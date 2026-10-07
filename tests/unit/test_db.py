@@ -24,6 +24,14 @@ import time
 
 import pytest
 
+# 持久化层依赖 ``[db]`` extra（``sqlalchemy[asyncio]`` → greenlet、aiosqlite）。
+# 缺依赖时**明确跳过**而不是让 15 个用例在 setup 阶段报错：
+# 报错会淹没真正的失败信号，而"跳过"至少是诚实的。
+# 注意 CI 必须安装该 extra（见 .github/workflows/ci.yml），否则这些用例
+# 会在 CI 上静默不跑 —— 那比报错更危险。
+pytest.importorskip("aiosqlite", reason="需要 pip install -e '.[db]'")
+pytest.importorskip("greenlet", reason="需要 pip install -e '.[db]'")
+
 from devagent.api.store import InMemoryTaskStore, TaskEvent
 from devagent.db.session import Database, is_postgres, normalize_url
 from devagent.db.task_store import SqlTaskStore

@@ -538,11 +538,17 @@ make web-check   # 语法检查 + 模块图完整性 + 73 个纯逻辑断言（�
 ## 测试
 
 ```bash
+pip install -e ".[dev,db]"   # [dev] 是测试工具；[db] 供持久化层用例使用
 make test            # 全量（659 个）
 make test-unit       # 仅单元测试
 make check           # ruff + mypy --strict
 make web-check       # 前端语法 + 模块图 + 逻辑测试（178 个，零依赖）
 ```
+
+> `[db]` 不是可选项：`tests/unit/test_db.py`（15 个用例，覆盖真实 SQL 方言、
+> 外键与 JSON 往返）需要 `sqlalchemy[asyncio]` 的 greenlet 与 aiosqlite。
+> 未安装时该文件会**明确跳过**并说明原因，而不是抛出一堆 setup 错误 ——
+> 但 CI 必须装上它，否则这些用例会在流水线上静默不跑。
 
 当前状态：
 
