@@ -1,0 +1,43 @@
+# 统一换行符处理，避免跨平台协作时的噪音 diff
+#
+# 策略：仓库内一律存 LF，检出时按平台自动转换
+# （Windows 上用 core.autocrlf 会引入噪音警告，显式声明更可控）
+
+* text=auto eol=lf
+
+# ---- 明确为文本的文件 ----
+*.py        text eol=lf
+*.md        text eol=lf
+*.toml      text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.json      text eol=lf
+*.jsonl     text eol=lf
+*.sql       text eol=lf
+*.js        text eol=lf
+*.css       text eol=lf
+*.html      text eol=lf
+*.sh        text eol=lf
+Makefile    text eol=lf
+Dockerfile  text eol=lf
+
+# ---- 必须保持 CRLF（Windows 专用脚本）----
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# ---- 二进制，Git 不应尝试转换或 diff ----
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary
+*.whl       binary
+*.tar.gz    binary
+*.zip       binary
+*.sqlite3   binary
+
+# ---- 语言统计：把这些路径不计入仓库语言占比 ----
+datasets/**     linguist-documentation
+docs/**         linguist-documentation
+*.jsonl         linguist-generated
