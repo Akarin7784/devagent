@@ -328,6 +328,60 @@ class TestHealthEndpoint:
         assert body["status"] == "ok"
         assert "providers" in body
 
+    def test_providers_reflect_gateway_not_config(
+        self, client: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`providers` 必须反映**网关实际注册**的提供商，而不是配置开关。
+
+        回归背景：早先这个字段直接读 ``settings.models``。演示模式下
+        ``serve_demo.py`` 把 ``DemoProvider`` 注入网关而配置为空，
+        于是返回空列表，前端弹出「未配置模型提供商，提交的任务会失败」——
+        事实上任务跑得好好的。这是一条会吓退用户的假警报。
+
+        这个测试模拟的就是那个场景：配置里一个都没启用，
+        但网关里注入了 stub，健康检查必须报告网关里有的。
+        """
+        from devagent.api.app import create_app
+        from devagent.config import Settings
+
+        app = create_app(Settings())
+        with TestClient(app) as c:
+            gateway = getattr(app.state, "gateway", None)
+            assert gateway is not None, "网关未挂载，无法验证 providers 来源"
+
+            # 配置为空（演示模式的真实形态）
+            assert not [
+                n for n, cfg in Settings().models.__dict__.items() if getattr(cfg, "enabled", False)
+            ], "前置条件不成立：测试环境竟然配置了模型 Key"
+
+            # 但网关里注入了 stub —— 健康检查必须报告它们
+            monkeypatch.setattr(
+                type(gateway),
+                "provider_names",
+                property(lambda _self: ["deepseek", "qwen"]),
+            )
+            body = c.get("/api/v1/health").json()
+            assert body["providers"] == ["deepseek", "qwen"], (
+                "网关有可用提供商但健康检查报空 —— 前端会误报「未配置模型」"
+            )
+
+    def test_providers_empty_when_gateway_has_none(
+        self, client: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """反过来：网关确实为空时必须如实报空，不能为了好看而编造。"""
+        from fastapi.testclient import TestClient
+
+        from devagent.api.app import create_app
+        from devagent.config import Settings
+
+        app = create_app(Settings())
+        with TestClient(app) as c:
+            gateway = getattr(app.state, "gateway", None)
+            assert gateway is not None
+            monkeypatch.setattr(type(gateway), "provider_names", property(lambda _self: []))
+            body = c.get("/api/v1/health").json()
+            assert body["providers"] == []
+
     def test_root(self, client: Any) -> None:
         r = client.get("/")
         assert r.status_code == 200

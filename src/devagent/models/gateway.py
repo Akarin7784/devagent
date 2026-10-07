@@ -194,6 +194,25 @@ class ModelGateway:
         self._providers = providers if providers is not None else self._build_providers(settings)
         self.ledger = CostLedger()
 
+    @property
+    def provider_names(self) -> list[str]:
+        """网关**实际可用**的模型提供商名字。
+
+        为什么需要它，而不是让调用方去读配置：
+
+        `/health` 早先直接读 ``settings.models``（配置），于是演示模式下
+        会报告「未配置任何模型」—— 而实际上 ``DemoProvider`` 已经注入网关，
+        任务跑得好好的。前端据此弹出「未配置模型提供商，提交的任务会失败」，
+        是一条**彻头彻尾的假警报**：它吓退用户，而用户试一下会发现任务照样成功。
+
+        判断「能不能跑」必须看**运行时实际注册了什么**，而不是配置里写了什么。
+        这两者在以下场景会分叉：
+          - 演示/冒烟模式：注入脚本化假模型，配置为空；
+          - 测试：注入 stub provider；
+          - 生产降级：某家 Key 失效后被摘除。
+        """
+        return sorted(self._providers.keys())
+
     # ------------------------------------------------------------------ #
     # 缓存适配
     # ------------------------------------------------------------------ #

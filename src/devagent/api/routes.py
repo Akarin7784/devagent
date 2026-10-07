@@ -76,12 +76,27 @@ def _to_task_view(data: dict[str, Any]) -> TaskView:
 
 
 @router.get("/health", response_model=HealthResponse, tags=["system"])
-async def health() -> HealthResponse:
+async def health(request: Request) -> HealthResponse:
+    """健康检查 + 能力探测。
+
+    `providers` 取**网关实际注册的提供商**，而不是配置里的开关。
+
+    早先只读 ``settings.models``，于是演示模式下（``serve_demo.py`` 注入
+    ``DemoProvider`` 而配置为空）会返回空列表，前端据此弹出「未配置模型
+    提供商，提交的任务会失败」—— 事实上任务跑得好好的。
+    判断「能不能跑」必须看运行时实际有什么，配置只作为网关不可用时的兜底。
+    """
     from devagent.config import get_settings
     from devagent.observability import get_observability
 
     settings = get_settings()
-    providers = [name for name, cfg in settings.models.__dict__.items() if _enabled(cfg)]
+    gateway = getattr(request.app.state, "gateway", None)
+    names = getattr(gateway, "provider_names", None)
+    if names:
+        providers = list(names)
+    else:
+        providers = [name for name, cfg in settings.models.__dict__.items() if _enabled(cfg)]
+
     return HealthResponse(
         status="ok",
         providers=providers,
