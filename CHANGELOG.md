@@ -7,6 +7,26 @@
 
 ### 修复
 
+**CI 从未真正跑通（首次推送到 GitHub 才暴露）**
+
+仓库此前没有远端，CI 配置的正确性从未被验证过。首次推送后三个 ubuntu 任务
+全红，Windows 任务也红 —— 两个都是**先于本轮改动就存在**的问题：
+
+- `pip install -e ".[dev]"` 少装了 `[db]` extra，而 `tests/unit/test_db.py`
+  需要 `sqlalchemy[asyncio]` 的 greenlet 与 aiosqlite → 15 个用例在 setup
+  阶段抛 `ModuleNotFoundError`，把真正的失败信号淹没了。现在 lint 与 test
+  两个 job 都装 `.[dev,db]`，并让该测试文件在缺依赖时**明确跳过**并给出
+  安装提示（跳过 ≠ 不跑：CI 侧依赖是装齐的）
+- Windows 任务在 `demo_smoke.py` 上抛
+  `UnicodeEncodeError: 'charmap' codec can't encode characters`：
+  英文 Windows 的 stdout 默认是 cp1252，打印中文直接崩溃并以非零码退出。
+  本地中文 Windows（cp936）反而看不出问题，所以这个坑一直躺在 CI 里。
+  新增 `devagent/console.py::force_utf8_stdio()`（幂等、永不抛异常），
+  由 `cli.main()` 与冒烟脚本调用；CI 另加 `PYTHONUTF8=1`
+
+修复后 CI 全绿：Lint & Type Check、Docs Check、5 个测试矩阵
+（3.11/3.12/3.13 × ubuntu + Windows + macOS）、Build Package，CodeQL 亦通过。
+
 **对抗性复核查出的 8 项缺陷（含一项 P0：DAG 从未真正执行）**
 
 第一轮修复完成后，又做了一轮**对抗性复核**（独立重写探针、以证伪为目标），
