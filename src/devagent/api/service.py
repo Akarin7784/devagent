@@ -17,6 +17,7 @@ HTTP、SSE、存储。但要把它变成「可被前端观测的异步任务」�
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 import uuid
 from typing import Any
@@ -26,6 +27,42 @@ from devagent.enums import TaskStatus
 from devagent.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+async def _maybe_await(value: Any) -> Any:
+    """兼容同步与异步存储。
+
+    ``TaskStore`` 协议被刻意设计为**不声明 async**：内存实现是纯同步的，
+    强行加 ``async def`` 会平白引入 200 个协程的调度开销，而且让纯逻辑
+    的单测被迫变成 ``async``。
+
+    但 SQL 实现天然是异步的。于是这里做一个薄适配：是 awaitable 就 await。
+    代价是一次 ``isawaitable`` 判断（纳秒级），换来两种实现共用同一套调用代码。
+    """
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _as_dict(value: Any) -> dict[str, Any] | None:
+    """把 ``_maybe_await`` 的结果收窄成任务字典。
+
+    ``_maybe_await`` 的返回类型只能是 ``Any``：它的入参既可能是协程也可能是
+    普通值，无法用类型参数表达。不收窄的话每个调用点都会触发
+    ``warn_return_any``，最后演变成到处撒 ``cast`` —— 问题只是被藏起来。
+    集中在这里做一次显式收窄（顺便复制一份，避免调用方误改存储内部状态），
+    调用点就能保持干净。
+    """
+    if isinstance(value, dict):
+        return dict(value)
+    return None
+
+
+def _as_dict_list(value: Any) -> list[dict[str, Any]]:
+    """把 ``_maybe_await`` 的结果收窄成任务字典列表。"""
+    if not value:
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
 
 
 class TaskService:
@@ -85,30 +122,36 @@ class TaskService:
     # 提交与执行
     # ------------------------------------------------------------------ #
 
-    def submit(
+    async def submit(
         self, goal: str, *, task_id: str = "", metadata: dict[str, Any] | None = None
     ) -> str:
-        """提交任务并立即返回 id（不等待完成）。"""
+        """提交任务并立即返回 id（不等待完成）。
+
+        改为 ``async`` 是为了支持 SQL 存储（写库是异步的）。内存实现下
+        除了多一次 ``isawaitable`` 判断外没有额外开销。
+        """
         tid = task_id or f"task_{uuid.uuid4().hex[:12]}"
-        if self._store.get(tid) is not None:
+        if await _maybe_await(self._store.get(tid)) is not None:
             raise ValueError(f"任务 id 已存在：{tid}")
 
-        self._store.save(
-            tid,
-            {
-                "task_id": tid,
-                "goal": goal,
-                "status": TaskStatus.PENDING.value,
-                "succeeded": False,
-                "error": "",
-                "duration_ms": 0,
-                "total_tokens": 0,
-                "total_cost_usd": 0.0,
-                "steps": [],
-                "nodes": [],
-                "context_metrics": {},
-                "metadata": metadata or {},
-            },
+        await _maybe_await(
+            self._store.save(
+                tid,
+                {
+                    "task_id": tid,
+                    "goal": goal,
+                    "status": TaskStatus.PENDING.value,
+                    "succeeded": False,
+                    "error": "",
+                    "duration_ms": 0,
+                    "total_tokens": 0,
+                    "total_cost_usd": 0.0,
+                    "steps": [],
+                    "nodes": [],
+                    "context_metrics": {},
+                    "metadata": metadata or {},
+                },
+            )
         )
         self._running[tid] = asyncio.create_task(self._execute(tid, goal))
         logger.info("task_submitted", task_id=tid)
@@ -121,13 +164,14 @@ class TaskService:
             self._current_task_id = task_id
             self._current_goal = goal
             self._publish(task_id, "task_started", {"goal": goal})
-            self._update(task_id, {"status": TaskStatus.RUNNING.value})
+            await self._update(task_id, {"status": TaskStatus.RUNNING.value})
             started = time.perf_counter()
             try:
                 result = await self._orchestrator.run(goal, task_id=task_id)
                 view = _to_view(result)
-                view["metadata"] = (self._store.get(task_id) or {}).get("metadata", {})
-                self._store.save(task_id, view)
+                existing = await _maybe_await(self._store.get(task_id)) or {}
+                view["metadata"] = existing.get("metadata", {})
+                await _maybe_await(self._store.save(task_id, view))
                 self._publish(
                     task_id,
                     "task_finished",
@@ -140,12 +184,12 @@ class TaskService:
                     },
                 )
             except asyncio.CancelledError:
-                self._update(task_id, {"status": TaskStatus.CANCELLED.value})
+                await self._update(task_id, {"status": TaskStatus.CANCELLED.value})
                 self._publish(task_id, "task_cancelled", {})
                 raise
             except Exception as exc:
                 logger.exception("task_execution_failed", task_id=task_id)
-                self._update(
+                await self._update(
                     task_id,
                     {
                         "status": TaskStatus.FAILED.value,
@@ -164,22 +208,30 @@ class TaskService:
     def _publish(self, task_id: str, kind: str, payload: dict[str, Any]) -> None:
         self._bus.publish(TaskEvent(kind=kind, task_id=task_id, payload=payload))
 
-    def _update(self, task_id: str, patch: dict[str, Any]) -> None:
-        data = self._store.get(task_id)
+    async def _update(self, task_id: str, patch: dict[str, Any]) -> None:
+        data = await _maybe_await(self._store.get(task_id))
         if data is None:
             return
         data.update(patch)
-        self._store.save(task_id, data)
+        await _maybe_await(self._store.save(task_id, data))
 
     # ------------------------------------------------------------------ #
     # 查询与取消
     # ------------------------------------------------------------------ #
 
-    def get(self, task_id: str) -> dict[str, Any] | None:
-        return self._store.get(task_id)
+    async def get(self, task_id: str) -> dict[str, Any] | None:
+        return _as_dict(await _maybe_await(self._store.get(task_id)))
 
-    def list(self, *, limit: int = 50, status: str = "") -> list[dict[str, Any]]:
-        return self._store.list(limit=limit, status=status)
+    async def list(self, *, limit: int = 50, status: str = "") -> list[dict[str, Any]]:
+        return _as_dict_list(await _maybe_await(self._store.list(limit=limit, status=status)))
+
+    async def delete(self, task_id: str) -> bool:
+        """删除任务（含事件历史）。"""
+        self.cancel(task_id)
+        existed = bool(await _maybe_await(self._store.delete(task_id)))
+        if existed:
+            self._bus.clear(task_id)
+        return existed
 
     def cancel(self, task_id: str) -> bool:
         task = self._running.get(task_id)
@@ -196,10 +248,10 @@ class TaskService:
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
             except TimeoutError:
-                return self._store.get(task_id)
+                return _as_dict(await _maybe_await(self._store.get(task_id)))
             except asyncio.CancelledError:
                 pass
-        return self._store.get(task_id)
+        return _as_dict(await _maybe_await(self._store.get(task_id)))
 
     async def shutdown(self) -> None:
         """取消所有在跑任务并等待收尾。"""

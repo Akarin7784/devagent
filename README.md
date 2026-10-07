@@ -4,7 +4,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-315%20passing-brightgreen)](#测试)
+[![Tests](https://img.shields.io/badge/tests-353%20passing-brightgreen)](#测试)
 [![mypy](https://img.shields.io/badge/mypy-strict-blue)](https://mypy-lang.org/)
 [![Ruff](https://img.shields.io/badge/code%20style-ruff-000000)](https://github.com/astral-sh/ruff)
 
@@ -273,7 +273,25 @@ DEVAGENT_ORCHESTRATION__MAX_ATTEMPTS=3
 | `DEVAGENT_OBSERVABILITY__METRICS_ENABLED` | `false` | 指标采集（默认关闭，零开销） |
 | `DEVAGENT_OBSERVABILITY__OTLP_ENDPOINT` | `""` | 设置后走 OTLP 导出 |
 | `DEVAGENT_ORCHESTRATION__MAX_ATTEMPTS` | `3` | 单节点最大尝试次数 |
-| `DEVAGENT_RELIABILITY__TOKEN_BUDGET` | `2_000_000` | 任务级 token 熔断阈值 |
+| `DEVAGENT_RELIABILITY__MAX_TASK_TOKENS` | `500_000` | 任务级 token 熔断阈值 |
+| `DEVAGENT_STORAGE__BACKEND` | `memory` | 任务存储后端：`memory` 或 `sql` |
+| `DEVAGENT_DATABASE__URL` | 本地 Postgres | `sql` 模式下的连接串；测试用 `sqlite+aiosqlite:///./devagent.db` |
+
+### 任务持久化（可选）
+
+默认走内存存储 —— clone 下来**不需要任何数据库**就能跑通 demo。
+需要在进程重启后保留任务与事件流时，切到 SQL 后端：
+
+```bash
+pip install -e '.[db]'                      # sqlalchemy[asyncio] + aiosqlite + asyncpg
+export DEVAGENT_STORAGE__BACKEND=sql
+export DEVAGENT_DATABASE__URL=postgresql+asyncpg://user:pass@localhost/devagent
+psql "$DEVAGENT_DATABASE__URL" -f scripts/init_db.sql   # 扩展与索引（Postgres）
+```
+
+`TaskStore` 是协议，内存与 SQL 两种实现**可直接互换**，上层零改动。
+事件落库后，SSE 的「历史回放」在进程重启后依然可靠（见
+[ADR-0002](docs/adr/0002-上下文装配使用硬去重作为保险.md) 同类取舍记录）。
 
 ---
 
@@ -316,7 +334,7 @@ curl -N http://localhost:8000/api/v1/tasks/<id>/events
 ## 测试
 
 ```bash
-make test            # 全量（315 个）
+make test            # 全量（353 个）
 make test-unit       # 仅单元测试
 make check           # ruff + mypy --strict
 ```
@@ -324,7 +342,7 @@ make check           # ruff + mypy --strict
 当前状态：
 
 ```
-315 passed in 20.6s
+353 passed in 21.3s
 ruff check .......... 通过
 ruff format --check . 通过
 mypy --strict ....... 52 个源文件，0 错误
@@ -356,9 +374,10 @@ mypy --strict ....... 52 个源文件，0 错误
 │   ├── orchestration/    # DAG 编排
 │   ├── reliability/      # 可靠性机制
 │   ├── tools/            # 沙箱 / 测试执行 / 代码索引
+│   ├── db/               # 持久化（SQLAlchemy 异步 ORM，可选依赖）
 │   ├── cli.py
 │   └── config.py
-├── tests/unit/           # 315 个测试
+├── tests/unit/           # 全量单元测试
 ├── datasets/             # golden set（13 样本 4 类）
 ├── docs/                 # 设计文档 + ADR
 ├── web/                  # 零构建前端

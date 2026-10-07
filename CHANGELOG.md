@@ -5,13 +5,45 @@
 
 ## [Unreleased]
 
+### 新增
+
+**任务持久化（`SqlTaskStore`）**
+
+- `devagent.db` 包：SQLAlchemy 2.0 异步 ORM（`Mapped[...]` / `mapped_column` 新式声明）
+- `TaskRow` / `TaskEventRow` 两张表；任务 JSON 列整体存储，避免无谓拆表
+- `TaskStore` 协议保持不变，内存与 SQL 实现**可直接互换**（由 `_maybe_await` 适配）
+- 事件落库使 SSE 的「历史回放」跨进程重启依然可靠
+- `StorageConfig`：`DEVAGENT_STORAGE__BACKEND=memory|sql`，向后兼容、默认 `memory`
+- `pyproject.toml` 新增 `[db]` extra；`scripts/init_db.sql`（pgvector / HNSW / pg_trgm）
+- 33 个持久化层测试（`sqlite+aiosqlite:///:memory:`，无需外部数据库）
+
 ### 计划中
 
-- 任务持久化（`PostgresTaskStore`，替换当前内存 LRU 实现）
 - 语义缓存的向量检索版本（替换当前精确匹配实现）
 - 异构模型裁判（消除 LLM-as-Judge 的自我偏好偏差，见 ADR-0005 的局限章节）
 - 前端 DAG 可视化与 diff 查看器
 - 提示词注入防护（内容信任度分级）
+
+### 修复
+
+持久化层引入时发现并修复的 5 个缺陷：
+
+12. `pyproject.toml` 缺少 `[db]` extra，但报错文案让用户执行 `pip install -e '.[db]'`
+    —— **一条照着做必然失败的建议**。已补齐，并明确写 `sqlalchemy[asyncio]`
+    （裸 `sqlalchemy` 不拉 `greenlet`，而 asyncio 扩展在 import 期就硬性依赖它）
+13. `Database.__init__` 丢弃 `_require_sqlalchemy()` 返回的 `AsyncSession`，
+    随后引用仅在 `TYPE_CHECKING` 下存在的模块级名字 → 运行期 `NameError`
+    （即：**该实现从未被真正执行过**）
+14. `TaskStore` 未声明 `@runtime_checkable`，"实现是否满足协议"无法在运行期断言，
+    只能依赖 mypy 覆盖到实际调用路径
+15. `SqlTaskStore.list` 方法遮蔽内置 `list`，使 `list[TaskEvent]` 注解
+    被 mypy 判定为非法类型（`Function ... is not valid as a type`）
+16. `purge_events` 依赖 `Result.rowcount`，异步 `Result` 无此属性；
+    改为先取主键再按主键删，跨方言行为一致且行数准确
+
+另修复 2 个测试自身的缺陷（`await` 误写在生成器表达式内导致 `async_generator`、
+未 `await` 的 `submit` 协程），以及 `SqlTaskStore` 新增测试暴露出的
+`test_concurrency_limit` / `test_shutdown_cancels_running` 调用点问题。
 
 ---
 
@@ -104,11 +136,12 @@
 
 ### 已知限制
 
-- 任务存储为内存实现，进程重启后丢失
 - 语义缓存是精确匹配，非向量检索
 - 提示词注入无专门防护（见 [SECURITY.md](SECURITY.md)）
 - 默认沙箱是本地进程，**不是安全边界**（见 [ADR-0004](docs/adr/0004-沙箱默认本地进程docker可选.md)）
 - LLM-as-Judge 的自我偏好偏差未处理（见 [ADR-0005](docs/adr/0005-llm-judge-双向评估对冲偏差.md)）
+- `SqlTaskStore` 不自动清理历史任务：留保留策略给外部（cron / 定期任务），
+  硬编码 TTL 会让需要长期留存审计记录的部署很难受
 
 ---
 

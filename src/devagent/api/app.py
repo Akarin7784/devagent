@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse
 
 from devagent.api.routes import router
 from devagent.api.service import TaskService
-from devagent.api.store import EventBus, InMemoryTaskStore
+from devagent.api.store import EventBus
 from devagent.config import Settings, get_settings
 from devagent.logging_config import configure_logging, get_logger
 
@@ -44,20 +44,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             otlp_endpoint=resolved.observability.otlp_endpoint,
         )
 
+        from devagent.db.factory import build_store, finalize_store
         from devagent.models.gateway import ModelGateway
         from devagent.orchestration import Orchestrator
 
         app.state.settings = resolved
         app.state.gateway = ModelGateway(resolved)
-        app.state.store = InMemoryTaskStore()
+
+        # 存储后端：memory（默认，零依赖）或 sql（持久化）。
+        # 装配与释放配对写在同一处，避免 sql 模式下漏掉 engine.dispose()。
+        store, database = build_store(resolved)
+        app.state.storage = store
+        app.state.database = database
+        if database is not None:
+            # 开发便利：自动建表。生产请用 `alembic upgrade head`
+            # （create_all 无法演进已有表结构）。
+            await database.init_models()
+
+        app.state.store = store
         app.state.bus = EventBus()
         app.state.orchestrator = Orchestrator(resolved, gateway=app.state.gateway)
         app.state.task_service = TaskService(
             app.state.orchestrator,
-            store=app.state.store,
+            store=store,
             bus=app.state.bus,
         )
-        logger.info("api_started")
+        logger.info("api_started", storage=resolved.storage.backend)
 
         try:
             yield
@@ -66,6 +78,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             service: TaskService = app.state.task_service
             await service.shutdown()
             await app.state.orchestrator.aclose()
+            await finalize_store(app.state.storage, app.state.database)
             logger.info("api_stopped")
 
     app = FastAPI(

@@ -173,6 +173,20 @@ class DatabaseConfig(BaseModel):
     max_overflow: int = Field(default=20, ge=0)
 
 
+class StorageConfig(BaseModel):
+    """任务存储后端选择。
+
+    默认 ``memory``：零依赖即可启动，贡献者 clone 后不用先起数据库。
+    生产环境应设为 ``sql`` 并配置 ``database.url``。
+    """
+
+    backend: Literal["memory", "sql"] = "memory"
+    memory_capacity: int = Field(default=200, gt=0, description="内存模式下的 LRU 容量")
+    event_history_limit: int = Field(
+        default=2000, gt=0, description="SQL 模式下单任务可回放的事件条数上限"
+    )
+
+
 class RedisConfig(BaseModel):
     url: str = "redis://localhost:6379/0"
     stream_max_len: int = Field(default=10_000, gt=0)
@@ -206,6 +220,7 @@ class Settings(BaseSettings):
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
 
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    storage: StorageConfig = Field(default_factory=StorageConfig)
     redis: RedisConfig = Field(default_factory=RedisConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)

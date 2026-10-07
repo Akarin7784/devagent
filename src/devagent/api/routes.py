@@ -109,11 +109,13 @@ async def create_task(payload: CreateTaskRequest, request: Request) -> TaskView:
     """提交任务（异步）。返回 202 与任务视图，前端随后订阅 ``/tasks/{id}/events``。"""
     service = _service(request)
     try:
-        task_id = service.submit(payload.goal, task_id=payload.task_id, metadata=payload.metadata)
+        task_id = await service.submit(
+            payload.goal, task_id=payload.task_id, metadata=payload.metadata
+        )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
-    data = service.get(task_id)
+    data = await service.get(task_id)
     if data is None:  # pragma: no cover - 竞态兜底
         raise HTTPException(status_code=500, detail="任务创建后立即丢失")
     return _to_task_view(data)
@@ -126,7 +128,7 @@ async def list_tasks(
     status_filter: str = Query(default="", alias="status"),
 ) -> TaskListResponse:
     service = _service(request)
-    items = service.list(limit=limit, status=status_filter)
+    items = await service.list(limit=limit, status=status_filter)
     return TaskListResponse(
         total=len(items),
         items=[
@@ -150,7 +152,7 @@ async def list_tasks(
     responses={404: {"model": ErrorResponse}},
 )
 async def get_task(task_id: str, request: Request) -> TaskView:
-    data = _service(request).get(task_id)
+    data = await _service(request).get(task_id)
     if data is None:
         raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
     return _to_task_view(data)
@@ -163,17 +165,15 @@ async def get_task(task_id: str, request: Request) -> TaskView:
 )
 async def delete_task(task_id: str, request: Request) -> dict[str, Any]:
     service = _service(request)
-    service.cancel(task_id)
-    if not service._store.delete(task_id):
+    if not await service.delete(task_id):
         raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
-    service.bus.clear(task_id)
     return {"deleted": True, "task_id": task_id}
 
 
 @router.post("/tasks/{task_id}/cancel", tags=["tasks"])
 async def cancel_task(task_id: str, request: Request) -> dict[str, Any]:
     service = _service(request)
-    if service.get(task_id) is None:
+    if await service.get(task_id) is None:
         raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
     cancelled = service.cancel(task_id)
     return {"cancelled": cancelled, "task_id": task_id}
@@ -189,7 +189,7 @@ async def stream_events(task_id: str, request: Request) -> EventSourceResponse:
     - 任务结束且队列排空后主动关闭流，避免客户端一直等。
     """
     service = _service(request)
-    if service.get(task_id) is None:
+    if await service.get(task_id) is None:
         raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
 
     async def event_generator() -> AsyncIterator[dict[str, str]]:
@@ -231,7 +231,7 @@ async def get_task_context(task_id: str, request: Request) -> dict[str, Any]:
     前端「上下文查看器」用这个接口展示：压缩前/后 token、丢弃片段数、
     各 Agent 的预算利用率分布 —— 这是本项目最有说服力的可视化。
     """
-    data = _service(request).get(task_id)
+    data = await _service(request).get(task_id)
     if data is None:
         raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
     return {

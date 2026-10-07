@@ -29,7 +29,7 @@ import contextlib
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from devagent.logging_config import get_logger
 
@@ -131,16 +131,26 @@ class EventBus:
         self._dropped.pop(task_id, None)
 
 
+@runtime_checkable
 class TaskStore(Protocol):
-    """任务存储协议。"""
+    """任务存储协议。
 
-    def save(self, task_id: str, data: dict[str, Any]) -> None: ...
+    刻意**不声明** ``async``：内存实现是纯同步的（见 ``InMemoryTaskStore``），
+    而 SQL 实现是异步的。上层的兼容由 ``devagent.api.service._maybe_await``
+    承担 —— 这样纯逻辑单测不必被迫变成协程，也不会为每次调用引入协程开销。
 
-    def get(self, task_id: str) -> dict[str, Any] | None: ...
+    声明为 ``runtime_checkable`` 是为了让「实现是否满足协议」这件事**可被
+    测试断言**。否则类型错误只会在 CI 的 mypy 里出现（而且只覆盖被真正
+    用到的调用路径），运行时完全没有防线。
+    """
 
-    def list(self, *, limit: int = 50, status: str = "") -> list[dict[str, Any]]: ...
+    def save(self, task_id: str, data: dict[str, Any]) -> Any: ...
 
-    def delete(self, task_id: str) -> bool: ...
+    def get(self, task_id: str) -> Any: ...
+
+    def list(self, *, limit: int = 50, status: str = "") -> Any: ...
+
+    def delete(self, task_id: str) -> Any: ...
 
 
 class InMemoryTaskStore:

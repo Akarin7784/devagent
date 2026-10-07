@@ -216,7 +216,7 @@ class TestInMemoryTaskStore:
 class TestTaskService:
     async def test_submit_and_wait(self) -> None:
         service = TaskService(_FakeOrchestrator(), store=InMemoryTaskStore())
-        tid = service.submit("加个分页")
+        tid = await service.submit("加个分页")
         data = await service.wait(tid)
         assert data is not None
         assert data["status"] == "succeeded"
@@ -225,13 +225,13 @@ class TestTaskService:
 
     async def test_duplicate_task_id_rejected(self) -> None:
         service = TaskService(_FakeOrchestrator(), store=InMemoryTaskStore())
-        service.submit("g", task_id="dup")
+        await service.submit("g", task_id="dup")
         with pytest.raises(ValueError, match="已存在"):
-            service.submit("g2", task_id="dup")
+            await service.submit("g2", task_id="dup")
 
     async def test_emits_start_and_finish_events(self) -> None:
         service = TaskService(_FakeOrchestrator(), store=InMemoryTaskStore())
-        tid = service.submit("g")
+        tid = await service.submit("g")
         await service.wait(tid)
         kinds = [e.kind for e in service.bus.history(tid)]
         assert kinds[0] == "task_started"
@@ -240,7 +240,7 @@ class TestTaskService:
     async def test_failure_recorded_not_lost(self) -> None:
         """编排器抛异常时任务状态必须落库为 failed，且带错误信息。"""
         service = TaskService(_ExplodingOrchestrator(), store=InMemoryTaskStore())
-        tid = service.submit("g")
+        tid = await service.submit("g")
         data = await service.wait(tid)
         assert data is not None
         assert data["status"] == "failed"
@@ -248,7 +248,7 @@ class TestTaskService:
 
     async def test_cancel(self) -> None:
         service = TaskService(_FakeOrchestrator(delay=5.0), store=InMemoryTaskStore())
-        tid = service.submit("g")
+        tid = await service.submit("g")
         await asyncio.sleep(0.05)
         assert service.cancel(tid) is True
         data = await service.wait(tid, timeout=2)
@@ -264,20 +264,23 @@ class TestTaskService:
         service = TaskService(
             _FakeOrchestrator(delay=0.1), store=InMemoryTaskStore(), max_concurrent=2
         )
-        tids = [service.submit(f"g{i}") for i in range(6)]
+        tids = [await service.submit(f"g{i}") for i in range(6)]
         await asyncio.gather(*(service.wait(t) for t in tids))
-        assert all(service.get(t)["status"] == "succeeded" for t in tids)
+        # 注意：await 不能写在生成器表达式里（会变成 async_generator），
+        # 因此先并发取回全部记录再断言。
+        records = await asyncio.gather(*(service.get(t) for t in tids))
+        assert all(r is not None and r["status"] == "succeeded" for r in records)
 
     async def test_shutdown_cancels_running(self) -> None:
         service = TaskService(_FakeOrchestrator(delay=5.0), store=InMemoryTaskStore())
-        service.submit("g")
+        await service.submit("g")
         await asyncio.sleep(0.05)
         await service.shutdown()
         assert service._running == {}
 
     async def test_metadata_preserved(self) -> None:
         service = TaskService(_FakeOrchestrator(), store=InMemoryTaskStore())
-        tid = service.submit("g", metadata={"user": "alice"})
+        tid = await service.submit("g", metadata={"user": "alice"})
         data = await service.wait(tid)
         assert data["metadata"] == {"user": "alice"}
 
@@ -521,7 +524,7 @@ class TestOrchestratorEventBridge:
         orch = _EmittingOrchestrator()
         store = InMemoryTaskStore()
         service = TaskService(orch, store=store)
-        tid = service.submit("g")
+        tid = await service.submit("g")
         await service.wait(tid)
 
         queue = service.bus.subscribe(tid)
@@ -538,7 +541,7 @@ class TestOrchestratorEventBridge:
         """驳回事件必须带失败标准，前端才能解释「为什么回退」。"""
         orch = _EmittingOrchestrator()
         service = TaskService(orch, store=InMemoryTaskStore())
-        tid = service.submit("g")
+        tid = await service.submit("g")
         await service.wait(tid)
 
         queue = service.bus.subscribe(tid)
@@ -574,11 +577,11 @@ class TestOrchestratorEventBridge:
         # 把桥接方法本身替换为抛异常版本，模拟总线故障
         service._on_orchestrator_event = _raise_bus_down  # type: ignore[method-assign]
 
-        tid = service.submit("g")
+        tid = await service.submit("g")
         await service.wait(tid)
 
         assert orch.reached_end, "回调异常后编排仍应执行到结尾"
-        assert (service.get(tid) or {}).get("succeeded") is True
+        assert ((await service.get(tid)) or {}).get("succeeded") is True
 
     async def test_no_hook_is_silent_noop(self) -> None:
         """未设置回调时 _emit 必须是零成本空操作。"""

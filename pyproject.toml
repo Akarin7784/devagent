@@ -55,6 +55,15 @@ dev = [
 sandbox = [
     "docker>=7.1.0",
 ]
+db = [
+    # 注意：必须写 sqlalchemy[asyncio] 而不是 sqlalchemy。
+    # 裸的 sqlalchemy 不会拉入 greenlet，而 SQLAlchemy 的 asyncio 扩展
+    # 在 import 时就会硬性要求它，报出的还是一个容易误导的
+    # 「No module named 'greenlet'」。这是本项目踩过的坑之一。
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",     # SQLite 异步驱动（测试与轻量部署）
+    "asyncpg>=0.29",       # Postgres 异步驱动（生产）
+]
 eval = [
     "pandas>=2.2.0",
     "tabulate>=0.9.0",
