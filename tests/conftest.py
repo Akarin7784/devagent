@@ -40,12 +40,17 @@ def _build_contract_words() -> dict[str, Any]:
     枚举完全一致），`web/graph.test.js` 则读取它逐个断言覆盖。
     这样 Python 侧新增枚举成员时，前端契约测试会立即变红。
     """
-    from devagent.enums import AgentType, StepStatus
+    from devagent.enums import AgentType, StepStatus, TaskStatus
 
     return {
         "_generated_by": "tests/conftest.py::_build_contract_words",
         "step_status": [s.value for s in StepStatus],
         "agent_type": [a.value for a in AgentType],
+        # 任务级状态同样被前端消费（任务列表/摘要卡）。此前只导出了
+        # step_status，于是「后端加枚举 → 前端变红」这条链路对 TaskStatus
+        # 是断的：概览页曾拿 'success' 去比较后端实际发出的 'succeeded'，
+        # 结果全成功时显示"—"、9 成功 1 失败时显示 900%，而没有任何测试发现。
+        "task_status": [s.value for s in TaskStatus],
     }
 
 

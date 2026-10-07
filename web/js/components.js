@@ -500,6 +500,33 @@ export function metricRow({ name, value, ratio = null, tone = '' }) {
   return node;
 }
 
+/**
+ * 提示条的正文渲染参数（**纯函数，可单测**）。
+ *
+ * ## 为什么单独抽出来（这是一次真实的 XSS 事故）
+ *
+ * 这里原先写的是 `el('div', { html: body })`，即把字符串正文当 HTML 解析。
+ * 而 `body` 的调用方传的**全是模型产出**：
+ *   - `workbench.js` 传 `node.lastError`（后端 `last_error`，内部嵌了
+ *     Verifier 模型自己吐出的 JSON 字符串）；
+ *   - `workbench.js` 传 `detail.error`（任务失败原因，同样来自模型）。
+ * 于是一个包含 `<img src=x onerror=...>` 的 goal，经"验证驳回 → 写进
+ * last_error → 前端渲染"这条链路，就能在**与 API 同源**的页面上执行 JS。
+ *
+ * 根因是把「一段文本」当成了「一段标记」。因此这里把决策收敛成一个
+ * 可被测试直接断言的纯函数：**字符串正文永远走 text**。
+ * 需要富文本的调用方请自己构造节点传进来（对象分支），
+ * 而不是在这里放开一个 `html` 参数 —— 那种"逃生舱"迟早会被数据填满。
+ *
+ * @param {Node|string} body
+ * @returns {{text: string}|{node: Node}|null} `el()` 的 options 片段
+ */
+export function alertBodyOptions(body) {
+  if (!body) return null;
+  if (typeof body === 'string') return { text: body };
+  return { node: body };
+}
+
 /** 提示条。 */
 export function alert({ tone = 'info', title, body, icon: ico }) {
   const icoName = ico || {
@@ -509,12 +536,14 @@ export function alert({ tone = 'info', title, body, icon: ico }) {
     success: 'check-circle',
   }[tone];
   const node = el('div', { class: `alert alert-${tone}`, attrs: { role: 'note' } });
+  // 图标是 icons.js 的静态 SVG，唯一的 html 用法（见文件头注释）
   node.append(el('div', { class: 'alert-icon', html: icon(icoName, 15) }));
   const b = el('div', { class: 'alert-body' });
   if (title) b.append(el('div', { class: 'alert-title', text: title }));
-  if (body) {
-    if (typeof body === 'string') b.append(el('div', { html: body }));
-    else b.append(body);
+  const opt = alertBodyOptions(body);
+  if (opt) {
+    if (opt.text != null) b.append(el('div', { text: opt.text }));
+    else b.append(opt.node);
   }
   node.append(b);
   return node;

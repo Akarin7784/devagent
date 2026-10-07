@@ -100,6 +100,9 @@ export const TASK_STATUS_BADGE = {
   completed: ['success', '已完成', 'check-circle'],
   failed: ['danger', '失败', 'x-circle'],
   error: ['danger', '失败', 'x-circle'],
+  // TaskStatus.PAUSED —— orchestrator 在预算耗尽时把任务终态置为 paused。
+  // 漏登记的后果不是报错，而是任务列表回显英文 `paused`（正是本表要防的坑）。
+  paused: ['warning', '已暂停', 'pause'],
   cancelled: ['neutral', '已取消', 'ban'],
   skipped: ['neutral', '已跳过', 'ban'],
   backtracked: ['warning', '回退重试', 'refresh'],
@@ -174,6 +177,20 @@ export function statusDotClass(status) {
 export function taskStatusBadge(status) {
   return TASK_STATUS_BADGE[status]
     || [TASK_STATUS_FALLBACK_TONE, status || '未知', ''];
+}
+
+/**
+ * 任务状态 → 中文标签（只要文字，不要徽章）。
+ *
+ * 存在的理由：任务级行（任务列表、执行摘要）**不能**用 `statusLabel()`。
+ * 那是 StepStatus 的表，`succeeded` / `cancelled` / `paused` 在里面都没有
+ * 条目，于是 `statusLabel()` 会把英文枚举名原样回显到中文界面上。
+ * 两套状态共用同一个字面量 `running`，正是这个巧合让该 bug 长期没被发现。
+ *
+ * 与 `taskStatusBadge()` 共用同一张表 —— 不允许出现第二份文案。
+ */
+export function taskStatusLabel(status) {
+  return taskStatusBadge(status)[1];
 }
 
 export function agentLabel(type) {

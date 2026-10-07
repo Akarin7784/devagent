@@ -3,7 +3,7 @@
  *
  * ## 为什么独立成文件
  *
- * 布局算法是**纯函数**，与 DOM 无关。把它从 `app.js` 里拆出来有两个好处：
+ * 布局算法是**纯函数**，与 DOM 无关。把它从页面渲染代码里拆出来有两个好处：
  * 1. 可以单独做语法/行为校验（`node --check`、直接 import 跑断言）；
  * 2. 强制「数据 → 几何」与「几何 → DOM」分离，避免布局逻辑悄悄依赖
  *    当前 DOM 状态（这是可视化代码最常见的腐化方式）。
@@ -102,6 +102,8 @@ export function computeLayers(nodes) {
  *   `nodes[i]` 是 `{id, x, y, w, h, cx, cy, layer, row}`，坐标均为左上角；
  *   `edges[j]` 是 `{from, to, d, back}`，`d` 是 SVG path 的 `d` 属性，
  *   `back` 标记该边是否指向更小的层（若后端表达了回退边，前端要能画出来）。
+ *   `width`/`height` 是**整张图的包围盒**：不仅包含节点矩形，也包含回退边
+ *   向下绕行的那段弧线。调用方可以直接拿它当 viewBox，不需要自己估算边距。
  */
 export function layoutDag(nodes) {
   const list = Array.isArray(nodes) ? nodes.filter((n) => n && n.id) : [];
@@ -164,9 +166,48 @@ export function layoutDag(nodes) {
   }
 
   const width = PAD * 2 + (maxLayer + 1) * NODE_W + maxLayer * GAP_X;
-  const height = PAD * 2 + maxRows * NODE_H + Math.max(0, maxRows - 1) * GAP_Y;
+  const height = dagBounds(placed, edges).height;
 
   return { nodes: placed, edges, width, height, layers: maxLayer + 1, byId: position };
+}
+
+/**
+ * 计算 DAG 的包围盒（**纯函数**，只吃几何，可直接单测）。
+ *
+ * 高度不能只看节点矩形：回退边会绕到所有节点的**下方**（弧顶下探 34），
+ * 这段行程不在任何节点里。而 `renderDag()` 会用 `layout.width/height`
+ * 覆盖调用方设好的 viewBox —— 一旦高度漏算了弧线，
+ * 「验证驳回 → 回退重跑」这条本项目最想展示的边就会被裁掉一半，
+ * 而且不会有任何报错（SVG 不会抱怨内容超出 viewBox）。
+ *
+ * 因此把"节点 + 边"的实际行程一起算进来：宁可多留白，不可裁内容。
+ *
+ * @param {Array<{x:number,y:number,w:number,h:number}>} nodes
+ * @param {Array<{d:string}>} edges
+ * @returns {{width:number, height:number}}
+ */
+export function dagBounds(nodes, edges) {
+  const ns = Array.isArray(nodes) ? nodes : [];
+  const es = Array.isArray(edges) ? edges : [];
+  const width = ns.reduce((m, n) => Math.max(m, n.x + n.w), 0);
+  const height = Math.max(
+    ns.reduce((m, n) => Math.max(m, n.y + n.h), 0),
+    ...es.map((e) => pathMaxY(e?.d)),
+    0,
+  );
+  return { width, height };
+}
+
+/** 从 path 的 `d` 里取出最大 Y 坐标。用于把边（含回退弧线）纳入画布包围盒。 */
+function pathMaxY(d) {
+  let max = 0;
+  const nums = String(d ?? '').match(/-?\d+(?:\.\d+)?/g) || [];
+  // 每对数字是 (x, y)，取奇数位
+  for (let i = 1; i < nums.length; i += 2) {
+    const y = Number(nums[i]);
+    if (Number.isFinite(y) && y > max) max = y;
+  }
+  return max;
 }
 
 /** 层内排序用的重心：父节点行号的平均值；无父节点视为 -1（排最前）。 */
@@ -182,8 +223,14 @@ function barycenter(node, byId, rowOf) {
  * 控制点水平外推，让边从节点右侧中心出发、水平切入目标左侧中心 ——
  * 直线在多层布局里会斜穿节点，而「水平出、水平入」的曲线看起来像
  * 真正的流程图，也让 `back` 边（反向）能被一眼区分。
+ *
+ * **导出是为了可测**：`back` 分支在当前的严格分层算法下不会被
+ * `layoutDag()` 走到（依赖必然落在更小的层里，见 computeLayers 的最长路径
+ * 语义），但它是**必须正确**的防御分支 —— 一旦分层算法变化或后端送来
+ * 违反拓扑序的依赖，画出来的就是这条弧线。测试直接构造几何来验证它，
+ * 比"等它真的发生"可靠得多（这条弧线一旦被 viewBox 裁掉是静默的）。
  */
-function edgePath(from, to) {
+export function edgePath(from, to) {
   if (from.layer >= to.layer) {
     // 回退边：走一段绕行弧线（下方）而不是穿过节点，避免与主链重叠
     const midY = Math.max(from.y + from.h, to.y + to.h) + 34;
@@ -373,6 +420,44 @@ export function diffStats(diffText) {
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
+/**
+ * 箭头 marker 的 id 与取色方式。
+ *
+ * 这些 id 是 `renderDag()` 写进 `marker-end` 的引用（`url(#dag-arrow)` 等）。
+ * 曾经只写了引用、没有写 `<marker>` 定义 —— 于是**一条箭头都画不出来**，
+ * 而且是静默失败：`url(#不存在)` 在浏览器里不会报错，只是什么都不渲染。
+ * 所以定义与引用现在放在同一个文件里，并由 graph.test.js 断言"引用的 id
+ * 必须有定义"。
+ *
+ * 颜色用 `context-stroke`：marker 因此自动跟随所在边的描边色，
+ * 边的状态色（成功/失败/回退）改一次，箭头跟着变，不需要第二处配色。
+ */
+const ARROW_MARKERS = ['dag-arrow', 'dag-arrow-back', 'dag-arrow-done'];
+
+/** 建一次 marker 定义（幂等）。 */
+function ensureDefs(svg) {
+  if (svg.querySelector('defs.dag-defs')) return;
+  const defs = svgEl('defs', { class: 'dag-defs' });
+  for (const id of ARROW_MARKERS) {
+    const marker = svgEl('marker', {
+      id,
+      viewBox: '0 0 8 8',
+      refX: 7,
+      refY: 4,
+      markerWidth: 6,
+      markerHeight: 6,
+      orient: 'auto-start-reverse',
+      markerUnits: 'strokeWidth',
+    });
+    marker.appendChild(svgEl('path', {
+      d: 'M0.5 1.2 7 4 0.5 6.8',
+      fill: 'context-stroke',
+    }));
+    defs.appendChild(marker);
+  }
+  svg.insertBefore(defs, svg.firstChild);
+}
+
 function svgEl(tag, attrs = {}) {
   const el = document.createElementNS(SVG_NS, tag);
   for (const [k, v] of Object.entries(attrs)) {
@@ -416,6 +501,8 @@ export function renderDag(svg, layout, state, opts = {}) {
     svg.appendChild(svgEl('g', { class: 'dag-edges' }));
     svg.appendChild(svgEl('g', { class: 'dag-nodes' }));
   }
+  // 箭头定义必须在写 marker-end 之前就位（否则第一帧的箭头是缺失的）
+  ensureDefs(svg);
   const edgeLayer = svg.querySelector('g.dag-edges');
   const nodeLayer = svg.querySelector('g.dag-nodes');
 

@@ -197,14 +197,22 @@ class DAG:
     # ------------------------------------------------------------------ #
 
     def mark(self, node_id: str, status: StepStatus, **kwargs: object) -> None:
-        """更新节点状态。"""
+        """更新节点状态。
+
+        未知字段**直接报错**而不是静默忽略：早先用 ``if hasattr(state, key)``
+        过滤，于是把 ``tokens_used`` 拼成 ``token_used`` 不会有任何提示，
+        只是数据悄悄丢了 —— 这类问题在状态图上表现为"数值偶尔为 0"，
+        排查成本远高于一次显式异常。
+        """
         if node_id not in self.states:
             raise DAGError(f"未知节点：{node_id}")
         state = self.states[node_id]
+        unknown = [key for key in kwargs if not hasattr(state, key)]
+        if unknown:
+            raise DAGError(f"未知的节点状态字段：{unknown}（节点 {node_id}）")
         state.status = status
         for key, value in kwargs.items():
-            if hasattr(state, key):
-                setattr(state, key, value)
+            setattr(state, key, value)
 
     def mark_attempt(self, node_id: str) -> None:
         """递增尝试次数。"""

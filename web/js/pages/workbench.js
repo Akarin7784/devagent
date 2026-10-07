@@ -42,9 +42,10 @@ import {
   layoutDag,
   parseDiff,
   renderDag,
-  statusLabel,
 } from '../../graph.js';
 import { getState, navigate, set } from '../store.js';
+import { StreamSlot } from '../stream.js';
+import { taskStatusLabel } from '../status.js';
 import {
   $, clear, copyText, debounce, el, esc, fmtCost, fmtDuration, fmtInt,
   fmtRelative, fmtTime, fromHTML, mount, prefersReducedMotion,
@@ -59,7 +60,6 @@ const MAX_TIMELINE = 400;
  */
 export default async function renderWorkbench(root, ctx) {
   const disposers = [];
-  let unsubscribeStream = null;
   let autoScroll = true;
   let timelineFilter = 'all';
   let countLabel = null;
@@ -285,7 +285,10 @@ export default async function renderWorkbench(root, ctx) {
         el('div', { class: 'task-item-goal', text: t.goal }),
         el('div', { class: 'task-item-meta' }, [
           el('span', { class: `dot dot-sm ${statusDotClass(t.status)}` }),
-          el('span', { text: statusLabel(t.status) }),
+          // 任务级状态必须走 taskStatusLabel：`t.status` 是 TaskStatus
+          // （succeeded / cancelled / paused），用 StepStatus 的 statusLabel
+          // 查不到条目，会把英文枚举名直接回显到中文界面上。
+          el('span', { text: taskStatusLabel(t.status) }),
           el('span', { text: '·' }),
           el('span', { text: fmtDuration(t.duration_ms) }),
           el('span', { text: '·' }),
@@ -300,6 +303,8 @@ export default async function renderWorkbench(root, ctx) {
 
   async function selectTask(taskId) {
     if (!taskId) return;
+    // 立刻作废当前流：下面的 await 期间到达的事件属于上一个任务，
+    // 不能再写进本任务的图与时间线（见 openStream 的 activeToken 守卫）。
     closeStream();
     set({ activeTaskId: taskId });
     paintTaskList();
@@ -322,9 +327,16 @@ export default async function renderWorkbench(root, ctx) {
     }));
 
     await refreshCurrent();
+
+    // await 期间用户可能已经点了另一个任务：此时 activeTaskId 已变，
+    // 为旧任务开流只会产生一条"永远不该存在"的 SSE 订阅（还会把旧任务的
+    // 事件写进新任务的界面）。直接放弃。
+    if (getState('activeTaskId') !== taskId) return;
     openStream(taskId);
 
-    // 同步 URL，便于分享/刷新后回到同一任务
+    // 同步 URL，便于分享/刷新后回到同一任务。
+    // replace=true 只改地址栏，不会触发 hashchange —— 否则外壳会把
+    // 刚建好的页面整个拆掉重建（双 SSE、双请求、选中态丢失）。
     const { params } = currentRoute();
     if (params !== taskId) navigate('workbench', { task: taskId }, true);
   }
@@ -336,7 +348,17 @@ export default async function renderWorkbench(root, ctx) {
 
   /* ---------- 拉取权威快照 ---------- */
 
-  async function refreshCurrent({ manual = false } = {}) {
+  /**
+   * 拉取权威快照并覆盖乐观状态。
+   *
+   * @param {object} [opts]
+   * @param {boolean} [opts.manual] 用户主动点击刷新：显示 loading 与成功提示，
+   *   失败时用 toast（不破坏当前内容）。
+   * @param {boolean} [opts.background] 后台自动刷新（任务结束后的最终对齐）。
+   *   失败必须**静默**：调用方刚渲染好的摘要卡是有内容的，
+   *   把它换成一张错误卡是"用一次后台失败抹掉一次成功渲染"。
+   */
+  async function refreshCurrent({ manual = false, background = false } = {}) {
     const taskId = getState('activeTaskId');
     if (!taskId) return;
 
@@ -370,7 +392,9 @@ export default async function renderWorkbench(root, ctx) {
     } catch (err) {
       if (manual) {
         toast({ tone: 'error', title: '刷新失败', desc: err?.message || String(err) });
-      } else {
+      } else if (!background) {
+        // 只有"用户正等着看结果"的那种刷新（首次加载/切任务）才允许展示错误卡。
+        // 后台刷新失败时界面里的旧数据仍然有效，抹掉它反而是净损失。
         clear(summaryEl);
         summaryEl.append(
           card({
@@ -389,9 +413,23 @@ export default async function renderWorkbench(root, ctx) {
 
   /* ---------- SSE ---------- */
 
+  /**
+   * 事件流生命周期管理器（纯逻辑，见 `../stream.js` 的模块注释）。
+   *
+   * 一句话：`create()` 先关旧流，`isActive(token)` 让过期流的回调自动失效。
+   * 这样"快速点 A 再点 B"既不会泄漏 A 的连接，也不会把 A 的事件画进 B 的图。
+   */
+  const streamSlot = new StreamSlot();
+
+  /** 建立订阅；`token.close` 由 StreamSlot 负责调用。 */
   function openStream(taskId) {
-    unsubscribeStream = subscribeTaskEvents(taskId, {
+    const token = streamSlot.create(taskId);
+    token.onClose = subscribeTaskEvents(taskId, {
       onEvent: (ev, meta) => {
+        // 过期流（切任务/任务已结束）的事件一律丢弃：否则会把上一个任务的
+        // 节点事件写进当前任务的图与时间线 —— 表现为"串台"。
+        if (!streamSlot.isActive(token)) return;
+
         // 重连后的重复投递：直接丢弃。既不用重绘图（内容没变），
         // 也不能污染事件数组 —— 否则时间线会出现整段重复。
         if (meta?.duplicate) return;
@@ -416,15 +454,15 @@ export default async function renderWorkbench(root, ctx) {
         }
       },
       onError: (err) => {
-        // 重连中 —— 只提示一次，不刷屏
-        if (!openStream.warned) {
-          openStream.warned = true;
-          toast({
-            tone: 'warning',
-            title: '事件流连接中断',
-            desc: `${err.message}（浏览器会自动重连，历史事件不会重复）`,
-          });
-        }
+        // 重连中 —— 每条流只提示一次，不刷屏。warned 挂在 token 上，
+        // 而不是挂在函数对象上：切任务后新流应当能重新提示。
+        if (!streamSlot.isActive(token) || token.warned) return;
+        token.warned = true;
+        toast({
+          tone: 'warning',
+          title: '事件流连接中断',
+          desc: `${err.message}（浏览器会自动重连，历史事件不会重复）`,
+        });
       },
       onClose: () => {
         // 服务端在任务结束后主动关闭，属正常路径，不报错
@@ -433,9 +471,7 @@ export default async function renderWorkbench(root, ctx) {
   }
 
   function closeStream() {
-    unsubscribeStream?.();
-    unsubscribeStream = null;
-    openStream.warned = false;
+    streamSlot.close();
   }
 
   /* ---------- DAG ---------- */
@@ -813,7 +849,8 @@ export default async function renderWorkbench(root, ctx) {
     clear(summaryEl);
 
     const stats = [
-      ['状态', statusLabel(detail.status)],
+      // 同样是任务级状态：detail.status 是 TaskStatus，不是 StepStatus
+      ['状态', taskStatusLabel(detail.status)],
       ['耗时', fmtDuration(detail.duration_ms)],
       ['token', fmtInt(detail.total_tokens)],
       ['成本', fmtCost(detail.total_cost_usd)],

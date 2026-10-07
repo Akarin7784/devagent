@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import re
+import stat
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,9 @@ from pathlib import Path
 from devagent.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+DEFAULT_MAX_FILE_BYTES = 2_000_000
+"""单个源码文件的字节上限：超过则跳过（避免把巨型文件读进模型上下文/内存）。"""
 
 try:  # pragma: no cover - 取决于运行环境是否安装
     import tree_sitter_python as tspython
@@ -105,10 +109,12 @@ class CodeIndex:
         *,
         excludes: tuple[str, ...] = DEFAULT_EXCLUDES,
         max_files: int = 2000,
+        max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
     ) -> None:
         self.root = Path(root).resolve()
         self.excludes = set(excludes)
         self.max_files = max_files
+        self.max_file_bytes = max(int(max_file_bytes), 1)
         self.files: dict[str, FileIndex] = {}
         self._built = False
         self._parser: object | None = None
@@ -137,13 +143,23 @@ class CodeIndex:
         return self
 
     def index_file(self, path: Path) -> FileIndex | None:
-        """索引单个文件。"""
+        """索引单个文件。
+
+        越界路径（符号链接 / Windows 目录联接指向仓库外）、链接本身与超大
+        文件一律跳过——索引的内容会进入模型上下文，不能越界读取。
+        """
+        if not self._is_inside_root(path) or _is_link_or_reparse_point(path):
+            logger.debug("index_file_outside_root_skipped", path=str(path))
+            return None
+        if self._is_oversized(path):
+            logger.info("index_file_too_large_skipped", path=str(path), limit=self.max_file_bytes)
+            return None
         try:
             source = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             return None
 
-        rel = str(path.relative_to(self.root)).replace("\\", "/")
+        rel = str(path.resolve().relative_to(self.root)).replace("\\", "/")
         if _TS_AVAILABLE:
             symbols, imports = self._parse_with_tree_sitter(source)
             mode = "tree-sitter"
@@ -180,14 +196,18 @@ class CodeIndex:
         if parser is None:
             return self._parse_with_regex(source)
 
-        tree = parser.parse(source.encode("utf-8"))  # type: ignore[attr-defined]
+        # tree-sitter 的 start_byte/end_byte 是 **UTF-8 字节偏移**，不是 str 的
+        # 字符下标。含中文的源码必须按字节切片再解码，否则符号名/导入/文档
+        # 字符串会整体错位（例如期望 '中文' 却得到 "中文'\n"）。
+        source_bytes = source.encode("utf-8")
+        tree = parser.parse(source_bytes)  # type: ignore[attr-defined]
         symbols: list[Symbol] = []
         imports: list[str] = []
 
         def visit(node: object, parent: str | None = None) -> None:
             ntype = getattr(node, "type", "")
             if ntype == "class_definition":
-                name = _node_text(node, "name", source)
+                name = _node_text(node, "name", source_bytes)
                 if name:
                     symbols.append(
                         Symbol(
@@ -196,12 +216,12 @@ class CodeIndex:
                             file="",
                             start_line=node.start_point[0] + 1,  # type: ignore[attr-defined]
                             end_line=node.end_point[0] + 1,  # type: ignore[attr-defined]
-                            docstring=_extract_docstring(node, source),
+                            docstring=_extract_docstring(node, source_bytes),
                         )
                     )
                     parent = name
             elif ntype == "function_definition":
-                name = _node_text(node, "name", source)
+                name = _node_text(node, "name", source_bytes)
                 if name:
                     symbols.append(
                         Symbol(
@@ -210,14 +230,16 @@ class CodeIndex:
                             file="",
                             start_line=node.start_point[0] + 1,  # type: ignore[attr-defined]
                             end_line=node.end_point[0] + 1,  # type: ignore[attr-defined]
-                            docstring=_extract_docstring(node, source),
+                            docstring=_extract_docstring(node, source_bytes),
                             parent=parent,
                         )
                     )
             elif ntype in {"import_statement", "import_from_statement"}:
-                text = source[
-                    node.start_byte : node.end_byte  # type: ignore[attr-defined]
-                ]
+                text = _slice_utf8(
+                    source_bytes,
+                    node.start_byte,  # type: ignore[attr-defined]
+                    node.end_byte,  # type: ignore[attr-defined]
+                )
                 imports.append(text.strip())
 
             for child in getattr(node, "children", []):
@@ -386,27 +408,73 @@ class CodeIndex:
         return self._built
 
     def _iter_files(self) -> Iterator[Path]:
-        """遍历 Python 文件，跳过排除目录。"""
+        """遍历 Python 文件，跳过排除目录、越界路径、链接与超大文件。"""
         for path in self.root.rglob("*.py"):
             if any(part in self.excludes for part in path.parts):
                 continue
+            if not self._is_inside_root(path) or _is_link_or_reparse_point(path):
+                # 目录联接 / 符号链接可能把仓库外的文件拉进模型上下文
+                logger.debug("index_path_outside_root_skipped", path=str(path))
+                continue
+            if self._is_oversized(path):
+                logger.info(
+                    "index_file_too_large_skipped", path=str(path), limit=self.max_file_bytes
+                )
+                continue
             yield path
 
+    def _is_inside_root(self, path: Path) -> bool:
+        """解析后必须仍位于仓库根目录内（防链接逃逸）。"""
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+        try:
+            resolved.relative_to(self.root)
+        except ValueError:
+            return False
+        return True
 
-def _node_text(node: object, field_name: str, source: str) -> str:
-    """提取节点某字段的源码文本。"""
+    def _is_oversized(self, path: Path) -> bool:
+        try:
+            return path.stat().st_size > self.max_file_bytes
+        except OSError:
+            return True
+
+
+def _is_link_or_reparse_point(path: Path) -> bool:
+    """符号链接或 Windows 重解析点（目录联接）返回 True。
+
+    无法确认时按「是」处理：索引宁可少一个文件，也不能越界读文件。
+    """
+    try:
+        st = path.lstat()
+    except OSError:
+        return True
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = getattr(st, "st_file_attributes", 0)
+    return bool(attributes & reparse_flag)
+
+
+def _slice_utf8(source_bytes: bytes, start: int, end: int) -> str:
+    """按 UTF-8 字节偏移切片并解码（tree-sitter 的偏移语义）。"""
+    return source_bytes[start:end].decode("utf-8", errors="replace")
+
+
+def _node_text(node: object, field_name: str, source_bytes: bytes) -> str:
+    """提取节点某字段的源码文本（按字节偏移，避免中文错位）。"""
     try:
         child = node.child_by_field_name(field_name)  # type: ignore[attr-defined]
     except AttributeError:
         return ""
     if child is None:
         return ""
-    start = child.start_byte
-    end = child.end_byte
-    return source[start:end]
+    return _slice_utf8(source_bytes, child.start_byte, child.end_byte)
 
 
-def _extract_docstring(node: object, source: str) -> str:
+def _extract_docstring(node: object, source_bytes: bytes) -> str:
     """提取节点的文档字符串（若首个子语句是字符串字面量）。"""
     try:
         body = node.child_by_field_name("body")  # type: ignore[attr-defined]
@@ -418,7 +486,7 @@ def _extract_docstring(node: object, source: str) -> str:
         if getattr(child, "type", "") == "expression_statement":
             for sub in getattr(child, "children", []):
                 if getattr(sub, "type", "") == "string":
-                    text = source[sub.start_byte : sub.end_byte]
+                    text = _slice_utf8(source_bytes, sub.start_byte, sub.end_byte)
                     return text.strip("\"'").strip()[:200]
         break
     return ""
@@ -439,6 +507,7 @@ def _describe_match(matched: list[str]) -> str:
 
 __all__ = [
     "DEFAULT_EXCLUDES",
+    "DEFAULT_MAX_FILE_BYTES",
     "CodeIndex",
     "FileIndex",
     "SearchHit",

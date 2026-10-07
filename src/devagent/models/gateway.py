@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -37,7 +37,7 @@ from devagent.models.providers import (
     ZhipuProvider,
 )
 from devagent.models.vector_cache import VectorSemanticCache
-from devagent.observability import get_observability
+from devagent.observability import MetricNames, get_observability
 
 logger = get_logger(__name__)
 
@@ -66,9 +66,15 @@ class CostLedger:
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     total_cost_usd: float = 0.0
-    records: list[CallRecord] = field(default_factory=list)
+    records: deque[Any] = field(default_factory=lambda: deque(maxlen=1000))
+    """明细环形缓冲。
 
-    def add(self, record: CallRecord) -> None:
+    刻意用**有界** deque：网关是进程级单例，长跑服务里每个模型调用都会
+    追加一条记录，而只有测试会读它 —— 无界列表等于给服务埋一个稳定增长
+    的内存泄漏。聚合数字（``calls`` / ``total_*``）不受影响。
+    """
+
+    def add(self, record: Any) -> None:
         self.calls += 1
         if record.cached:
             self.cache_hits += 1
@@ -193,6 +199,8 @@ class ModelGateway:
             self._cache = SemanticCache(max_entries=cache_cfg.max_entries if cache_cfg else 512)
         self._providers = providers if providers is not None else self._build_providers(settings)
         self.ledger = CostLedger()
+        self._unpriced_models: set[str] = set()
+        """已告警过的"价格表未命中"模型，避免每次调用都刷一条日志。"""
 
     @property
     def provider_names(self) -> list[str]:
@@ -405,7 +413,7 @@ class ModelGateway:
                 )
                 continue
 
-            cost = self._estimate_cost(provider, result.usage, candidate.model)
+            cost = self._cost_or_warn(provider, result.usage, candidate.model)
             self.ledger.add(
                 CallRecord(
                     provider=candidate.provider,
@@ -419,7 +427,28 @@ class ModelGateway:
             )
 
             if use_cache and self._cache_enabled and not tools:
-                await self._cache_put(messages, str(spec), temperature, result)
+                # ★ 只在「不是因为主模型故障而降级」时写缓存。
+                # 早先无条件写入、且用的是请求的 spec：某次 deepseek 5xx 之后
+                # qwen 的答案被存进 deepseek 的桶，等 deepseek 恢复，
+                # 同一个请求会命中那次降级产生的答案 —— 与模块文档承诺的
+                # 「跨桶不互相召回」正好相反。
+                #
+                # 注意判据是「主模型**可用**却没用上」，而不是「candidate != spec」：
+                # 主模型压根没配置（路由默认指向一个没有 Key 的提供商）时，
+                # 降级是常态而非异常，此时缓存它是正确且必要的 ——
+                # 唯一的替代方案是把同一个请求再打一遍。
+                degraded_from_healthy_primary = (
+                    candidate != spec and spec.provider in self._providers
+                )
+                if degraded_from_healthy_primary:
+                    logger.info(
+                        "cache_skip_fallback_result",
+                        requested=str(spec),
+                        used=str(candidate),
+                        reason="主模型可用但本次失败，降级结果不入缓存",
+                    )
+                else:
+                    await self._cache_put(messages, str(spec), temperature, result)
 
             get_observability().record_llm_call(
                 model=result.model,
@@ -492,6 +521,27 @@ class ModelGateway:
             return 0.0
         result: float = estimator(usage, model=model)
         return result
+
+    def _cost_or_warn(self, provider: ModelProvider, usage: TokenUsage, model: str) -> float:
+        """估算成本；价格表未命中时**必须留痕**。
+
+        为什么：``Providers.estimate_cost`` 在 ``PRICES`` 找不到模型时直接
+        ``return 0.0``。于是任何配了价格表外模型名的部署（换型号、厂商返回
+        带日期的快照 id）都会把真实花费静默记成 $0 —— 成本账本、任务成本、
+        评测报告一起偏低，而且没有任何地方能看出来。
+        """
+        cost = self._estimate_cost(provider, usage, model)
+        tokens = usage.prompt_tokens + usage.completion_tokens
+        if cost == 0.0 and tokens > 0 and model not in self._unpriced_models:
+            self._unpriced_models.add(model)
+            logger.warning(
+                "model_price_unknown",
+                provider=getattr(provider, "name", "?"),
+                model=model,
+                hint="该模型不在价格表中，成本将记为 0；请补充价格表或改用已定价模型",
+            )
+            get_observability().inc(MetricNames.LLM_UNPRICED_CALLS, 1, model=model)
+        return cost
 
 
 __all__ = [

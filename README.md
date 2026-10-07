@@ -4,7 +4,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-565%20passing-brightgreen)](#测试)
+[![Tests](https://img.shields.io/badge/tests-653%20passing-brightgreen)](#测试)
 [![mypy](https://img.shields.io/badge/mypy-strict-blue)](https://mypy-lang.org/)
 [![Ruff](https://img.shields.io/badge/code%20style-ruff-000000)](https://github.com/astral-sh/ruff)
 
@@ -71,6 +71,10 @@ Verifier 上下文: requirements.验收标准 + diff + 测试stdout   ← 无 Co
 
 这条边界由 `ContextIsolator` 在代码层面强制，并有专门测试守护。
 
+**验证不可用时 fail-closed**：Verifier 调用失败（上游 5xx / 超时 / 限流）时，
+节点判为**未通过**并计入 `verification_unavailable` 指标 —— 绝不因为"验证跑不了"
+就把未经验证的产物标记成成功。一次瞬时网络错误不该等于一次静默放行。
+
 ### 2. DAG 驱动的编排与回退
 
 Architect 把任务分解为 DAG，编排器按拓扑序并行调度无依赖节点。
@@ -128,16 +132,20 @@ devagent run "为用户列表接口增加分页能力"
 `demo_smoke.py` 的预期输出：
 
 ```
-任务 task_1791360851430  状态=succeeded
+任务 task_1791360851430_a3f1  状态=succeeded
 模型调用次数 : 8
 DAG 节点     : {"N1": "success"}
 执行步骤     : requirement:ok -> architect:ok -> coder:ok -> verifier:reject -> coder:ok -> verifier:pass
-token 总量   : 2011
+token 总量   : 4808
 SMOKE OK
 ```
 
 > 注意其中 `verifier:reject → coder:ok` 这一段：脚本故意让验证器第一次驳回，
 > 用来覆盖**回退重试**路径。真实运行时这条路径由模型自行触发。
+>
+> `token 总量` 计入**全部**模型调用（需求 / 架构 / Coder / Tester / Verifier），
+> 而不是只算主链路 —— 漏记 Tester 与 Verifier 会让熔断器看到的用量只有真实的
+> 三分之一，可用预算悄悄变成配置值的三倍。
 
 ### 启动控制台
 
@@ -197,7 +205,7 @@ devagent serve --port 8000
 | 可观测性 | `src/devagent/observability/` | 自研 Span/Metrics，可降级 OTLP |
 | 评测 | `src/devagent/evaluation/` | Golden set、双向 LLM-as-Judge、轨迹指标 |
 | API | `src/devagent/api/` | FastAPI + SSE 流式进度 |
-| 前端 | `web/` | 零构建控制台：DAG 依赖图 + diff 查看器（原生 ES Module） |
+| 前端 | `web/` | 零构建多页控制台：DAG 依赖图、上下文看板、评测与可观测性（原生 ES Module） |
 
 ---
 
@@ -255,15 +263,18 @@ score(chunk) = w_rel · relevance
 
 ```bash
 # 模型供应商（至少配一个）
-DEEPSEEK_API_KEY=sk-xxx
-QWEN_API_KEY=sk-xxx
-ZHIPU_API_KEY=xxx
+DEVAGENT_MODELS__DEEPSEEK__API_KEY=sk-xxx
+DEVAGENT_MODELS__QWEN__API_KEY=sk-xxx
+DEVAGENT_MODELS__ZHIPU__API_KEY=xxx
 
 # 嵌套配置示例
 DEVAGENT_MODELS__DEEPSEEK__TIMEOUT_SECONDS=120
 DEVAGENT_OBSERVABILITY__METRICS_ENABLED=true
-DEVAGENT_ORCHESTRATION__MAX_ATTEMPTS=3
+DEVAGENT_RELIABILITY__MAX_RETRIES=3
 ```
+
+> 供应商没有独立的 ``ENABLED`` 开关：``ProviderConfig.enabled`` 由
+> 「``api_key`` 与 ``base_url`` 同时非空」推导（空串 Key 视为未配置）。
 
 完整清单见 [`.env.example`](.env.example)。
 
@@ -271,17 +282,21 @@ DEVAGENT_ORCHESTRATION__MAX_ATTEMPTS=3
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `DEVAGENT_MODELS__*__ENABLED` | 按 Key 自动 | 供应商开关 |
-| `DEVAGENT_OBSERVABILITY__METRICS_ENABLED` | `false` | 指标采集（默认关闭，零开销） |
+| `DEVAGENT_MODELS__<PROVIDER>__API_KEY` | 空 | 供应商密钥；Key 与 `BASE_URL` 都有才算已配置 |
+| `DEVAGENT_OBSERVABILITY__METRICS_ENABLED` | `true`（API 启动时） | 指标采集（库层默认关闭，零开销） |
 | `DEVAGENT_OBSERVABILITY__OTLP_ENDPOINT` | `""` | 设置后走 OTLP 导出 |
-| `DEVAGENT_ORCHESTRATION__MAX_ATTEMPTS` | `3` | 单节点最大尝试次数 |
-| `DEVAGENT_RELIABILITY__MAX_TASK_TOKENS` | `500_000` | 任务级 token 熔断阈值 |
+| `DEVAGENT_RELIABILITY__MAX_RETRIES` | `3` | 单节点最大尝试次数 |
+| `DEVAGENT_RELIABILITY__MAX_TASK_TOKENS` | `500_000` | 任务级 token 熔断阈值（含 Tester/Verifier 调用） |
 | `DEVAGENT_STORAGE__BACKEND` | `memory` | 任务存储后端：`memory` 或 `sql` |
 | `DEVAGENT_DATABASE__URL` | 本地 Postgres | `sql` 模式下的连接串；测试用 `sqlite+aiosqlite:///./devagent.db` |
 | `DEVAGENT_CACHE__SEMANTIC` | `false` | 开启向量检索语义缓存（需嵌入模型） |
 | `DEVAGENT_CACHE__SIMILARITY_THRESHOLD` | `0.92` | 语义命中的余弦相似度阈值 |
 | `DEVAGENT_CONTEXT__INJECTION_GUARD` | `true` | 给不可信来源的上下文加内容边界标记 |
 | `DEVAGENT_CONTEXT__WEIGHT_TRUST` | `1.0` | 信任度在装配打分中的权重（0 = 关闭） |
+| `DEVAGENT_SANDBOX__WORKSPACE_MOUNT` | 临时目录 | 测试工作区；留空则每次启动建一个一次性目录 |
+| `DEVAGENT_SANDBOX__ALLOW_LOCAL_FALLBACK` | `true` | Docker 不可用时是否降级为本地沙箱（生产建议 `false`，fail-closed） |
+| `DEVAGENT_SECURITY__API_KEY` | `""` | 非空时 `/api/v1/**` 要求 `X-API-Key` 请求头 |
+| `DEVAGENT_EVALUATION__DATASET_DIR` | `datasets` | 评测接口允许读取的数据集根目录 |
 | `DEVAGENT_EVALUATION__JUDGE_MODEL` | `deepseek:deepseek-chat` | 主裁判模型 |
 | `DEVAGENT_EVALUATION__REFERENCE_JUDGE_MODEL` | `qwen:qwen-plus` | 异构参考裁判（用于标定自我偏好偏差） |
 | `DEVAGENT_EVALUATION__ENABLE_BIDIRECTIONAL_JUDGE` | `true` | 双向评估（对冲位置偏差） |
@@ -458,14 +473,41 @@ curl -N http://localhost:8000/api/v1/tasks/<id>/events
 
 ## 前端
 
-`web/` 是**零构建**的依赖图控制台：无需 `npm install`，打开 `web/index.html` 即用。
+`web/` 是**零构建**的多页控制台：无需 `npm install`，打开 `web/index.html` 即用。
+原生 ES Module + 自研组件层 + 一套设计令牌，支持明暗双主题与响应式布局。
 
-| 面板 | 内容 |
+### 页面
+
+| 路由 | 内容 |
 | --- | --- |
-| 任务 DAG | 节点按状态着色（成功/执行中/回退/失败），`×N` 徽标显示重跑轮次 |
-| 节点详情 | 点击节点查看角色、依赖、token 与**代码改动 diff**（逐行着色） |
-| 执行时间线 | SSE 事件的原始流水，与 DAG 互为补充 |
-| 上下文看板 | token 节省、压缩比、预算利用率、缓存命中 |
+| 总览 | 任务 KPI、成功率、累计 token/成本、近期任务、健康告警 |
+| 工作台 | 任务 DAG（节点按状态着色，`×N` 显示重跑轮次）、节点详情与**逐行着色的 diff**、SSE 执行时间线 |
+| 上下文看板 | 五层上下文能力指标、token 节省、压缩比、预算利用率、语义缓存命中 |
+| 评测中心 | golden set 跑批、任务级/轨迹级/质量级指标、分类别表现、判别力提示 |
+| 可观测性 | 指标明细表（可搜索排序）、Prometheus 导出、链路追踪、缓存统计 |
+| 设置 | 后端连接、外观偏好、本地数据管理 |
+
+### 设计系统
+
+- **三层令牌**：`palette` → `semantic` → 组件。组件只引用语义层，
+  因此切换主题时组件 CSS 零改动（187 个令牌，无悬空引用）。
+- **明暗双主题**：跟随系统 / 手动切换，`prefers-color-scheme` 实时监听，
+  首屏有防 FOUC 预置脚本。
+- **图标**：77 个内联 SVG，继承 `currentColor`，暗色主题下自动适配。
+- **可访问性**：焦点陷阱与恢复、`:focus-visible`、skip-link、
+  `aria-live` 分级通知、`prefers-reduced-motion`、`forced-colors`、WCAG AA 对比度。
+- **响应式**：≤1023px 侧栏转抽屉，≤767px 表格转卡片，触摸目标 ≥38px。
+
+### 目录
+
+```
+web/
+├── index.html          外壳挂载点
+├── css/                tokens / base / components / responsive
+├── js/                 util, api, store, components, shell, main, icons
+│   └── pages/          6 个业务页面
+└── graph.js            DAG 布局纯函数（不碰 document）
+```
 
 想在没有 API Key 的环境下看到完整 DAG：
 
@@ -477,10 +519,10 @@ make web-serve          # http://localhost:5173
 # 浏览器打开：http://localhost:5173/?api=http://127.0.0.1:8812
 ```
 
-前端逻辑（布局、事件叠加、diff 解析）可在无浏览器环境下测试：
+前端逻辑可在无浏览器环境下测试：
 
 ```bash
-make web-check          # node --check + 46 个纯逻辑断言（先自动导出跨语言词表）
+make web-check   # 语法检查 + 模块图完整性 + 73 个纯逻辑断言（零依赖）
 ```
 
 ---
@@ -488,20 +530,25 @@ make web-check          # node --check + 46 个纯逻辑断言（先自动导出
 ## 测试
 
 ```bash
-make test            # 全量（565 个）
+make test            # 全量（653 个）
 make test-unit       # 仅单元测试
 make check           # ruff + mypy --strict
-make web-check       # 前端语法 + 逻辑测试（46 个，零依赖）
+make web-check       # 前端语法 + 模块图 + 逻辑测试（178 个，零依赖）
 ```
 
 当前状态：
 
 ```
-565 passed in 21.1s
+653 passed, 1 skipped in 19.9s
 46 passed (web/graph.test.js)
+17 passed (web/eventstream.test.js)
+37 passed (web/status.test.js)
+27 passed (web/format.test.js)
+41 passed (web/pages.test.js)
+10 passed (web/imports.test.js)
 ruff check .......... 通过
 ruff format --check . 通过
-mypy --strict ....... 60 个源文件，0 错误
+mypy --strict ....... 61 个源文件，0 错误
 ```
 
 测试覆盖了若干**回归场景**，每一个都对应一个曾经真实存在的 bug：

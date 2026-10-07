@@ -39,6 +39,8 @@ from devagent.context.tokenizer import (
     TokenCounter,
     Vector,
     cosine_similarity,
+    estimate_info_units,
+    lexical_similarity,
 )
 from devagent.context.trust import assess_trust
 from devagent.enums import ContextKind
@@ -47,6 +49,24 @@ from devagent.models.domain import (
     BudgetAllocation,
     ContextChunk,
 )
+
+
+def chunk_similarity(a: ContextChunk, b: ContextChunk) -> float:
+    """两个片段的相似度：有向量用余弦，没向量退化为词法 Jaccard。
+
+    **这是本模块最重要的一处兜底**。早先的实现只算余弦相似度，而
+    ``cosine_similarity`` 在任一入参为 ``None`` 时返回 0 —— 偏偏
+    embedding 是可选能力，生产路径上没有任何片段带向量（需要额外调用
+    嵌入模型）。结果是相关性恒为 0、冗余惩罚恒为 0、**硬去重永不触发**，
+    整套「加权打分 + 硬去重」退化成「按插入顺序取片段」，
+    而单测因为手工构造了向量所以全绿。
+
+    现在语义是：**有精确向量就信向量，没有就必须用词法兜底**，
+    保证算法在任何配置下都不会静默失效。
+    """
+    if a.embedding is not None and b.embedding is not None:
+        return cosine_similarity(a.embedding, b.embedding)
+    return lexical_similarity(a.content, b.content)
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +191,7 @@ class ContextAssembler:
         task_embedding: Vector | None,
         current_step: str,
         selected: Sequence[ContextChunk],
+        task_text: str = "",
     ) -> ScoreBreakdown:
         """计算单个片段的得分明细。
 
@@ -179,12 +200,18 @@ class ContextAssembler:
             task_embedding: 当前任务的语义向量，用于相关性计算。
             current_step: 当前步骤 id，用于依赖判定。
             selected: 已选中的片段集合，用于冗余惩罚。
+            task_text: 当前任务的**文本**（需求目标等）。当两侧都没有向量时，
+                用它做词法相关性兜底 —— 否则相关性项恒为 0（见
+                ``chunk_similarity`` 的说明）。
         """
         w = self._weights
         b = ScoreBreakdown(chunk_id=chunk.id)
 
-        # 相关性：与任务语义向量的余弦相似度
-        b.relevance = cosine_similarity(chunk.embedding, task_embedding)
+        # 相关性：优先语义向量，缺失时退化为词法重叠
+        if chunk.embedding is not None and task_embedding is not None:
+            b.relevance = cosine_similarity(chunk.embedding, task_embedding)
+        else:
+            b.relevance = lexical_similarity(chunk.content, task_text)
 
         # 时效：指数衰减，越新越重要
         import math
@@ -198,12 +225,12 @@ class ContextAssembler:
         density_raw = chunk.info_units / max(chunk.tokens, 1)
         b.density = min(density_raw * 100.0, 1.0)
 
-        # 冗余：与已选片段的最大余弦相似度，做非线性放大
+        # 冗余：与已选片段的最大相似度，做非线性放大
         # 相似度 1.0 → 罚满；相似度 0.5 → 仅罚 0.5^gamma（gamma=4 → 0.0625）
         # 使得「高度重复」被强压制，而「部分重叠」几乎不受影响。
         max_sim = 0.0
         for s in selected:
-            sim = cosine_similarity(chunk.embedding, s.embedding)
+            sim = chunk_similarity(chunk, s)
             if sim > max_sim:
                 max_sim = sim
         b.redundancy = max(0.0, max_sim) ** w.redundancy_gamma
@@ -238,13 +265,14 @@ class ContextAssembler:
         budget: BudgetAllocation,
         agent: Any = None,  # AgentType，避免循环导入用 Any
         step_id: str = "",
+        task_text: str = "",
         task_spec_chunks_first: bool = True,  # noqa: ARG002  预留开关，当前位置编排恒按 age 排
     ) -> AssemblyResult:
         """执行装配。
 
         步骤：
         1. 预算回流（quota 未用满时把余量给 code_context，再取可用上限）；
-        2. 硬约束无条件优先纳入；
+        2. 硬约束无条件优先纳入（先按内容去重，见下）；
         3. 其余候选按带冗余惩罚的贪心逐轮选择；
         4. 位置编排输出。
 
@@ -255,6 +283,7 @@ class ContextAssembler:
             budget: 预算分配。
             agent: 当前 Agent 类型（仅用于决策记录）。
             step_id: 当前步骤 id（用于决策记录）。
+            task_text: 任务文本，用于无向量时的相关性兜底。
             task_spec_chunks_first: 预留开关（位置编排由 placement 决定）。
         """
         tokens_before = sum(c.tokens for c in candidates)
@@ -263,6 +292,23 @@ class ContextAssembler:
 
         hard, soft = self._partition(candidates)
 
+        # 硬约束去重：硬片段**不参与**下面的软片段去重循环，也不受预算约束，
+        # 因此一旦上游重复投喂（例如节点重试时再次 handoff），它们会无限累积
+        # 并挤爆上下文窗口。内容完全相同即视为同一约束，只保留第一份。
+        deduped_hard: list[ContextChunk] = []
+        seen_content: set[str] = set()
+        hard_duplicates = 0
+        for chunk in hard:
+            # 用内容本身（去首尾空白）而不是 hash()：精确、无碰撞，
+            # 且不必依赖进程级哈希随机化。
+            fingerprint = chunk.content.strip()
+            if fingerprint in seen_content:
+                hard_duplicates += 1
+                continue
+            seen_content.add(fingerprint)
+            deduped_hard.append(chunk)
+        hard = deduped_hard
+
         selected: list[ContextChunk] = []
         used = 0
 
@@ -270,6 +316,10 @@ class ContextAssembler:
         for chunk in hard:
             selected.append(chunk)
             used += chunk.tokens
+
+        # 硬约束本身就超预算时**必须留下痕迹**：此前是静默无限投递，
+        # 实际会撞模型上下文窗口（实测预算 2000 时投递 13530 token）。
+        hard_overflow = max(0, used - limit)
 
         # ---- 软片段：贪心选择 ----
         pool = list(soft)
@@ -280,7 +330,8 @@ class ContextAssembler:
         while pool and used < limit:
             # 每轮重新打分：冗余度依赖已选集合，必须动态计算
             scored = [
-                (c, self.score_chunk(c, task_embedding, current_step, selected)) for c in pool
+                (c, self.score_chunk(c, task_embedding, current_step, selected, task_text))
+                for c in pool
             ]
             best_chunk, best_score = max(scored, key=lambda pair: pair[1].total)
 
@@ -314,11 +365,16 @@ class ContextAssembler:
             tokens_before=tokens_before,
             tokens_after=used,
             budget_total=budget.total,
-            compression_applied=used < tokens_before,
+            hard_overflow_tokens=hard_overflow,
+            # 压缩与否由 L3 压缩器决定，装配层**不能**用 used < tokens_before
+            # 来推断（那只是"装配丢弃"，不是"压缩"）。ContextEngine 会用
+            # 压缩器的真实结果覆盖这个字段。
+            compression_applied=False,
             reason=(
-                f"硬约束 {len(hard)} 项优先纳入；"
+                f"硬约束 {len(hard)} 项优先纳入（去重 {hard_duplicates} 项）；"
                 f"软片段 {len(soft)} 项中选中 {len(ordered) - len(hard)} 项，"
                 f"去重 {deduplicated} 项，预算 {used}/{limit}"
+                + (f"；⚠ 硬约束超预算 {hard_overflow} token" if hard_overflow else "")
             ),
         )
         return AssemblyResult(chunks=ordered, decision=decision, scores=scores)
@@ -333,22 +389,25 @@ class ContextAssembler:
 
         输出顺序（从首到尾）::
 
-            [硬约束...] → [辅助材料...（越旧越靠前）] → [最新内容...（最新在最尾）]
+            [硬约束...] → [辅助材料（越旧越靠前）] → [最新内容（最新在最尾）]
 
         依据：模型对序列首尾的注意力权重更高，因此把**不可违反的约束**
         放头部保证不被忽略，把**最新任务状态**放尾部保证靠近生成位置
         （自回归模型对紧邻生成位置的内容利用最充分）。
+
+        为什么就是「按 age 降序」这一件事：降序天然满足两个约束 ——
+        最旧的在最前（紧跟硬约束之后）、最新的在最后。早先的实现在降序
+        序列上又切了"前 N 个当尾部区"，等于把**最旧**的若干项搬到了尾部，
+        同时把真正最新的项留在了中部 —— 方向正好相反，而当时的单测只用了
+        2 个软片段，恰好掩盖了这个错误。
         """
         hard = [c for c in chunks if c.is_hard]
         soft = [c for c in chunks if not c.is_hard]
 
-        # 越旧越靠前：按 age 降序排列（age 大 = 旧在前）
+        # age 大 = 旧。降序即「越旧越靠前」，且最新者自然落在最末。
         soft_by_age = sorted(soft, key=lambda c: c.age, reverse=True)
-        newest_count = min(2, len(soft_by_age))
-        recent = soft_by_age[:newest_count]  # 尾部区（age 最小的最新）
-        middle = soft_by_age[newest_count:]  # 中部区（更旧）
 
-        return [*hard, *middle, *recent]
+        return [*hard, *soft_by_age]
 
     # ------------------------------------------------------------------ #
     # 辅助
@@ -366,9 +425,13 @@ class ContextAssembler:
         return hard, soft
 
     def is_redundant(self, chunk: ContextChunk, selected: Sequence[ContextChunk]) -> bool:
-        """判断片段是否与已选项冗余（超过阈值）。"""
+        """判断片段是否与已选项冗余（超过阈值）。
+
+        用 ``chunk_similarity`` 而非裸的 ``cosine_similarity``：
+        没有向量时必须走词法兜底，否则去重恒不触发（见该函数说明）。
+        """
         threshold = self._weights.redundancy_cosine_threshold
-        return any(cosine_similarity(chunk.embedding, s.embedding) > threshold for s in selected)
+        return any(chunk_similarity(chunk, s) > threshold for s in selected)
 
 
 def estimate_tokens(text: str, counter: TokenCounter | None = None) -> int:
@@ -395,7 +458,7 @@ def make_chunk(
     """
     c = counter or HeuristicTokenCounter()
     tokens = c.count(content)
-    units = info_units if info_units is not None else max(1, len(content.split(". ")))
+    units = info_units if info_units is not None else estimate_info_units(content)
     return ContextChunk(
         content=content,
         kind=kind,
@@ -419,6 +482,7 @@ __all__ = [
     "ContextAssembler",
     "ScoreBreakdown",
     "ScoringWeights",
+    "chunk_similarity",
     "estimate_tokens",
     "make_chunk",
 ]

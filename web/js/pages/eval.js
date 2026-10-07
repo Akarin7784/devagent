@@ -93,6 +93,9 @@ export default async function renderEval(root, ctx) {
 
   function buildFormCard() {
     const body = el('div', { class: 'field', style: { gap: 'var(--space-4)' } });
+    // 所有控件显示值都从 snapshotFormState 取 —— 与提交用的 payload 同源。
+    // 这样"看得见的值"与"提交的值"不可能再分叉（样本上限就曾分叉过）。
+    const { fields } = snapshotFormState(form);
 
     // 数据集路径
     const datasetInput = el('input', {
@@ -101,7 +104,7 @@ export default async function renderEval(root, ctx) {
         type: 'text',
         id: 'dataset-path',
         placeholder: '留空使用配置中的默认数据集',
-        value: form.dataset,
+        value: fields.dataset,
       },
     });
     datasetInput.addEventListener('input', () => {
@@ -123,7 +126,15 @@ export default async function renderEval(root, ctx) {
     catWrap.append(el('div', { class: 'label', text: '类别筛选' }));
     const catList = el('div', { style: { display: 'flex', 'flex-direction': 'column', gap: 'var(--space-2)' } });
     for (const c of CATEGORY_OPTIONS) {
-      const cb = el('input', { attrs: { type: 'checkbox', value: c.id, id: `cat-${c.id}` } });
+      // checked 同样要回填：类别筛选是"看起来没选、实际仍然生效"的同一类缺陷
+      const cb = el('input', {
+        attrs: {
+          type: 'checkbox',
+          value: c.id,
+          id: `cat-${c.id}`,
+          checked: fields.categories.includes(c.id),
+        },
+      });
       cb.addEventListener('change', () => {
         if (cb.checked) form.categories.add(c.id);
         else form.categories.delete(c.id);
@@ -143,9 +154,12 @@ export default async function renderEval(root, ctx) {
     body.append(catWrap);
 
     // 样本上限
+    // `value` 必须回填：paint() 会重建整张表单，而 form.maxSamples 是本地状态。
+    // 不回填的后果是"输入框看起来是空的，但提交时旧值仍然生效" ——
+    // 界面与 payload 不一致，用户会以为上限被清掉了。
     const maxInput = el('input', {
       class: 'input',
-      attrs: { type: 'number', min: '1', id: 'max-samples', placeholder: '不限' },
+      attrs: { type: 'number', min: '1', id: 'max-samples', placeholder: '不限', value: fields.maxSamples },
     });
     maxInput.addEventListener('input', () => {
       form.maxSamples = maxInput.value.trim();
@@ -162,7 +176,7 @@ export default async function renderEval(root, ctx) {
     );
 
     // Judge 开关
-    const judgeCb = el('input', { attrs: { type: 'checkbox', checked: form.useJudge, id: 'use-judge' } });
+    const judgeCb = el('input', { attrs: { type: 'checkbox', checked: fields.useJudge, id: 'use-judge' } });
     judgeCb.addEventListener('change', () => {
       form.useJudge = judgeCb.checked;
     });
@@ -222,12 +236,7 @@ export default async function renderEval(root, ctx) {
     set({ evalRunning: true });
     paint();
 
-    const payload = {
-      ...(form.dataset ? { dataset_path: form.dataset } : {}),
-      ...(form.categories.size ? { categories: [...form.categories] } : {}),
-      ...(form.maxSamples ? { max_samples: Number(form.maxSamples) } : {}),
-      use_judge: form.useJudge,
-    };
+    const { payload } = snapshotFormState(form);
 
     try {
       const result = await api.runEvaluation(payload);
@@ -398,3 +407,42 @@ export default async function renderEval(root, ctx) {
 }
 
 export { badge, fromHTML, navigate, skeletonBlock, errorState };
+
+/* ------------------------------------------------------------------ *
+ * 纯函数助手（可单测）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 把表单状态编译成「请求 payload」与「重绘时各控件应显示的值」。
+ *
+ * ## 为什么需要这个函数
+ *
+ * 本页的表单状态是本地 `form` 对象，而 `paint()` 会整套重建 DOM。
+ * 两者一旦不同步，就会出现最阴险的一类 bug：**看得见的值与提交的值不一致**。
+ * 真实发生过：`样本上限` 输入框重建时忘了回填 `value`，
+ * 于是字段看起来是空的，提交时却仍然带着上次的上限值 ——
+ * 用户以为清空了上限，实际只跑了一小部分样本。
+ *
+ * 把"payload"和"控件显示值"放在同一个函数里返回，任何新增字段都
+ * 被迫同时考虑这两侧；测试也只需断言一次（见 pages.test.js）。
+ *
+ * @param {{dataset?: string, categories?: Set<string>, maxSamples?: string, useJudge?: boolean}} form
+ * @returns {{payload: object, fields: {dataset: string, maxSamples: string, useJudge: boolean, categories: string[]}}}
+ */
+export function snapshotFormState(form = {}) {
+  const dataset = String(form.dataset ?? '').trim();
+  const maxSamples = String(form.maxSamples ?? '').trim();
+  const categories = [...(form.categories || [])];
+  const useJudge = form.useJudge !== false;
+
+  return {
+    payload: {
+      ...(dataset ? { dataset_path: dataset } : {}),
+      ...(categories.length ? { categories } : {}),
+      ...(maxSamples ? { max_samples: Number(maxSamples) } : {}),
+      use_judge: useJudge,
+    },
+    // 这一份就是 paint() 时必须回填到控件上的值，必须与 payload 同源
+    fields: { dataset, maxSamples, useJudge, categories },
+  };
+}

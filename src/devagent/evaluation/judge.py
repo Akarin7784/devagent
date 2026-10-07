@@ -279,8 +279,7 @@ class LLMJudge:
             raw=payload,
         )
 
-    @staticmethod
-    def _merge(a: JudgeResult, b: JudgeResult) -> JudgeResult:
+    def _merge(self, a: JudgeResult, b: JudgeResult) -> JudgeResult:
         """合并两次评估：逐维度取均值，保留矛盾标记。"""
         by_dim: dict[str, list[DimensionScore]] = {}
         for result in (a, b):
@@ -301,15 +300,28 @@ class LLMJudge:
             or b.inconsistent
             or abs(a.overall - b.overall) > _INCONSISTENCY_THRESHOLD
         )
-        # 通过判定取「更保守」的一侧：两次都通过才算通过。
-        # 这与「宁可漏报不可误报」的评测哲学一致 —— 误判为通过会掩盖真实缺陷。
-        passed = a.passed and b.passed
+        # ★ 通过判定必须与 overall **同源**，否则报告会自相矛盾。
+        # 早先是 ``passed = a.passed and b.passed``，而 overall 取平均：
+        # 前向 3.6 / 反向 3.4（阈值 3.5）会产出 {"overall": 3.5, "passed": false}，
+        # 于是 ``mean_judge_score`` 说达标、``judge_pass_rate`` 说没达标，
+        # 同一个样本在两个口径里给出相反结论（异构校正后还会再翻转一次）。
+        #
+        # 现在：分数取平均（保持原有的"平均分"契约），通过与否由该平均分推导。
+        # 两次评估的分歧本身不会丢失 —— 差距大时 ``inconsistent`` 会置位，
+        # 而两次各自的通过结论也原样保留在 ``raw["passes"]`` 里，
+        # 需要"两次都通过才算通过"的下游可以据此自行收紧。
+        passed = overall >= self._pass_threshold
         return JudgeResult(
             scores=merged_scores,
             overall=overall,
             passed=passed,
             inconsistent=inconsistent,
-            raw={"forward": a.raw, "backward": b.raw},
+            raw={
+                "forward": a.raw,
+                "backward": b.raw,
+                "passes": [a.passed, b.passed],
+                "overalls": [a.overall, b.overall],
+            },
         )
 
 

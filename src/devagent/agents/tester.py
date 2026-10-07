@@ -181,7 +181,14 @@ class TesterAgent(BaseAgent):
         """生成测试代码，返回 (内容, tokens, 成本, 模型名)。"""
         messages = self.build_messages(invocation)
         result = await self._gateway.chat(
-            messages, signals=invocation.routing_signals, step_id=invocation.step_id
+            messages,
+            signals=invocation.routing_signals,
+            step_id=invocation.step_id,
+            # ★ 必须显式传 use_cache：``cache_enabled`` 只是本类的声明，
+            # 而 gateway.chat 的默认值是 True。早先这里没传，于是
+            # 「Tester 关闭缓存」这条注释与属性都成了摆设 ——
+            # 测试生成会命中上一次（甚至上一个节点）的缓存结果。
+            use_cache=self.cache_enabled,
         )
         provider = self._gateway._providers.get(result.provider)
         cost = (

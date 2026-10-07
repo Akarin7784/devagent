@@ -810,6 +810,50 @@
   gap: var(--space-2);
 }
 
+/* DAG 状态图例：分组名 → 颜色。
+   分组名由 graph.js 的 statusGroup() 产出（与 LEGEND_ITEMS 同序），
+   所以这里漏一个分组 = 图例上一个圆点没有颜色（渲染成透明）。
+   注意这些类的语义是"状态分组"，与上面的 .dot-<tone>（状态色调）是两套
+   命名空间：ok≠success、backtrack≠warning，不能合并。 */
+.legend .dot-pending {
+  background: var(--border-strong);
+}
+
+.legend .dot-ready {
+  background: var(--brand);
+}
+
+.legend .dot-running {
+  background: var(--status-warning);
+}
+
+/* .dot-running 的脉冲光环是给"实时状态点"用的（在 ::after 上）。
+   图例是静态说明，不能动：一排会呼吸的圆点会把读者的注意力从
+   "颜色代表什么"引到"哪个点在动"上去。 */
+.legend .dot-running::after {
+  content: none;
+}
+
+.legend .dot-ok {
+  background: var(--status-success);
+}
+
+.legend .dot-backtrack {
+  background: var(--status-warning);
+  /* 回退用方点：与「执行中」的圆点在形状上再区分一层，
+     色盲用户也能分辨（两者同为 warning 色）。 */
+  border-radius: 2px;
+}
+
+.legend .dot-fail {
+  background: var(--status-danger);
+}
+
+.legend .dot-muted {
+  background: var(--border-default);
+  opacity: 0.55;
+}
+
 /* --------------------------------------------------------------------------
    卡片 / 面板
    -------------------------------------------------------------------------- */
@@ -2108,6 +2152,18 @@
   display: block;
 }
 
+/* 边层在节点层之下。默认 pointer-events 会让整块边层吞掉点击，
+   于是两节点之间的空白区域点不到画布本身，也不便于以后加"点空白取消选中"。 */
+.dag-edges {
+  pointer-events: none;
+}
+
+/* 节点层不参与命中测试，由每个 .dag-node 自己接收点击 ——
+   否则相邻节点之间的空隙会变成可点击的死区。 */
+.dag-nodes {
+  pointer-events: none;
+}
+
 .dag-toolbar {
   position: absolute;
   top: var(--space-3);
@@ -2159,6 +2215,206 @@
 
 .dag-edge-done {
   stroke: var(--status-success);
+}
+
+/* --------------------------------------------------------------------------
+   DAG 节点（graph.js 的 renderDag() 产出这些类名）
+   --------------------------------------------------------------------------
+   ★ 这段规则曾经只存在于 `web/styles.css` —— 一个没有任何 HTML 引用的
+     "孤儿文件"（index.html 只加载 css/ 下的四张表）。后果是 SVG 里的
+     `<rect class="node-bg">` 拿不到 fill，走 SVG 默认值**纯黑**：
+     暗色主题下节点黑底黑字，亮色主题同样不可读；状态色全部失效，
+     图例圆点也全塌成同一个灰。
+
+   教训：孤儿样式文件不会报错，只会静默地"什么都没生效"。
+   因此 graph.test.js 里有一条测试会把 graph.js 用到的类名与
+   index.html 实际加载的样式表逐一对照 —— 那才是能拦住这类问题的测试。
+
+   配色一律走 css/tokens.css 的语义层（--surface-*/--text-*/--status-*），
+   不写死十六进制值，这样暗色主题只需重绑语义层。
+   -------------------------------------------------------------------------- */
+
+.dag-node {
+  cursor: pointer;
+  /* 父层 g.dag-nodes 设了 pointer-events:none，这里必须显式恢复 ——
+     否则整个图都点不动（"父层关掉、子层打开"是 SVG 命中的标准写法）。 */
+  pointer-events: auto;
+}
+
+.dag-node:focus {
+  outline: none;
+}
+
+/* 焦点可见：DAG 节点是 role=button，键盘用户必须能看出焦点在哪。
+   用 stroke 而非 outline —— SVG 子元素上 outline 的表现跨浏览器不一致。 */
+.dag-node:focus-visible .node-bg {
+  stroke: var(--brand);
+  stroke-width: 2.4;
+}
+
+.dag-node .node-bg {
+  fill: var(--surface-raised);
+  stroke: var(--border-default);
+  stroke-width: 1.4;
+  transition: stroke var(--dur-fast) var(--ease-out), fill var(--dur-fast) var(--ease-out);
+}
+
+.dag-node:hover .node-bg {
+  stroke: var(--brand);
+}
+
+.dag-node.selected .node-bg {
+  stroke: var(--brand);
+  stroke-width: 2.2;
+}
+
+/* 左侧角色色条：fill 由 graph.js 按 agent 角色内联设置，这里只管过渡 */
+.dag-node .node-accent {
+  transition: fill var(--dur-fast) var(--ease-out);
+}
+
+.dag-node .node-dot {
+  fill: var(--border-strong);
+  transition: fill var(--dur-fast) var(--ease-out);
+}
+
+/* 节点内文本：必须显式给 fill。SVG 的 text 默认也是黑色，
+   与节点底色相同即"不可见"——这类 bug 在亮色主题下会被误判为"没渲染"。 */
+.dag-node .node-agent {
+  fill: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: var(--fw-semibold);
+}
+
+.dag-node .node-id {
+  fill: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.dag-node .node-goal {
+  fill: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+}
+
+.dag-node .node-status {
+  fill: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+.dag-node .node-tokens {
+  fill: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+/* 重试角标：只在 attempt > 1 时由 JS 显示 */
+.dag-node .node-badge .badge-bg {
+  fill: var(--status-warning);
+  opacity: 0.22;
+}
+
+.dag-node .node-badge .badge-text {
+  fill: var(--status-warning);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+/* ---- 状态 → 视觉（与 graph.js 的 statusGroup() 一一对应，缺一个就是渲染降级） ---- */
+
+.dag-node.s-pending .node-dot {
+  fill: var(--border-strong);
+}
+
+.dag-node.s-pending .node-status {
+  fill: var(--text-tertiary);
+}
+
+/* 待调度：依赖已满足但还没拿到执行槽位。虚线描边 + 高亮色，
+   与 s-pending 的灰区分开——「马上要跑」和「还没轮到」对排障是两回事。 */
+.dag-node.s-ready .node-bg {
+  stroke: var(--brand);
+  stroke-dasharray: 2 3;
+}
+
+.dag-node.s-ready .node-dot {
+  fill: var(--brand);
+}
+
+.dag-node.s-ready .node-status {
+  fill: var(--brand-text);
+}
+
+/* 执行中：脉冲描边，让「当前正在跑哪个节点」在长任务里始终可见。
+   动画在 prefers-reduced-motion 下由 tokens.css 统一压成 0.01ms。 */
+.dag-node.s-running .node-bg {
+  stroke: var(--status-warning);
+  animation: dag-pulse 1.4s ease-in-out infinite;
+}
+
+.dag-node.s-running .node-dot {
+  fill: var(--status-warning);
+}
+
+.dag-node.s-running .node-status {
+  fill: var(--status-warning-text);
+}
+
+@keyframes dag-pulse {
+  0%,
+  100% {
+    stroke-opacity: 1;
+  }
+
+  50% {
+    stroke-opacity: 0.42;
+  }
+}
+
+.dag-node.s-ok .node-bg {
+  stroke: var(--status-success);
+}
+
+.dag-node.s-ok .node-dot {
+  fill: var(--status-success);
+}
+
+.dag-node.s-ok .node-status {
+  fill: var(--status-success-text);
+}
+
+/* 回退重跑：虚线描边 —— 「会重跑」与「已失败」视觉必须可分 */
+.dag-node.s-backtrack .node-bg {
+  stroke: var(--status-warning);
+  stroke-dasharray: 5 3;
+}
+
+.dag-node.s-backtrack .node-dot {
+  fill: var(--status-warning);
+}
+
+.dag-node.s-backtrack .node-status {
+  fill: var(--status-warning-text);
+}
+
+.dag-node.s-fail .node-bg {
+  stroke: var(--status-danger);
+}
+
+.dag-node.s-fail .node-dot {
+  fill: var(--status-danger);
+}
+
+.dag-node.s-fail .node-status {
+  fill: var(--status-danger-text);
+}
+
+/* 跳过：整节点降透明度，但仍可读（不是 display:none） */
+.dag-node.s-muted {
+  opacity: 0.55;
 }
 
 /* --------------------------------------------------------------------------

@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -67,16 +67,51 @@ class EventBus:
       拖慢任务执行**（这是 SSE 实现里最常见的坑）。
     """
 
-    def __init__(self, *, history_size: int = 500, queue_size: int = 200) -> None:
-        self._history: dict[str, deque[TaskEvent]] = {}
+    def __init__(
+        self,
+        *,
+        history_size: int = 500,
+        queue_size: int = 200,
+        max_tasks: int = 512,
+    ) -> None:
+        """初始化。
+
+        Args:
+            history_size: 单任务历史缓冲长度（供晚到订阅者回放）。
+            queue_size: 单订阅者队列长度。
+            max_tasks: 保留历史的任务数上限。超过后按最久未更新淘汰。
+
+        ``max_tasks`` 是必须的：历史里存的是**完整事件载荷**（含模型输出），
+        而此前只有 ``delete()`` 会清理它 —— 长跑服务里每个跑过的任务都会
+        永久占用最多 ``history_size`` 条事件。加上 ``_closed`` / ``_dropped``
+        两本只增不减的账，内存随任务数单调增长。
+        """
+        self._history: OrderedDict[str, deque[TaskEvent]] = OrderedDict()
         self._subscribers: dict[str, list[asyncio.Queue[TaskEvent]]] = {}
         self._closed: set[str] = set()
         self._history_size = history_size
         self._queue_size = queue_size
+        self._max_tasks = max_tasks
         self._dropped: dict[str, int] = {}
+
+    def _touch(self, task_id: str) -> None:
+        """把任务标记为"最近活跃"，并在超限时淘汰最久未活跃的任务。"""
+        self._history.move_to_end(task_id)
+        while len(self._history) > self._max_tasks:
+            victim = next(
+                (tid for tid in self._history if tid != task_id and tid not in self._subscribers),
+                None,
+            )
+            if victim is None:
+                # 全部仍有订阅者：宁可暂时超限，也不能清掉用户正在看的流。
+                return
+            self._history.pop(victim, None)
+            self._closed.discard(victim)
+            self._dropped.pop(victim, None)
 
     def publish(self, event: TaskEvent) -> None:
         hist = self._history.setdefault(event.task_id, deque(maxlen=self._history_size))
+        self._touch(event.task_id)
         hist.append(event)
 
         for queue in self._subscribers.get(event.task_id, []):
@@ -92,13 +127,21 @@ class EventBus:
                     logger.debug("event_dropped", task_id=event.task_id, kind=event.kind)
 
     def subscribe(self, task_id: str) -> asyncio.Queue[TaskEvent]:
-        """订阅某任务的事件流，并**回放已有历史**。"""
+        """订阅某任务的事件流，并**回放已有历史**。
+
+        回放只取**最近** ``queue_size`` 条：历史容量（默认 500）大于队列
+        容量（默认 200），早先的实现从头填充并在队满时 ``break``，于是晚到
+        的订阅者拿到的是最旧的 200 条，**永远看不到 task_finished 与验证结论**
+        —— 而这些恰恰是最需要看到的事件。丢掉的那部分再也补不回来。
+        """
         queue: asyncio.Queue[TaskEvent] = asyncio.Queue(maxsize=self._queue_size)
-        for event in self._history.get(task_id, ()):
-            try:
-                queue.put_nowait(event)
-            except asyncio.QueueFull:
-                break
+        history = self._history.get(task_id)
+        if history:
+            for event in list(history)[-self._queue_size :]:
+                try:
+                    queue.put_nowait(event)
+                except asyncio.QueueFull:  # pragma: no cover - 切片已保证不溢出
+                    break
         self._subscribers.setdefault(task_id, []).append(queue)
         return queue
 
@@ -170,7 +213,14 @@ class InMemoryTaskStore:
             self._data.pop(oldest, None)
 
     def get(self, task_id: str) -> dict[str, Any] | None:
-        return self._data.get(task_id)
+        item = self._data.get(task_id)
+        if item is not None:
+            # 命中要刷新顺序，否则淘汰策略退化成 FIFO，
+            # 与被反复读取的热任务相比，冷任务反而更"长寿"。
+            with contextlib.suppress(ValueError):
+                self._order.remove(task_id)
+            self._order.append(task_id)
+        return item
 
     def list(self, *, limit: int = 50, status: str = "") -> list[dict[str, Any]]:
         items = [self._data[tid] for tid in reversed(self._order) if tid in self._data]

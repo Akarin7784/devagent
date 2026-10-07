@@ -19,9 +19,14 @@ WORKDIR /build
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
 
-# 装入独立前缀，便于整体复制到 runtime 阶段
+# 装入独立前缀，便于整体复制到 runtime 阶段。
+# 必须带上 [db] extra：SQL 模式依赖 sqlalchemy[asyncio]（greenlet）+ aiosqlite + asyncpg，
+# 只装裸包时 `import sqlalchemy.ext.asyncio` 会直接 ImportError，
+# 容器在 DEVAGENT_STORAGE__BACKEND=sql 下起不来。
+# 不装 [sandbox]（docker SDK）：DockerSandbox 走 `docker` CLI 子进程，
+# 代码里没有任何 SDK import；不装 [eval]（pandas/tabulate）：无代码引用。
 RUN python -m pip install --upgrade pip build && \
-    python -m pip install --prefix=/install .
+    python -m pip install --prefix=/install '.[db]'
 
 # ---------------------------------------------------------------------- #
 # Stage 2: runtime
@@ -40,6 +45,10 @@ WORKDIR /app
 
 # 从 builder 复制已安装的依赖
 COPY --from=builder /install /usr/local
+
+# 构建期断言：异步 DB 栈真的可用（缺 greenlet 时这里就失败，
+# 而不是等到容器启动、开了 SQL 模式才崩）
+RUN python -c "import aiosqlite, asyncpg, sqlalchemy.ext.asyncio"
 
 # 应用代码与前端静态资源
 COPY --chown=devagent:devagent src/ ./src/

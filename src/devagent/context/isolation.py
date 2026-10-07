@@ -62,6 +62,17 @@ class AgentContextSpace:
     def extend(self, chunks: Iterable[ContextChunk]) -> None:
         self.chunks.extend(chunks)
 
+    def drop_source_prefix(self, prefix: str) -> int:
+        """移除 ``source`` 以 ``prefix`` 开头的片段，返回移除条数。
+
+        用途：同一次交付（handoff / 验证）重跑时，旧片段必须被**替换**而不是
+        继续追加。否则节点每重试一次，目标/验收标准/约束就在空间里多一份，
+        且硬约束不受预算约束 —— 重试几次就能把上下文窗口挤爆。
+        """
+        before = len(self.chunks)
+        self.chunks = [c for c in self.chunks if not c.source.startswith(prefix)]
+        return before - len(self.chunks)
+
     @property
     def total_tokens(self) -> int:
         return sum(c.tokens for c in self.chunks)
@@ -92,6 +103,24 @@ class ContextIsolator:
     def reset(self) -> None:
         self._spaces.clear()
         self._borrow_log.clear()
+
+    def snapshot(self) -> ContextIsolator:
+        """复制当前隔离容器，得到一份**互不影响**的新容器。
+
+        为什么要它：编排器全进程只有一个实例，而服务层允许并发跑多个任务。
+        如果各任务共用同一个 isolator，任务 B 的 Agent 就会在同一个空间里
+        读到任务 A 的需求原文（已实测复现）——「上下文隔离」在**任务之间**
+        完全失效。每次 ``run()`` 从快照开始，运行期间的写入只落在本次运行
+        的副本里，任务之间重新隔离；同时保留了「运行前预置片段」这种用法
+        （调用方先往 ``ContextEngine.isolator`` 里塞内容，作为初始上下文）。
+        """
+        clone = ContextIsolator()
+        for agent, space in self._spaces.items():
+            new_space = AgentContextSpace(agent=agent, chunks=list(space.chunks))
+            new_space.handoff = space.handoff
+            clone._spaces[agent] = new_space
+        clone._borrow_log = list(self._borrow_log)
+        return clone
 
     def borrow(
         self,
@@ -142,8 +171,15 @@ class ContextIsolator:
 
         注意：只投喂 **handoff 的结构化字段**（目标/验收标准/约束/引用），
         不投喂上游的原始对话历史。这正是隔离的核心机制。
+
+        同一次交付重跑（例如节点被 Verifier 驳回后重试）时，**先移除上一轮
+        投喂的 handoff 片段再写入**。理由：这些片段是 ``is_hard=True`` 的，
+        而硬约束在装配阶段无条件纳入、且不参与软片段去重 —— 若只追加，
+        每次重试都会让目标/标准/约束多一份，几轮之后硬约束自己就把
+        上下文窗口撑爆（预算护栏对硬约束不生效）。
         """
         space = self.space_for(agent)
+        space.drop_source_prefix("handoff://")
 
         # 硬约束：目标与验收标准、约束
         if handoff.goal:
@@ -259,7 +295,10 @@ class ContextEngine:
             token_counter=token_counter,
         )
         self._allocator = allocator or BudgetAllocator()
-        self._compressor = compressor or ContextCompressor(token_counter=token_counter)
+        self._compressor = compressor or ContextCompressor(
+            token_counter=token_counter,
+            protect_hard=config.hard_constraint_untouchable,
+        )
         self._router = router or ComplexityRouter()
         # 注入防护：默认按配置开关。关闭时 render() 与 render_guarded()
         # 输出一致，因此调用方无需分支判断。
@@ -278,12 +317,23 @@ class ContextEngine:
         budget_total: int | None = None,
         routing_signals: RoutingSignals | None = None,
         extra_chunks: Sequence[ContextChunk] = (),
+        isolator: ContextIsolator | None = None,
+        task_id: str = "",
+        task_text: str = "",
     ) -> ContextBundle:
         """为指定 Agent 构建最终上下文。
 
         流程：取隔离空间 → （必要时）压缩 → 装配 → 附加路由决策。
+
+        Args:
+            isolator: 使用哪个隔离容器。编排器每次运行传自己的**运行级副本**，
+                避免并发任务互相污染；不传则退化为实例级容器（单任务用法）。
+            task_id: 任务标识，用于把上下文工程指标归因到具体任务
+                （否则前端「本任务节省了多少 token」只能显示进程累计值）。
+            task_text: 任务文本，无向量时用于相关性兜底。
         """
-        space = self.isolator.space_for(agent)
+        active_isolator = isolator or self.isolator
+        space = active_isolator.space_for(agent)
         if extra_chunks:
             space.extend(extra_chunks)
 
@@ -309,6 +359,7 @@ class ContextEngine:
             budget=budget,
             agent=agent,
             step_id=current_step,
+            task_text=task_text,
         )
 
         # 用装配决策的 tokens_before/tokens_after 反映**装配阶段**的取舍，
@@ -327,12 +378,16 @@ class ContextEngine:
 
         # 可观测性：量化上下文工程的实际收益（省了多少 token、预算用掉多少）。
         # 这是本项目最核心的价值指标——它把「上下文工程」从口号变成可测数字。
+        # 带 task_id 标签是必须的：不带就只能给出**进程累计值**，
+        # 而前端把它当作「本任务」的数字展示（实测两个任务拿到完全相同的值）。
         get_observability().record_context_build(
             agent=agent.value,
             tokens_before=tokens_before_compression,
             tokens_after=decision.tokens_after,
             budget=budget.total,
             dropped_chunks=max(0, len(candidates) - len(result.chunks)),
+            task_id=task_id,
+            hard_overflow=decision.hard_overflow_tokens,
         )
 
         return ContextBundle(

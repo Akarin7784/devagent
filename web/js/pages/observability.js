@@ -81,8 +81,34 @@ export default async function renderObservability(root, ctx) {
 
   function paint() {
     if (disposed) return;
+
+    // 别把用户正在打字的输入框连同整页一起拆掉。
+    // 自动刷新每 10s 一次，而 load({silent:true}) 会走 paint() ——
+    // 原实现会整套重建，光标与已输入的半截关键词一起消失，
+    // 表现为"输入框每隔几秒自己清空一次"。这里退化为只重绘数据区。
+    if (isTypingInPage()) {
+      for (const repaint of dataRegionRepaints) repaint();
+      return;
+    }
+
+    dataRegionRepaints.clear();
     clear(container);
     mount(container, buildLayout());
+  }
+
+  /**
+   * 数据区就地重绘函数集合。
+   * 由各 tab 在构建时注册，`paint()` 在"用户正在输入"时改调它们 ——
+   * 这样一次静默刷新既能更新数据，又不会碰输入框。
+   */
+  const dataRegionRepaints = new Set();
+
+  /** 焦点是否落在本页的文本输入控件里。 */
+  function isTypingInPage() {
+    const active = document.activeElement;
+    if (!active || !container.contains(active)) return false;
+    const tag = active.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || active.isContentEditable === true;
   }
 
   /* ---------- 布局 ---------- */
@@ -251,25 +277,56 @@ export default async function renderObservability(root, ctx) {
       ...histograms.map(([name, labels]) => ({ type: 'histogram', name, labels: flattenHist(labels) })),
     ];
 
-    const filtered = metricQuery
-      ? allRows.filter((r) => r.name.toLowerCase().includes(metricQuery.toLowerCase())
-          || r.labels.some((l) => l.label.toLowerCase().includes(metricQuery.toLowerCase())))
-      : allRows;
-
-    filtered.sort((a, b) => {
-      const dir = sortState.dir === 'asc' ? 1 : -1;
-      if (sortState.key === 'type') return a.type.localeCompare(b.type) * dir;
-      return a.name.localeCompare(b.name) * dir;
-    });
-
     // 搜索框
     const searchInput = el('input', {
       class: 'input',
       attrs: { type: 'search', placeholder: '搜索指标名或标签…', 'aria-label': '搜索指标', value: metricQuery },
     });
+
+    // 行数提示：必须由**同一次**过滤结果驱动，否则会和表格显示的内容对不上
+    const countHint = el('span', { class: 'hint-text' });
+
+    /** 排序：就地排**副本**（绝不改 allRows，页面会反复重算过滤结果）。 */
+    function sortedRows() {
+      const rows = filterMetrics(allRows, metricQuery);
+      rows.sort((a, b) => {
+        const dir = sortState.dir === 'asc' ? 1 : -1;
+        if (sortState.key === 'type') return a.type.localeCompare(b.type) * dir;
+        return a.name.localeCompare(b.name) * dir;
+      });
+      return rows;
+    }
+
+    const tableHost = el('div');
+
+    /**
+     * 重绘表格区。
+     *
+     * ## 为什么每次都要重算（这是一次真实的翻车）
+     *
+     * 原实现把 `filtered` 算在 buildMetricsTab 的作用域里，输入框的 handler
+     * 只调 refreshTable() —— 而那个函数读的是**闭包捕获的那一个数组**。
+     * 结果是：打字时 query 变了、表格纹丝不动、行数提示永远是初始值，
+     * 用户会以为"搜索坏了"。这类 bug 不会报错，只会让人觉得功能没做。
+     *
+     * 因此过滤结果与提示文案都从**当前** query 现算，不缓存到闭包里。
+     */
+    function refreshTable() {
+      const rows = sortedRows();
+      countHint.textContent = `${rows.length} / ${allRows.length} 条`;
+      clear(tableHost);
+      if (!rows.length) {
+        tableHost.append(
+          emptyState({ small: true, icon: 'search', title: '没有匹配的指标', desc: '试试缩短关键词' })
+        );
+        return;
+      }
+      tableHost.append(buildMetricTable(rows));
+    }
+
     searchInput.addEventListener('input', () => {
       metricQuery = searchInput.value;
-      // 只更新表格，避免输入时丢焦点
+      // 只更新表格区与提示，不动输入框本身 —— 否则光标位置会丢
       refreshTable();
     });
 
@@ -279,10 +336,9 @@ export default async function renderObservability(root, ctx) {
         searchInput,
       ]),
       el('div', { class: 'toolbar-spacer' }),
-      el('span', { class: 'hint-text', text: `${filtered.length} / ${allRows.length} 条` }),
+      countHint,
     ]);
 
-    const tableHost = el('div');
     const tableCard = card({
       title: '指标明细',
       subtitle: 'counters / gauges 为两层结构，histograms 为三层（最内层是统计量）',
@@ -299,18 +355,9 @@ export default async function renderObservability(root, ctx) {
       flush: true,
     });
 
-    function refreshTable() {
-      clear(tableHost);
-      if (!filtered.length) {
-        tableHost.append(
-          emptyState({ small: true, icon: 'search', title: '没有匹配的指标', desc: '试试缩短关键词' })
-        );
-        return;
-      }
-      tableHost.append(buildMetricTable(filtered));
-    }
-
     refreshTable();
+    // 注册"就地重绘"入口：静默刷新时若用户正在输入，改调它而不是重建整页
+    dataRegionRepaints.add(refreshTable);
 
     return [toolbar, tableCard];
   }
@@ -610,6 +657,31 @@ export default async function renderObservability(root, ctx) {
 /* ------------------------------------------------------------------ *
  * 纯函数
  * ------------------------------------------------------------------ */
+
+/**
+ * 按关键词过滤指标行（**纯函数**，零 DOM，可直接单测）。
+ *
+ * 单独抽出来的理由：这段逻辑原本内联在 `buildMetricsTab()` 里，被闭包
+ * 捕获成"只算一次"的数组 —— 输入框改的是 query，重绘用的却是旧结果。
+ * 把决策变成纯函数之后，"打字能不能过滤"这件事才有办法断言。
+ *
+ * 匹配范围刻意包含**标签**：真实排障时用户是按 `agent="coder"`
+ * 或模型名去找指标的，只匹配指标名会让人以为数据不存在。
+ * 大小写不敏感（用户不会照着键名的大小写打字）。
+ *
+ * @param {Array<{type:string,name:string,labels:Array<{label:string,value:string}>}>} rows
+ * @param {string} query 关键词，空/纯空白表示不过滤
+ * @returns {Array} 过滤后的**新数组**（排序等后续操作不会污染入参）
+ */
+export function filterMetrics(rows, query) {
+  const list = Array.isArray(rows) ? rows : [];
+  const q = String(query ?? '').trim().toLowerCase();
+  if (!q) return list.slice();
+  return list.filter((r) => {
+    if (String(r?.name ?? '').toLowerCase().includes(q)) return true;
+    return (r?.labels || []).some((l) => String(l?.label ?? '').toLowerCase().includes(q));
+  });
+}
 
 /** 统计某层有多少个指标名。 */
 function countMetrics(metrics, layer) {

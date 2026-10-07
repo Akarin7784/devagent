@@ -143,7 +143,7 @@ function buildSections(ctx) {
       warnings));
   }
 
-  sections.push(buildKpiRow(tasks, metrics));
+  sections.push(renderKpiRow(tasks, metrics));
   sections.push(buildMainGrid(tasks, metrics, cache, ctx));
 
   return sections;
@@ -203,19 +203,77 @@ function collectWarnings({ connected, providers, observability, cache }) {
  * KPI 行
  * ------------------------------------------------------------------ */
 
-function buildKpiRow(tasks, metrics) {
-  const total = tasks.length;
-  const succeeded = tasks.filter((t) => t.succeeded).length;
-  const finished = tasks.filter((t) => t.status === 'success' || t.status === 'failed').length;
-  const running = tasks.filter((t) => t.status === 'running' || t.status === 'pending').length;
+/**
+ * 「已结束」的任务状态 —— 必须与后端 `TaskStatus` 一致，且**只列终态**。
+ *
+ * 这里曾经写作 `t.status === 'success' || t.status === 'failed'`：
+ * `success` 是 **StepStatus** 的成员，任务级的对应值是 `succeeded`
+ * （`devagent.enums.TaskStatus.SUCCEEDED = "succeeded"`）。
+ * 后果是 `finished` 只数到失败任务 —— 全部成功时成功率显示「—」，
+ * 9 成功 + 1 失败时算出 900%。这是一个"看起来只是没数据"的错误数字，
+ * 比空白更危险。
+ *
+ * 因此本集合由跨语言契约测试守着（`test_contract_words.json` 的
+ * `task_status`），任何人再写错字面量都会被测试拦下。
+ */
+export const FINISHED_TASK_STATUSES = Object.freeze([
+  'succeeded', // TaskStatus.SUCCEEDED —— 任务成功
+  'failed', // TaskStatus.FAILED
+  'cancelled', // TaskStatus.CANCELLED —— 用户主动取消，也是终态
+  'paused', // TaskStatus.PAUSED —— 预算耗尽后停住，不再推进
+]);
 
-  // 成功率只在「已结束」的任务上计算 —— 把运行中算进去会低估成功率
-  const successRate = finished ? succeeded / finished : null;
+/** 仍在推进、尚未产生终态的任务状态。 */
+export const ACTIVE_TASK_STATUSES = Object.freeze(['pending', 'running']);
 
-  const totalTokens = tasks.reduce((sum, t) => sum + (t.total_tokens || 0), 0);
-  const avgDuration = tasks.length
-    ? tasks.reduce((s, t) => s + (t.duration_ms || 0), 0) / tasks.length
-    : 0;
+export const isFinishedTask = (t) => FINISHED_TASK_STATUSES.includes(t?.status);
+export const isActiveTask = (t) => ACTIVE_TASK_STATUSES.includes(t?.status);
+
+/**
+ * 任务列表 → KPI 数字（**纯函数**，无 DOM，可直接单测）。
+ *
+ * 成功率只在「已结束」的任务上计算 —— 把运行中算进去会低估成功率；
+ * 而分母同样只取已结束，因此结果天然落在 [0, 1]，不可能出现 900%。
+ *
+ * @param {Array<object>} tasks
+ * @returns {{total:number, succeeded:number, finished:number, running:number,
+ *   successRate:number|null, totalTokens:number, avgDuration:number}}
+ *   `successRate` 为 `null` 表示「暂无已结束任务」，界面据此显示「—」
+ */
+export function computeTaskKpis(tasks) {
+  const list = Array.isArray(tasks) ? tasks : [];
+  const total = list.length;
+  const succeeded = list.filter((t) => t?.status === 'succeeded').length;
+  const finished = list.filter(isFinishedTask).length;
+  const running = list.filter(isActiveTask).length;
+
+  return {
+    total,
+    succeeded,
+    finished,
+    running,
+    successRate: finished ? succeeded / finished : null,
+    totalTokens: list.reduce((sum, t) => sum + (Number(t?.total_tokens) || 0), 0),
+    avgDuration: total
+      ? list.reduce((s, t) => s + (Number(t?.duration_ms) || 0), 0) / total
+      : 0,
+  };
+}
+
+/**
+ * 渲染 KPI 行。
+ *
+ * 之所以导出（而不是留在 buildKpiRow 里）：`buildKpiRow` 依赖 `getState()`
+ * 读全局 store，在 node 里跑不了；把「取数 → 造卡片」的重活放在这个只吃参数的
+ * 版本里，回归测试才能直接断言「全部成功 → 100%，且永不超过 100%」。
+ *
+ * @param {Array<object>} tasks
+ * @param {object|null} metrics 全局指标快照（可能为 null）
+ * @returns {HTMLElement}
+ */
+export function renderKpiRow(tasks, metrics) {
+  const k = computeTaskKpis(tasks);
+  const { total, succeeded, finished, running, successRate } = k;
 
   // 成本从指标里取（任务列表项不含成本字段）
   const totalCost = sumLabels(metric(metrics?.counters, 'llm_cost_usd'));
@@ -250,14 +308,14 @@ function buildKpiRow(tasks, metrics) {
     }),
     statCard({
       label: '平均耗时',
-      value: tasks.length ? fmtDuration(avgDuration).split(' ')[0] : '—',
-      unit: tasks.length ? fmtDuration(avgDuration).split(' ')[1] : '',
+      value: total ? fmtDuration(k.avgDuration).split(' ')[0] : '—',
+      unit: total ? fmtDuration(k.avgDuration).split(' ')[1] : '',
       icon: 'clock',
-      foot: tasks.length ? '基于全部任务' : '——',
+      foot: total ? '基于全部任务' : '——',
     }),
     statCard({
       label: '累计 token',
-      value: fmtCompact(totalTokens),
+      value: fmtCompact(k.totalTokens),
       icon: 'hash',
       foot: totalCost ? `模型成本 ${fmtCost(totalCost)}` : '开启可观测性可看成本',
     })

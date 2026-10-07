@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -20,6 +21,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 import httpx
 
 from devagent.logging_config import get_logger
+from devagent.observability import MetricNames, get_observability
 
 logger = get_logger(__name__)
 
@@ -250,13 +252,21 @@ class OpenAICompatibleProvider:
                 if isinstance(exc, ModelError) and not isinstance(exc, ModelRateLimitError):
                     raise
             if attempt < self._max_retries:
-                backoff = min(2.0 ** (attempt - 1), 8.0)
+                # ★ 退避必须带抖动。
+                # 纯指数退避会让**所有**并发调用在同一时刻重试：编排器默认
+                # 并行 4 个节点，遇到 429 时它们会在 1s / 2s / 4s 同时打回来，
+                # 把一个限流抖动放大成一次限流雪崩。抖动把重试打散。
+                base = min(2.0 ** (attempt - 1), 8.0)
+                backoff = base * (0.5 + random.random() * 0.5)
                 logger.warning(
                     "model_call_retry",
                     provider=self.name,
                     attempt=attempt,
-                    backoff=backoff,
+                    backoff=round(backoff, 3),
                     error=str(last_error),
+                )
+                get_observability().inc(
+                    MetricNames.LLM_RETRIES, 1, model=self.name, reason="transport_or_ratelimit"
                 )
                 await asyncio.sleep(backoff)
 

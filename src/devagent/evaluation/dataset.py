@@ -51,7 +51,11 @@ class GoldenSample:
     def from_dict(cls, raw: dict[str, Any]) -> GoldenSample:
         missing = [k for k in ("id", "category", "goal") if not raw.get(k)]
         if missing:
-            raise DatasetError(f"样本缺少必填字段：{missing}（原始数据：{raw}）")
+            # 不要把整条原始数据回显进错误信息：数据集内容可能来自用户上传，
+            # 而错误信息会经 API 返回给调用方（早先的实现会把整行内容带出去）。
+            raise DatasetError(
+                f"样本缺少必填字段：{missing}（该行字段：{sorted(raw.keys())[:10]}）"
+            )
         return cls(
             id=str(raw["id"]),
             category=str(raw["category"]),
@@ -149,6 +153,18 @@ class GoldenSet:
         result.validate_unique_ids()
         logger.info("golden_set_loaded", path=str(p), count=len(samples))
         return result
+
+    @classmethod
+    async def aload(cls, path: str | Path) -> GoldenSet:
+        """异步加载：把同步文件读放到线程里。
+
+        为什么需要：``load`` 会做 ``read_text`` + 逐行 ``json.loads``，
+        对一个几千行的数据集是**阻塞调用**。它此前被直接在 async 路由里
+        调用，会卡住整个事件循环（所有并发请求一起等）。
+        """
+        import asyncio
+
+        return await asyncio.to_thread(cls.load, path)
 
     def save(self, path: str | Path) -> None:
         p = Path(path)

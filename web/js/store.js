@@ -74,6 +74,16 @@ let state = { ...initial };
 
 const emitter = createEmitter();
 
+/**
+ * 每个字段的活跃订阅者数量。
+ *
+ * 为什么要显式记账：本项目里"订阅了但忘了退订"是**已经发生过**的缺陷
+ * （导航徽章每次 hashchange 重建都新增一个永久订阅者，写进已分离的 DOM）。
+ * 这类泄漏完全静默：界面看起来正常，只是内存与 CPU 缓慢增长。
+ * 有了这张计数表，回归测试才可能断言"重建 N 次后订阅数回到稳态"。
+ */
+const subCounts = new Map();
+
 /** 所有已注册的字段名，用于校验 `set` 的键名拼写。 */
 const KNOWN_KEYS = new Set(Object.keys(initial));
 
@@ -113,12 +123,32 @@ export function set(patch) {
  * 订阅字段变化。
  * @param {string|string[]} keys 字段名或字段名数组；传 '*' 订阅任意变化
  * @param {(value:any)=>void} fn
- * @returns {() => void} 取消订阅
+ * @returns {() => void} 取消订阅（**必须**被保存并在销毁时调用，否则会泄漏）
  */
 export function subscribe(keys, fn) {
   const list = Array.isArray(keys) ? keys : [keys];
-  const offs = list.map((k) => emitter.on(k, fn));
-  return () => offs.forEach((off) => off());
+  const offs = list.map((k) => {
+    subCounts.set(k, (subCounts.get(k) || 0) + 1);
+    return emitter.on(k, fn);
+  });
+  let done = false;
+  return () => {
+    // 幂等：重复调用清理函数不应把计数减成负数
+    if (done) return;
+    done = true;
+    offs.forEach((off) => off());
+    for (const k of list) subCounts.set(k, Math.max(0, (subCounts.get(k) || 0) - 1));
+  };
+}
+
+/**
+ * 某字段当前的活跃订阅者数量。
+ *
+ * 仅供测试与诊断使用 —— 它存在的意义是让"忘记退订"这件事**可断言**，
+ * 而不是靠人眼审查每一次 subscribe 调用。
+ */
+export function subscriberCount(key) {
+  return subCounts.get(key) || 0;
 }
 
 /** 重置为初始值（切换后端地址时用）。 */
@@ -221,6 +251,26 @@ export function parseHash() {
 
 /**
  * 跳转路由。
+ *
+ * ## replace 分支为什么不派发 hashchange（重要的回归教训）
+ *
+ * 这里曾经是 `history.replaceState(...)` + `window.dispatchEvent(new HashChangeEvent('hashchange'))`。
+ * 看似"通知一下总没错"，实际后果是：工作台里点一个任务
+ * （`workbench.js` 的 `selectTask` 会调 `navigate('workbench', { task }, true)`
+ * 把任务写进 URL）会立刻触发 `shell.js` 的 `renderRoute()` →
+ * `disposeCurrent()` **拆掉刚刚建好的页面**，然后重建一遍：
+ *   - 两条 SSE 订阅（前一条的清理恰好在 await 之前，管不到这一条）；
+ *   - 两次 `/tasks/{id}` + `/context` 请求；
+ *   - 选中的节点、时间线滚动位置、输入框内容全部丢失。
+ *
+ * 判断依据是**路由身份**：`#/workbench?task=A` → `#/workbench?task=B`
+ * 只是同一页面的参数变化，页面自己已经知道该怎么更新，外壳不必介入。
+ * 而 `#/workbench` → `#/overview`（或非法路由纠错）必须重建页面 ——
+ * 那种情况才需要手动补一个事件。
+ *
+ * 注意：非 replace 分支保持原样（`location.hash = ...`），
+ * 由浏览器触发**原生** hashchange —— 前进/后退因此仍然正常工作。
+ *
  * @param {string} id 路由 id
  * @param {Record<string,string>} [params] 查询参数
  * @param {boolean} [replace] 是否替换历史记录（用于自动纠错）
@@ -232,11 +282,19 @@ export function navigate(id, params = {}, replace = false) {
   const hash = `#/${id}${q ? `?${q}` : ''}`;
   if (window.location.hash === hash) return;
   if (replace) {
+    const routeChanged = routeIdOf(window.location.hash) !== id;
     window.history.replaceState(null, '', hash);
-    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    // 只有路由身份变了才需要外壳重渲染；同路由换参数不应打断页面
+    if (routeChanged) window.dispatchEvent(new HashChangeEvent('hashchange'));
   } else {
     window.location.hash = hash;
   }
+}
+
+/** 从 hash 里取出路由 id（与 parseHash 同源的宽松版，供 navigate 判断身份用）。 */
+function routeIdOf(hash) {
+  const raw = String(hash || '').replace(/^#\/?/, '');
+  return raw.split('?')[0] || ROUTES[0].id;
 }
 
 /** 监听路由变化。 */

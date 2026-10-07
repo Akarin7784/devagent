@@ -17,9 +17,11 @@ HTTP、SSE、存储。但要把它变成「可被前端观测的异步任务」�
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import time
 import uuid
+from contextvars import ContextVar
 from typing import Any
 
 from devagent.api.store import EventBus, TaskEvent, TaskStore
@@ -90,13 +92,22 @@ class TaskService:
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._running: dict[str, asyncio.Task[None]] = {}
         # 把 Orchestrator 的进度回调接到 EventBus，使 DAG 节点的开始/完成/判定
-        # 能实时推给前端。task_id 在回调时需要，因此用「当前执行中的任务 id」
-        # 传递 —— 编排器一次 run 只对应一个 task_id，且 _execute 内是串行发起。
-        self._current_task_id: str = ""
-        """当前执行中的任务 id（供进度回调定位；一次 run 只对应一个）。"""
-
-        self._current_goal: str = ""
-        """当前任务的 goal（供 task_started 事件携带）。"""
+        # 能实时推给前端。
+        #
+        # ★ 任务身份必须用 ContextVar 传递，**不能**用实例字段。
+        # 早先用 ``self._current_task_id`` 这个共享字符串，而本服务默认允许
+        # 4 个任务并发：任务 B 进入 _execute 时会覆盖它，于是任务 A 之后发出的
+        # `node_started`/`node_verdict` 全被投递到 B 的 SSE 流（实测 A 收到
+        # 0 个节点事件、B 收到 2 个）。ContextVar 在 asyncio 下按 Task 隔离，
+        # 每个任务看到的是自己那一次运行的值。
+        self._current_task: ContextVar[str] = ContextVar("devagent_current_task", default="")
+        self._current_goal: ContextVar[str] = ContextVar("devagent_current_goal", default="")
+        self._persist_queue: ContextVar[asyncio.Queue[TaskEvent | None] | None] = ContextVar(
+            "devagent_persist_queue", default=None
+        )
+        """当前任务的事件落库队列（仅 SQL 存储启用时非 None）。"""
+        # 串行化「查重 + 落库」，避免同一 task_id 被并发提交两次
+        self._submit_lock = asyncio.Lock()
 
         orchestrator._on_event = self._on_orchestrator_event
 
@@ -106,12 +117,13 @@ class TaskService:
         注意：这是同步回调（编排器不便 await 每个事件），而 ``bus.publish``
         也是同步的（内部用 put_nowait + 丢最旧策略），因此无需 async。
         """
-        tid = self._current_task_id
+        # 归属到**当前 asyncio 任务**正在跑的那个 task_id（见上面的说明）
+        tid = self._current_task.get()
         if not tid:
             return
         # 把当前 goal 附在第一个事件上，前端据此显示任务标题
         if kind == "task_started":
-            payload = {"goal": self._current_goal, **payload}
+            payload = {"goal": self._current_goal.get(), **payload}
         self._publish(tid, kind, payload)
 
     @property
@@ -131,82 +143,144 @@ class TaskService:
         除了多一次 ``isawaitable`` 判断外没有额外开销。
         """
         tid = task_id or f"task_{uuid.uuid4().hex[:12]}"
-        if await _maybe_await(self._store.get(tid)) is not None:
-            raise ValueError(f"任务 id 已存在：{tid}")
-
-        await _maybe_await(
-            self._store.save(
-                tid,
-                {
-                    "task_id": tid,
-                    "goal": goal,
-                    "status": TaskStatus.PENDING.value,
-                    "succeeded": False,
-                    "error": "",
-                    "duration_ms": 0,
-                    "total_tokens": 0,
-                    "total_cost_usd": 0.0,
-                    "steps": [],
-                    "nodes": [],
-                    "context_metrics": {},
-                    "metadata": metadata or {},
-                },
-            )
-        )
-        self._running[tid] = asyncio.create_task(self._execute(tid, goal))
+        # ★ 查重与占位必须在同一把锁内完成。
+        # 早先是「先 get 再 save」：两个并发请求带同一个 task_id 时都能通过
+        # 检查，于是同一个 id 跑了两次，而 _running 只留得下一个 —— 另一个
+        # 既观测不到也取消不了。SQL 模式下第二次还会撞主键，
+        # 抛出的 IntegrityError 不是 ValueError，会绕过 409 变成 500。
+        async with self._submit_lock:
+            if await _maybe_await(self._store.get(tid)) is not None:
+                raise ValueError(f"任务 id 已存在：{tid}")
+            try:
+                await _maybe_await(
+                    self._store.save(
+                        tid,
+                        {
+                            "task_id": tid,
+                            "goal": goal,
+                            "status": TaskStatus.PENDING.value,
+                            "succeeded": False,
+                            "error": "",
+                            "duration_ms": 0,
+                            "total_tokens": 0,
+                            "total_cost_usd": 0.0,
+                            "steps": [],
+                            "nodes": [],
+                            "context_metrics": {},
+                            "metadata": metadata or {},
+                        },
+                    )
+                )
+            except Exception as exc:
+                # 跨进程并发时由数据库主键兜底（本进程内已被上面的锁拦住）。
+                # 用类名判断而不是 import sqlalchemy：API 层不该为了一个
+                # 错误映射去依赖具体的存储实现。
+                if type(exc).__name__ == "IntegrityError":
+                    raise ValueError(f"任务 id 已存在：{tid}") from exc
+                raise
+            self._running[tid] = asyncio.create_task(self._execute(tid, goal))
         logger.info("task_submitted", task_id=tid)
         return tid
 
     async def _execute(self, task_id: str, goal: str) -> None:
         """后台执行任务，全程发事件。"""
-        async with self._semaphore:
-            # 供进度回调定位当前任务（见 _on_orchestrator_event）
-            self._current_task_id = task_id
-            self._current_goal = goal
-            self._publish(task_id, "task_started", {"goal": goal})
-            await self._update(task_id, {"status": TaskStatus.RUNNING.value})
-            started = time.perf_counter()
+        # 归属信息走 ContextVar（见 __init__ 的说明）
+        token_task = self._current_task.set(task_id)
+        token_goal = self._current_goal.set(goal)
+        started = time.perf_counter()
+
+        # SQL 模式下把事件也落库（否则 task_events 恒为空，进程重启后
+        # SSE 什么都回放不出来 —— 而 db 模块的文档承诺了这一点）。
+        persist_queue: asyncio.Queue[TaskEvent | None] | None = None
+        persister: asyncio.Task[None] | None = None
+        if hasattr(self._store, "append_event"):
+            persist_queue = asyncio.Queue(maxsize=1000)
+            self._persist_queue.set(persist_queue)
+            persister = asyncio.create_task(self._persist_loop(persist_queue))
+
+        try:
+            # ★ 信号量等待必须被 try 覆盖：任务在**排队期间**被取消时，
+            # 早先的实现会跳过全部状态跃迁与清理（因为 try 在 async with 内部），
+            # 结果任务永远停在 pending、_running 残留、SSE 永不结束。
+            async with self._semaphore:
+                self._publish(task_id, "task_started", {"goal": goal})
+                await self._update(task_id, {"status": TaskStatus.RUNNING.value})
+                try:
+                    result = await self._orchestrator.run(goal, task_id=task_id)
+                    view = _to_view(result)
+                    existing = await _maybe_await(self._store.get(task_id))
+                    if existing is None:
+                        # 收尾期间任务被 DELETE 了：不能把它写回去，
+                        # 否则接口已经回答「已删除」，任务却又"复活"。
+                        logger.info("task_deleted_before_finish", task_id=task_id)
+                    else:
+                        view["metadata"] = existing.get("metadata", {})
+                        await _maybe_await(self._store.save(task_id, view))
+                    self._publish(
+                        task_id,
+                        "task_finished",
+                        {
+                            "status": view["status"],
+                            "succeeded": view["succeeded"],
+                            "duration_ms": view["duration_ms"],
+                            "total_tokens": view["total_tokens"],
+                            "error": view["error"],
+                        },
+                    )
+                except Exception as exc:
+                    logger.exception("task_execution_failed", task_id=task_id)
+                    await self._update(
+                        task_id,
+                        {
+                            "status": TaskStatus.FAILED.value,
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "duration_ms": int((time.perf_counter() - started) * 1000),
+                        },
+                    )
+                    self._publish(task_id, "task_finished", {"status": "failed", "error": str(exc)})
+        except asyncio.CancelledError:
+            await self._update(task_id, {"status": TaskStatus.CANCELLED.value})
+            self._publish(task_id, "task_cancelled", {})
+            raise
+        finally:
+            self._bus.close(task_id)
+            self._running.pop(task_id, None)
+            self._current_task.reset(token_task)
+            self._current_goal.reset(token_goal)
+            if persister is not None and persist_queue is not None:
+                # 排空后再关：已经产生的事件不能因为任务结束而丢。
+                persist_queue.put_nowait(None)
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait_for(persister, timeout=10)
+                self._persist_queue.set(None)
+
+    async def _persist_loop(self, queue: asyncio.Queue[TaskEvent | None]) -> None:
+        """把事件按序写入支持 ``append_event`` 的存储。
+
+        串行消费而不是每条 ``create_task``：事件顺序是回放语义的一部分，
+        并发落库会让 seq 与实际发生顺序不一致。
+        """
+        append = getattr(self._store, "append_event", None)
+        if append is None:
+            return
+        while True:
+            event = await queue.get()
+            if event is None:
+                return
             try:
-                result = await self._orchestrator.run(goal, task_id=task_id)
-                view = _to_view(result)
-                existing = await _maybe_await(self._store.get(task_id)) or {}
-                view["metadata"] = existing.get("metadata", {})
-                await _maybe_await(self._store.save(task_id, view))
-                self._publish(
-                    task_id,
-                    "task_finished",
-                    {
-                        "status": view["status"],
-                        "succeeded": view["succeeded"],
-                        "duration_ms": view["duration_ms"],
-                        "total_tokens": view["total_tokens"],
-                        "error": view["error"],
-                    },
-                )
-            except asyncio.CancelledError:
-                await self._update(task_id, {"status": TaskStatus.CANCELLED.value})
-                self._publish(task_id, "task_cancelled", {})
-                raise
-            except Exception as exc:
-                logger.exception("task_execution_failed", task_id=task_id)
-                await self._update(
-                    task_id,
-                    {
-                        "status": TaskStatus.FAILED.value,
-                        "error": f"{type(exc).__name__}: {exc}",
-                        "duration_ms": int((time.perf_counter() - started) * 1000),
-                    },
-                )
-                self._publish(task_id, "task_finished", {"status": "failed", "error": str(exc)})
-            finally:
-                self._bus.close(task_id)
-                self._running.pop(task_id, None)
-                if self._current_task_id == task_id:
-                    self._current_task_id = ""
-                    self._current_goal = ""
+                await _maybe_await(append(event))
+            except Exception:
+                # 事件落库失败不能影响任务执行：SSE 是实时通道，
+                # 数据库只是历史回放。降级为日志。
+                logger.warning("task_event_persist_failed", task_id=event.task_id, exc_info=True)
 
     def _publish(self, task_id: str, kind: str, payload: dict[str, Any]) -> None:
-        self._bus.publish(TaskEvent(kind=kind, task_id=task_id, payload=payload))
+        event = TaskEvent(kind=kind, task_id=task_id, payload=payload)
+        self._bus.publish(event)
+        queue = self._persist_queue.get()
+        if queue is not None:
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(event)
 
     async def _update(self, task_id: str, patch: dict[str, Any]) -> None:
         data = await _maybe_await(self._store.get(task_id))
@@ -319,24 +393,32 @@ def _to_view(result: Any) -> dict[str, Any]:
         "total_cost_usd": float(getattr(result, "total_cost_usd", 0.0) or 0.0),
         "steps": steps,
         "nodes": nodes,
-        "context_metrics": _context_metrics(),
+        "context_metrics": _context_metrics(str(getattr(result, "task_id", "") or "")),
         "metadata": {},
     }
 
 
-def _context_metrics() -> dict[str, Any]:
-    """从可观测性单例汇总本任务的上下文工程收益。
+def _context_metrics(task_id: str = "") -> dict[str, Any]:
+    """汇总**本任务**的上下文工程收益。
 
     这是前端「上下文查看器」的数据源，也是最能体现项目价值的一块。
+
+    ``task_id`` 过滤是必须的：``MetricsCollector.total`` 不带过滤时求和的是
+    **整个进程**的所有序列，于是每个任务页面展示的都是同一份累计值
+    （实测两个任务拿到完全相同的数字），而这个数字还会随任务数单调增长 ——
+    一个不可复现的收益指标比没有指标更糟。
     """
     from devagent.observability import MetricNames, get_observability
 
     metrics = get_observability().metrics
+    scope = {"task_id": task_id} if task_id else {}
     return {
-        "tokens_saved": metrics.total(MetricNames.CONTEXT_TOKENS_SAVED),
-        "chunks_dropped": metrics.total(MetricNames.CONTEXT_CHUNKS_DROPPED),
-        "compression_ratio": metrics.observe_total(MetricNames.CONTEXT_COMPRESSION_RATIO),
-        "utilization": metrics.observe_total(MetricNames.CONTEXT_UTILIZATION),
+        "task_id": task_id,
+        "tokens_saved": metrics.total(MetricNames.CONTEXT_TOKENS_SAVED, **scope),
+        "chunks_dropped": metrics.total(MetricNames.CONTEXT_CHUNKS_DROPPED, **scope),
+        "hard_overflow_tokens": metrics.total(MetricNames.CONTEXT_HARD_OVERFLOW, **scope),
+        "compression_ratio": metrics.observe_total(MetricNames.CONTEXT_COMPRESSION_RATIO, **scope),
+        "utilization": metrics.observe_total(MetricNames.CONTEXT_UTILIZATION, **scope),
     }
 
 

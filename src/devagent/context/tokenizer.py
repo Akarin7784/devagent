@@ -123,10 +123,84 @@ def normalize_vector(vec: Vector) -> Vector:
     return vec / norm
 
 
+# --------------------------------------------------------------------------- #
+# 词法相似度：向量不可用时的**兜底**语义近似
+# --------------------------------------------------------------------------- #
+
+_SHINGLE_SIZE = 2
+"""字符 n-gram 的 n。
+
+为什么是字符而不是词：本项目语料以中文与代码为主。中文没有空格分词，
+代码里的标识符也会被空格切碎，唯有**字符 n-gram** 对两者都不需要分词器，
+且对「同一段文字只差几个字」这类近似重复足够敏感。
+"""
+
+
+def _shingles(text: str) -> set[str]:
+    """把文本切成字符 n-gram 集合（空白归一化后）。
+
+    归一化的理由：上下文片段里换行/缩进的差异不代表语义差异，
+    不做归一化会让「同一段话的两种缩进」被判为不相似。
+    """
+    normalized = "".join(text.split())
+    if not normalized:
+        return set()
+    if len(normalized) <= _SHINGLE_SIZE:
+        return {normalized}
+    return {normalized[i : i + _SHINGLE_SIZE] for i in range(len(normalized) - _SHINGLE_SIZE + 1)}
+
+
+def lexical_similarity(a: str, b: str) -> float:
+    """基于字符 n-gram 的 Jaccard 相似度，取值 ``[0, 1]``。
+
+    存在意义：装配算法的**相关性与冗余判定原本只依赖 embedding**，
+    而 embedding 是可选能力（需要额外的嵌入模型调用）。一旦没有向量，
+    ``cosine_similarity`` 恒返回 0，于是「硬去重」永不触发、
+    「冗余惩罚」恒为 0 —— 整套打分退化成按插入顺序取片段。
+
+    这是最危险的一类退化：**功能静默失效，而测试仍然全绿**
+    （因为单测都手工构造了向量）。因此这里提供一个不依赖外部服务的
+    确定性兜底，保证「没有嵌入模型」时算法依然按设计意图工作。
+
+    空文本与空文本的相似度定义为 0（而不是 1）：两个空片段不构成
+    「互为冗余」的理由，否则会把它们互相去重掉。
+    """
+    sa = _shingles(a)
+    sb = _shingles(b)
+    if not sa or not sb:
+        return 0.0
+    intersection = len(sa & sb)
+    union = len(sa | sb)
+    return intersection / union if union else 0.0
+
+
+def estimate_info_units(text: str) -> int:
+    """估算文本的「有效信息单元」数（供信息密度打分使用）。
+
+    早先的实现是 ``len(content.split(". "))``：那对英文尚可，
+    对**中文恒为 1**（中文句号是 ``。`` 且后面不跟空格），
+    于是密度项 ``info_units / tokens`` 对中文语料几乎恒为 0 —— 又一个
+    「看起来在工作、实际不起作用」的指标。
+
+    这里按中英文句子边界切分，并给代码块内常见的 ``;`` ``{`` ``}``
+    换行留出计数，使中文与代码两条路径都有区分度。
+    """
+    if not text.strip():
+        return 0
+    boundaries = "。！？；!?;\n"
+    units = 1
+    for ch in text:
+        if ch in boundaries:
+            units += 1
+    return max(1, units)
+
+
 __all__ = [
     "HeuristicTokenCounter",
     "TokenCounter",
     "Vector",
     "cosine_similarity",
+    "estimate_info_units",
+    "lexical_similarity",
     "normalize_vector",
 ]

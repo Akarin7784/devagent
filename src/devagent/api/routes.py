@@ -265,7 +265,11 @@ async def run_evaluation(payload: RunEvalRequest, request: Request) -> EvalSumma
     """同步运行一次评测（样本量小时适用；大批量请用 CLI 或后台任务）。"""
     from devagent.api.eval_routes import execute_evaluation
 
-    summary = await execute_evaluation(request.app, payload)
+    try:
+        summary = await execute_evaluation(request.app, payload)
+    except ValueError as exc:
+        # 路径越界等参数问题应当是 400，而不是冒泡成 500
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return EvalSummaryView.model_validate(summary)
 
 

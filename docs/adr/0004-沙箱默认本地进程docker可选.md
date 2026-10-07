@@ -96,9 +96,16 @@ docker run --rm \
 
 - `--network none`：彻底断网，防数据外泄
 - `--read-only` + `tmpfs`：根文件系统不可写，仅 `/tmp` 可写且有大小上限
-- 工作区挂载为**只读**，测试产物通过单独的可写挂载点回传
+- 工作区挂载模式**显式声明**：默认 `:ro`；只有调用方显式传入一个专用可写工作区
+  时才用读写挂载（`workspace_read_only_for()`）。早期实现无条件读写挂载仓库，
+  等于让不受信内容直接改写 `.git/hooks` 与源码
+- `--user` / `--cap-drop=ALL` / `--security-opt=no-new-privileges`：非 root + 降权
 - `--pids-limit`：防 fork 炸弹
-- `docker` Python SDK 惰性导入，未安装时抛出清晰错误并提示安装 `[sandbox]` extra
+- 超时后按 `--name` 执行 `docker rm -f`：只杀 `docker run` 这个 CLI 进程
+  **不会**停掉容器，容器会继续跑并继续写挂载目录
+- 不依赖 `docker` Python SDK：直接走 `docker` CLI（`create_subprocess_exec`），
+  因此 `[sandbox]` extra 并非运行必需；Docker 不可用时的降级由
+  `sandbox.allow_local_fallback` 控制，可配置为 fail-closed
 
 ### 路径穿越防护
 

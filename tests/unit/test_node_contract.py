@@ -411,6 +411,24 @@ class TestCrossLanguageWordlist:
         data = json.loads(Path(contract_words_path).read_text(encoding="utf-8"))
         assert data["agent_type"] == [a.value for a in AgentType]
 
+    def test_fixture_lists_every_task_status(self, contract_words_path: Any) -> None:
+        """任务级状态也必须进词表。
+
+        前端概览页曾用 ``t.status === 'success'`` 比较后端实际发出的
+        ``'succeeded'``，导致全成功时成功率显示"—"、9 成功 1 失败时显示
+        900%。词表里没有 task_status，就没有任何测试能把这类错配拦住。
+        """
+        import json
+        from pathlib import Path
+
+        from devagent.enums import TaskStatus
+
+        data = json.loads(Path(contract_words_path).read_text(encoding="utf-8"))
+        assert data["task_status"] == [s.value for s in TaskStatus]
+        # 固化两个最容易被写错的状态名
+        assert "succeeded" in data["task_status"]
+        assert "paused" in data["task_status"]
+
     def test_step_status_contains_ready_verifying_rejected(self) -> None:
         """固化这三个最容易在前端漏登记的状态。
 

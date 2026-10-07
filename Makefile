@@ -82,13 +82,14 @@ migrate:  ## 执行数据库迁移
 
 web-words:  ## 导出跨语言词表（从 devagent/enums.py 生成前端可读的 fixture）
 	@$(PYTHON) -c "import sys; sys.path.insert(0, 'src'); \
-	from devagent.enums import AgentType, StepStatus; \
+	from devagent.enums import AgentType, StepStatus, TaskStatus; \
 	import json, pathlib; \
 	pathlib.Path('web').mkdir(exist_ok=True); \
 	pathlib.Path('web/test_contract_words.json').write_text( \
 	    json.dumps({'_generated_by': 'Makefile::web-words', \
 	                'step_status': [s.value for s in StepStatus], \
-	                'agent_type': [a.value for a in AgentType]}, \
+	                'agent_type': [a.value for a in AgentType], \
+	                'task_status': [s.value for s in TaskStatus]}, \
 	               ensure_ascii=False, indent=2) + '\n', encoding='utf-8')"
 	@echo "[web-words] web/test_contract_words.json 已更新"
 
@@ -112,6 +113,10 @@ web-check: web-words  ## 校验前端（语法检查 + 纯逻辑测试 + 模块�
 	$(NODE) web/status.test.js
 	@echo "[web-check] 事件流去重与回放判定"
 	$(NODE) web/eventstream.test.js
+	@echo "[web-check] 页面纯函数与渲染契约"
+	$(NODE) web/pages.test.js
+	@echo "[web-check] 模块图与「动态数据不得当 HTML 解析」静态防线"
+	$(NODE) web/imports.test.js
 	@echo "[web-check] 通过"
 
 web-serve:  ## 用静态服务器托管前端（零依赖）

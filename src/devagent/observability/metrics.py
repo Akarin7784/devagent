@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 import threading
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -56,33 +56,75 @@ class MetricsCollector:
     之后 debug 「指标偶尔少算几千 token」划算。
     """
 
-    def __init__(self, *, max_observations: int = 10_000) -> None:
+    def __init__(
+        self,
+        *,
+        max_observations: int = 10_000,
+        max_series_per_metric: int = 2_000,
+    ) -> None:
         self._lock = threading.Lock()
-        self._counters: dict[str, dict[tuple[tuple[str, str], ...], _Series]] = defaultdict(dict)
-        self._gauges: dict[str, dict[tuple[tuple[str, str], ...], _Series]] = defaultdict(dict)
-        self._histograms: dict[str, dict[tuple[tuple[str, str], ...], _Series]] = defaultdict(dict)
+        self._counters: dict[str, OrderedDict[tuple[tuple[str, str], ...], _Series]] = defaultdict(
+            OrderedDict
+        )
+        self._gauges: dict[str, OrderedDict[tuple[tuple[str, str], ...], _Series]] = defaultdict(
+            OrderedDict
+        )
+        self._histograms: dict[str, OrderedDict[tuple[tuple[str, str], ...], _Series]] = (
+            defaultdict(OrderedDict)
+        )
         self._max_observations = max_observations
+        self._max_series_per_metric = max_series_per_metric
+        self._evicted: dict[str, int] = {}
+        """因超上限被淘汰的序列数（按指标名），用于判断上限是否定得过小。"""
 
     # ------------------------------------------------------------------ #
     # 写入
     # ------------------------------------------------------------------ #
 
+    def _bounded(
+        self,
+        bucket: OrderedDict[tuple[tuple[str, str], ...], _Series],
+        name: str,
+        key: tuple[tuple[str, str], ...],
+    ) -> _Series:
+        """取（或创建）序列，并对**序列数量**做 LRU 上限保护。
+
+        为什么必须限：写入方会拿 ``node_id`` / ``task_id`` 之类来自模型输出
+        或用户输入的值当标签，取值空间无界。此前只对「单个序列的观测数」
+        做了蓄水池采样，序列字典本身**从不淘汰** —— 长跑进程里
+        ``snapshot()`` 会序列化全部历史序列，内存与响应体一起膨胀。
+        这里按最近使用顺序淘汰最久未写入的序列，保证内存有界。
+        """
+        series = bucket.get(key)
+        if series is None:
+            series = _Series(labels=key)
+            bucket[key] = series
+            if len(bucket) > self._max_series_per_metric:
+                # 淘汰最久未写入的一条；被淘汰的序列若再次写入会自动重建。
+                bucket.popitem(last=False)
+                self._evicted[name] = self._evicted.get(name, 0) + 1
+        else:
+            bucket.move_to_end(key)
+        return series
+
     def inc_counter(self, name: str, value: float = 1.0, **labels: Any) -> None:
         key = _label_tuple(labels)
         with self._lock:
-            series = self._counters[name].setdefault(key, _Series(labels=key))
+            series = self._bounded(self._counters[name], name, key)
             series.value += value
             series.count += 1
 
     def set_gauge(self, name: str, value: float, **labels: Any) -> None:
         key = _label_tuple(labels)
         with self._lock:
-            self._gauges[name][key] = _Series(labels=key, value=value, count=1)
+            series = self._bounded(self._gauges[name], name, key)
+            series.value = value
+            series.count = 1
 
     def observe(self, name: str, value: float, **labels: Any) -> None:
         key = _label_tuple(labels)
         with self._lock:
-            series = self._histograms[name].setdefault(key, _Series(labels=key))
+            series = self._bounded(self._histograms[name], name, key)
             series.value += value
             series.count += 1
             # 容量保护：超高基数的长尾会吃掉内存，超过上限后转为水塘采样
@@ -103,19 +145,22 @@ class MetricsCollector:
     def counter(self, name: str, **labels: Any) -> float:
         key = _label_tuple(labels)
         with self._lock:
-            series = self._counters.get(name, {}).get(key)
+            bucket = self._counters.get(name)
+            series = bucket.get(key) if bucket is not None else None
             return series.value if series else 0.0
 
     def gauge(self, name: str, **labels: Any) -> float:
         key = _label_tuple(labels)
         with self._lock:
-            series = self._gauges.get(name, {}).get(key)
+            bucket = self._gauges.get(name)
+            series = bucket.get(key) if bucket is not None else None
             return series.value if series else 0.0
 
     def histogram_stats(self, name: str, **labels: Any) -> dict[str, float]:
         key = _label_tuple(labels)
         with self._lock:
-            series = self._histograms.get(name, {}).get(key)
+            bucket = self._histograms.get(name)
+            series = bucket.get(key) if bucket is not None else None
             if not series or not series.observations:
                 return {"count": 0, "sum": 0.0, "mean": 0.0, "min": 0.0, "max": 0.0}
             obs = sorted(series.observations)
@@ -153,6 +198,7 @@ class MetricsCollector:
             self._counters.clear()
             self._gauges.clear()
             self._histograms.clear()
+            self._evicted.clear()
 
     def total(self, name: str, **label_filter: Any) -> float:
         """按标签**前缀过滤**求和，忽略未指定的标签。
@@ -163,7 +209,9 @@ class MetricsCollector:
         """
         wanted = {str(k): str(v) for k, v in label_filter.items()}
         with self._lock:
-            series_map = self._counters.get(name, {})
+            series_map = self._counters.get(name)
+            if series_map is None:
+                return 0.0
             total = 0.0
             for labels, series in series_map.items():
                 as_dict = dict(labels)
@@ -293,18 +341,32 @@ class MetricNames:
     LLM_RETRIES = "llm_retries"
     """重试次数。labels: model, reason"""
 
+    LLM_UNPRICED_CALLS = "llm_unpriced_calls"
+    """价格表未命中的调用次数。labels: model
+
+    非 0 就意味着成本账本偏低（这些调用的花费被记为 0），
+    属于"数字看起来很正常、但其实是错的"那类问题，必须显式暴露。
+    """
+
     # 上下文工程
     CONTEXT_TOKENS_SAVED = "context_tokens_saved"
-    """上下文压缩/去重节省的 token。labels: agent, reason"""
+    """上下文压缩/去重节省的 token。labels: agent, reason, task_id"""
 
     CONTEXT_COMPRESSION_RATIO = "context_compression_ratio"
-    """压缩比分布。labels: agent"""
+    """压缩比分布。labels: agent, task_id"""
 
     CONTEXT_CHUNKS_DROPPED = "context_chunks_dropped"
-    """装配阶段淘汰的片段数。labels: agent, reason"""
+    """装配阶段淘汰的片段数。labels: agent, reason, task_id"""
 
     CONTEXT_UTILIZATION = "context_utilization"
-    """预算利用率分布。labels: agent"""
+    """预算利用率分布。labels: agent, task_id"""
+
+    CONTEXT_HARD_OVERFLOW = "context_hard_overflow"
+    """硬约束击穿输入预算的 token 数。labels: agent, task_id
+
+    为什么需要单独一个指标：硬约束「永不丢弃」是刻意设计，但**超预算本身
+    必须可见**。此前它是静默的——实测预算 2000 时投递了 13530 token。
+    """
 
     # 编排
     NODE_EXECUTIONS = "node_executions"
@@ -320,10 +382,15 @@ class MetricNames:
     """任务端到端耗时分布。"""
 
     RETRIES = "retries"
-    """重试次数。labels: node_id, reason"""
+    """重试次数。labels: node_type, reason
+
+    刻意**不用 node_id 当标签**：节点 id 来自模型的 JSON 输出，取值无界，
+    当标签会让指标基数随任务数无限增长（每个节点一条序列），
+    而按 Agent 类型聚合才是有决策价值的口径。
+    """
 
     BACKTRACKS = "backtracks"
-    """回退次数（Verifier 驳回触发）。labels: node_id"""
+    """回退次数（Verifier 驳回触发）。labels: node_type"""
 
     ESCALATIONS = "escalations"
     """模型升档次数。labels: from_tier, to_tier"""
@@ -333,17 +400,24 @@ class MetricNames:
     """熔断触发次数。labels: kind"""
 
     LOOP_DETECTED = "loop_detected"
-    """检测到循环次数。labels: node_id"""
+    """检测到循环次数。labels: node_type"""
 
     REFLEXION_LESSONS = "reflexion_lessons"
     """沉淀的复盘教训数。labels: agent"""
 
     # 验证
     VERDICT_TOTAL = "verdict_total"
-    """验证结论计数。labels: verdict"""
+    """验证结论计数。labels: verdict, node_type"""
 
     HALLUCINATION_BLOCKED = "hallucination_blocked"
-    """被 Verifier 拦截的不可验证断言数。"""
+    """被 Verifier 拦截的不可验证断言数。labels: node_type"""
+
+    VERIFICATION_UNAVAILABLE = "verification_unavailable"
+    """验证器不可用导致的「无法验证」次数。labels: node_type
+
+    这个数字**必须为 0 才敢说验证有效**：一旦大于 0，说明有产出在
+    「没有通过验证」的情况下进入了流程，此时任务状态应体现出来。
+    """
 
 
 __all__ = ["MetricNames", "MetricsCollector"]

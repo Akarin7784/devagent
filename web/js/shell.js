@@ -237,6 +237,33 @@ function showConnectionInfo() {
  * 侧边导航
  * ------------------------------------------------------------------ */
 
+/**
+ * 导航里注册的订阅清理函数。
+ *
+ * ## 为什么要有这个模块级变量（这是一次真实的泄漏）
+ *
+ * `rebuildNav()` 每次 hashchange 都会重建整个导航，而导航项里的
+ * "运行中任务数"徽章会 `subscribe('tasks', paint)`。
+ * 原实现丢弃了 subscribe 的返回值 —— 于是每导航一次就多一个**永久**
+ * 订阅者，全都往已经脱离文档的 `<span>` 里写 DOM：N 次导航后是 N+1 个。
+ * 界面看起来完全正常，只是内存与 CPU 缓慢增长。
+ *
+ * 因此把清理函数存到模块级，重建前先统一回收（`disposeNavSubscriptions`）。
+ */
+let navDisposers = [];
+
+/** 回收上一次导航注册的全部订阅（幂等）。 */
+function disposeNavSubscriptions() {
+  for (const off of navDisposers) {
+    try {
+      off();
+    } catch (err) {
+      console.error('[shell] 导航订阅清理失败', err);
+    }
+  }
+  navDisposers = [];
+}
+
 function buildNav() {
   const nav = el('nav', { class: 'nav', attrs: { 'aria-label': '主导航' } });
   // 经 routeById 归一：页内锚点（如 #page-root）解析出 id=null，
@@ -271,7 +298,8 @@ function buildNav() {
           badgeEl.hidden = !running;
         };
         paint();
-        subscribe('tasks', paint);
+        // **必须保存**取消订阅函数（见 navDisposers 的注释）
+        navDisposers.push(subscribe('tasks', paint));
         item.append(badgeEl);
       }
       nav.append(item);
@@ -280,12 +308,29 @@ function buildNav() {
   return nav;
 }
 
+/** 建一个新的导航节点；旧节点的订阅在这里被回收。 */
+function createNav() {
+  disposeNavSubscriptions();
+  const fresh = buildNav();
+  fresh.id = 'app-nav';
+  return fresh;
+}
+
+/**
+ * 建导航（**导出仅为可测**）。
+ *
+ * 导航徽章的订阅泄漏是"界面全对、内存缓慢增长"的类型，只有把
+ * "重建两次之后订阅数是否翻倍"变成断言才防得住。
+ * 与 `graph.js` 导出 `edgePath` 的理由相同：可测的边界值得显式一点。
+ */
+export function createNavForTest() {
+  return createNav();
+}
+
 function rebuildNav() {
   const old = $('app-nav');
   if (!old) return;
-  const fresh = buildNav();
-  fresh.id = 'app-nav';
-  old.replaceWith(fresh);
+  old.replaceWith(createNav());
 }
 
 /* ------------------------------------------------------------------ *
@@ -545,8 +590,7 @@ export async function mountShell() {
     ]),
   ]);
 
-  const nav = buildNav();
-  nav.id = 'app-nav';
+  const nav = createNav();
 
   const docsLink = el('a', {
     class: 'nav-item',

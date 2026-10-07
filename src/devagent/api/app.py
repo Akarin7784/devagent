@@ -48,6 +48,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         from devagent.db.factory import build_store, finalize_store
         from devagent.models.gateway import ModelGateway
         from devagent.orchestration import Orchestrator
+        from devagent.tools.runtime import build_test_runtime
 
         app.state.settings = resolved
         app.state.gateway = ModelGateway(resolved)
@@ -62,15 +63,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # （create_all 无法演进已有表结构）。
             await database.init_models()
 
+        # 测试运行时：把 Tester 的「生成 → 落盘 → 沙箱执行」链路真正接上。
+        # 早先没有任何入口传 test_runner，于是 Verifier 的「客观测试证据」
+        # 恒为一条占位符 —— 实现完整但这根线从未插上。
+        test_runtime = build_test_runtime(resolved)
+        app.state.test_runtime = test_runtime
+
         app.state.store = store
         app.state.bus = EventBus()
-        app.state.orchestrator = Orchestrator(resolved, gateway=app.state.gateway)
+        app.state.orchestrator = Orchestrator(
+            resolved, gateway=app.state.gateway, test_runner=test_runtime.runner
+        )
         app.state.task_service = TaskService(
             app.state.orchestrator,
             store=store,
             bus=app.state.bus,
         )
-        logger.info("api_started", storage=resolved.storage.backend)
+        logger.info(
+            "api_started",
+            storage=resolved.storage.backend,
+            test_isolation=test_runtime.isolation,
+        )
 
         try:
             yield
@@ -79,6 +92,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             service: TaskService = app.state.task_service
             await service.shutdown()
             await app.state.orchestrator.aclose()
+            await test_runtime.aclose()
             await finalize_store(app.state.storage, app.state.database)
             logger.info("api_stopped")
 
@@ -94,13 +108,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     # CORS：前端 dev server 通常跑在 5173（Vite）
+    #
+    # ★ 不能有 ``or ["*"]`` 兜底：通配源 + ``allow_credentials=True`` 是
+    # 浏览器明确禁止的组合（表现是凭据请求被拒），同时非凭据的跨站读取
+    # 会对任意站点开放 —— 而本项目默认没有鉴权。配置为空即"不发 CORS 头"。
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=resolved.cors_origins or ["*"],
+        allow_origins=list(resolved.cors_origins),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def api_key_guard(request: Request, call_next: Any) -> Any:
+        """可选的 API Key 校验（``DEVAGENT_SECURITY__API_KEY``）。
+
+        默认关闭以保持零配置可用；一旦设置，``/api/v1/**`` 全部要求
+        ``X-API-Key``。没有它的话，任何能访问端口的人都能创建任务
+        （即消耗模型额度）、删除任务、触发评测。
+        """
+        key = resolved.security.api_key
+        if (
+            key
+            and request.url.path.startswith("/api/v1")
+            and request.headers.get("x-api-key") != key
+        ):
+            return JSONResponse(
+                status_code=401,
+                content={"error": "unauthorized", "detail": "缺少或错误的 X-API-Key"},
+            )
+        return await call_next(request)
 
     app.include_router(router, prefix="/api/v1")
 
@@ -116,7 +154,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             status_code=500,
             content={
                 "error": "internal_error",
-                "detail": f"{type(exc).__name__}: {exc}" if _debug_enabled() else "服务器内部错误",
+                # 读注入的 settings，而不是 os.environ：pydantic-settings 会把
+                # .env 读进 Settings 但**不写入** os.environ，于是早先的实现
+                # 让 .env 里的 DEVAGENT_DEBUG 完全无效，而进程环境里恰好存在的
+                # 同名变量又能在未认证的 500 响应里泄漏内部细节。
+                "detail": f"{type(exc).__name__}: {exc}" if resolved.debug else "服务器内部错误",
                 "code": "INTERNAL",
             },
         )
@@ -188,12 +230,6 @@ def _maybe_mount_frontend(app: FastAPI, settings: Settings) -> Path | None:
 
     logger.info("frontend_mounted", web_dir=str(candidate))
     return candidate
-
-
-def _debug_enabled() -> bool:
-    import os
-
-    return os.environ.get("DEVAGENT_DEBUG", "").lower() in {"1", "true", "yes"}
 
 
 __all__ = ["create_app"]

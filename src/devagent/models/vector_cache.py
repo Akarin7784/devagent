@@ -167,8 +167,14 @@ class _Entry:
     """查询侧向量（对最后一个 user 消息做嵌入）。"""
 
     result: ChatResult
-    bucket: tuple[str, str]
-    """``(model, temperature)`` 检索桶。"""
+    bucket: tuple[str, str, str]
+    """``(model, temperature, prefix_key)`` 检索桶。
+
+    ``prefix_key`` 是"除最后一条之外的全部消息"的指纹（即系统提示 + 历史）。
+    只按 ``(model, temperature)`` 分桶是不够的：语义检索只嵌入**最后一条**
+    消息，于是命中判定对角色与提示词版本完全无感 —— 同一个模型桶里，
+    Verifier 的结论会被返回给 Coder，改版后的提示词也会命中旧版结果。
+    """
 
 
 class VectorSemanticCache:
@@ -213,7 +219,7 @@ class VectorSemanticCache:
         # 为什么不做 ANN（HNSW/IVF）：512 条以内的线性扫描是微秒级，
         # 引入 ANN 库会给一个"优化项"带来重依赖与调参负担。
         # 超过 512 条时仍然可接受（512 × 1024 维点积约 0.5ms）。
-        self._buckets: dict[tuple[str, str], list[_Entry]] = {}
+        self._buckets: dict[tuple[str, str, str], list[_Entry]] = {}
         self.stats = CacheStats()
 
     # ------------------------------------------------------------------ #
@@ -231,8 +237,25 @@ class VectorSemanticCache:
         return hasher.hexdigest()
 
     @staticmethod
-    def _bucket(model: str, temperature: float) -> tuple[str, str]:
-        return (model, f"{temperature:.3f}")
+    def _bucket(model: str, temperature: float, prefix_key: str = "") -> tuple[str, str, str]:
+        return (model, f"{temperature:.3f}", prefix_key)
+
+    @staticmethod
+    def _prefix_key(messages: Sequence[ChatMessage]) -> str:
+        """「除最后一条之外」的消息指纹（系统提示 + 历史）。
+
+        这与 ``_query_text`` 的取舍是配套的：嵌入只看最后一条消息（避免向量
+        向"平均语义"塌缩），但**命中判定必须知道前面是什么**，否则
+        「同一段用户消息 + 不同系统提示」会被判为同一个请求。
+        """
+        hasher = hashlib.sha256()
+        last_index = max((i for i, m in enumerate(messages) if m.content), default=-1)
+        for index, message in enumerate(messages):
+            if index == last_index:
+                continue
+            hasher.update(message.role.encode())
+            hasher.update(message.content.encode())
+        return hasher.hexdigest()[:16]
 
     @staticmethod
     def _query_text(messages: Sequence[ChatMessage]) -> str:
@@ -287,7 +310,7 @@ class VectorSemanticCache:
             key=key,
             vector=[],
             result=result,
-            bucket=self._bucket(model, temperature),
+            bucket=self._bucket(model, temperature, self._prefix_key(messages)),
         )
         self._store_entry(entry)
 
@@ -311,7 +334,7 @@ class VectorSemanticCache:
             self.stats.misses += 1
             return None
 
-        match = self._search(vector, model, temperature)
+        match = self._search(vector, model, temperature, self._prefix_key(messages))
         if match is None:
             self.stats.misses += 1
             return None
@@ -342,7 +365,7 @@ class VectorSemanticCache:
             key=key,
             vector=vector or [],
             result=result,
-            bucket=self._bucket(model, temperature),
+            bucket=self._bucket(model, temperature, self._prefix_key(messages)),
         )
         self._store_entry(entry)
 
@@ -369,10 +392,12 @@ class VectorSemanticCache:
             return None
         return list(vectors[0])
 
-    def _search(self, vector: list[float], model: str, temperature: float) -> _Entry | None:
+    def _search(
+        self, vector: list[float], model: str, temperature: float, prefix_key: str = ""
+    ) -> _Entry | None:
         """在候选桶内找相似度最高且过阈值的条目。"""
         if self._model_filter:
-            candidates = self._buckets.get(self._bucket(model, temperature), [])
+            candidates = self._buckets.get(self._bucket(model, temperature, prefix_key), [])
         else:
             candidates = [e for entries in self._buckets.values() for e in entries]
 

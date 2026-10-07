@@ -20,30 +20,66 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- ---------------------------------------------------------------------- #
 -- 任务表
+--
+-- 列名/类型/非空/默认值必须与 ORM 的 TaskRow（src/devagent/db/models.py）逐列一致：
+-- app.py 用的是 create_all(checkfirst=True)，表已存在时**不会**被纠正，
+-- 因此这里的 DDL 一旦与 ORM 不一致，SQL 模式下的第一次写入就会
+-- 报 "no such column: tasks.succeeded"。
+-- 时间戳统一为 double precision（Unix 秒），与 ORM 的 Float 列对应。
 -- ---------------------------------------------------------------------- #
 
 CREATE TABLE IF NOT EXISTS tasks (
-    id              TEXT PRIMARY KEY,
-    goal            TEXT        NOT NULL,
-    status          TEXT        NOT NULL DEFAULT 'pending',
-    error           TEXT,
-    total_tokens    BIGINT      NOT NULL DEFAULT 0,
+    id              VARCHAR(64)      PRIMARY KEY,
+    goal            TEXT             NOT NULL,
+    status          VARCHAR(32)      NOT NULL DEFAULT 'pending',
+    succeeded       BOOLEAN          NOT NULL DEFAULT FALSE,
+    error           TEXT             NOT NULL DEFAULT '',
+    duration_ms     INTEGER          NOT NULL DEFAULT 0,
+    total_tokens    INTEGER          NOT NULL DEFAULT 0,
     total_cost_usd  DOUBLE PRECISION NOT NULL DEFAULT 0,
-    duration_ms     BIGINT      NOT NULL DEFAULT 0,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    -- steps / nodes / context_metrics / extra 整体读写，从不按字段查询
+    steps           JSON             NOT NULL DEFAULT '[]'::json,
+    nodes           JSON             NOT NULL DEFAULT '[]'::json,
+    context_metrics JSON             NOT NULL DEFAULT '{}'::json,
+    extra           JSON             NOT NULL DEFAULT '{}'::json,
+    created_at      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at      DOUBLE PRECISION NOT NULL DEFAULT 0
 );
 
+-- 索引名与 ORM 的 __table_args__ 保持一致，避免两条建表路径产出不同的 schema
 -- 按状态查询（列表页最常见）
-CREATE INDEX IF NOT EXISTS idx_tasks_status_created
-    ON tasks (status, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_tasks_status_created
+    ON tasks (status, created_at);
+
+-- 列表按创建时间倒序
+CREATE INDEX IF NOT EXISTS ix_tasks_created
+    ON tasks (created_at);
+
+-- ---------------------------------------------------------------------- #
+-- 任务事件表（SSE 事件流的历史持久化，ORM：TaskEventRow）
+-- ---------------------------------------------------------------------- #
+
+CREATE TABLE IF NOT EXISTS task_events (
+    id          SERIAL           PRIMARY KEY,
+    task_id     VARCHAR(64)      NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    seq         INTEGER          NOT NULL DEFAULT 0,
+    kind        VARCHAR(48)      NOT NULL,
+    payload     JSON             NOT NULL DEFAULT '{}'::json,
+    timestamp   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    -- 序列号在任务内单调递增：既用于去重，也支持断点续拉
+    CONSTRAINT uq_task_events_task_seq UNIQUE (task_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS ix_task_events_task_seq
+    ON task_events (task_id, seq);
 
 -- ---------------------------------------------------------------------- #
 -- DAG 节点表
 -- ---------------------------------------------------------------------- #
 
 CREATE TABLE IF NOT EXISTS task_nodes (
-    task_id         TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    -- 外键列的类型必须与 tasks.id（VARCHAR(64)）一致，避免跨类型外键
+    task_id         VARCHAR(64) NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     node_id         TEXT NOT NULL,
     goal            TEXT NOT NULL DEFAULT '',
     agent_type      TEXT NOT NULL,
@@ -64,7 +100,7 @@ CREATE INDEX IF NOT EXISTS idx_task_nodes_status
 
 CREATE TABLE IF NOT EXISTS task_steps (
     id              BIGSERIAL PRIMARY KEY,
-    task_id         TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    task_id         VARCHAR(64) NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     step_id         TEXT NOT NULL,
     agent_type      TEXT NOT NULL,
     attempt         INT  NOT NULL DEFAULT 1,
@@ -116,7 +152,8 @@ CREATE INDEX IF NOT EXISTS idx_code_symbols_trgm
 
 CREATE TABLE IF NOT EXISTS context_decisions (
     id              BIGSERIAL PRIMARY KEY,
-    task_id         TEXT NOT NULL,
+    -- 与 tasks.id 保持同一类型（VARCHAR(64)）
+    task_id         VARCHAR(64) NOT NULL,
     step_id         TEXT NOT NULL,
     agent_type      TEXT NOT NULL,
     chunk_ref       TEXT NOT NULL,
@@ -136,7 +173,10 @@ CREATE INDEX IF NOT EXISTS idx_context_decisions_step
 
 CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS TRIGGER AS $$
 BEGIN
-    NEW.updated_at = now();
+    -- updated_at 是 double precision（Unix 秒），与 ORM 的 Float 列一致。
+    -- 直接写 now() 会因 timestamptz → float8 没有隐式转换而在**每次 UPDATE** 时报错
+    -- （SqlTaskStore.save() 更新已有任务时就会踩到），必须显式取 epoch。
+    NEW.updated_at = EXTRACT(EPOCH FROM now())::double precision;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;

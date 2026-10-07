@@ -125,18 +125,23 @@ class ContextCompressor:
         hot_window: int = 3,
         warm_window: int = 10,
         token_counter: TokenCounter | None = None,
+        protect_hard: bool = True,
     ) -> None:
         """
         Args:
-            summarizer: 摘要生成器；为 None 时退化为「指针化」压缩。
+            summarizer: 摘要生成器；为 None 时退化为「结构化抽取式摘要」。
             hot_window: 热区大小（最近 N 个片段不压缩）。
             warm_window: 温区大小（热区之外的 N 个片段做摘要压缩）。
             token_counter: token 计数器。
+            protect_hard: 硬约束是否免于压缩。对应
+                ``ContextConfig.hard_constraint_untouchable``；此前这个配置项
+                从未被读取（恒为 True），属于「写了开关但接线不存在」。
         """
         self._summarizer = summarizer
         self._hot_window = hot_window
         self._warm_window = warm_window
         self._counter = token_counter or HeuristicTokenCounter()
+        self._protect_hard = protect_hard
 
     async def compress(
         self,
@@ -155,9 +160,12 @@ class ContextCompressor:
         """
         tokens_before = sum(c.tokens for c in chunks)
 
-        # 硬约束永不压缩，直接透传
-        hard = [c for c in chunks if c.is_hard]
-        soft = [c for c in chunks if not c.is_hard]
+        # 硬约束是否免压缩由配置决定（``hard_constraint_untouchable``）
+        if self._protect_hard:
+            hard = [c for c in chunks if c.is_hard]
+            soft = [c for c in chunks if not c.is_hard]
+        else:
+            hard, soft = [], list(chunks)
 
         # 按 age 升序（新 → 旧），age 越小越新
         soft_sorted = sorted(soft, key=lambda c: c.age)
@@ -208,8 +216,9 @@ class ContextCompressor:
                 ),
             )
         else:
-            # 无摘要器时退化为截断（保守策略，明确标注）
-            summary_text = _naive_summary(merged_text)
+            # 无摘要器时的降级：结构化抽取式摘要（保留小标题/条目/约束），
+            # 而不是盲截断 —— 见 _extractive_summary 的说明。
+            summary_text = _extractive_summary(merged_text)
 
         max_age = max(c.age for c in group)
         return ContextChunk(
@@ -276,8 +285,48 @@ class EchoSummarizer:
         return rendered[: self._max_chars]
 
 
+def _extractive_summary(text: str, max_chars: int = 1200) -> str:
+    """无 LLM 摘要器时的降级策略：**结构化抽取**，而不是盲截断。
+
+    早期实现是 ``text[:300] + "…（已截断）"``。温区最多 10 个片段被合并后
+    只留前 300 字符 —— 对一份真实的开发过程记录，这等于丢掉 95% 以上内容，
+    而文档承诺的是「滚动摘要（结构化 schema）」。既然 ``src/`` 里并不存在
+    LLM 摘要器实现（只有测试用的 ``EchoSummarizer``），生产路径实际一直在
+    走这条降级分支，所以它必须足够保守：
+
+    1. 优先保留**有结构意义的行**（Markdown 小标题、列表项、含约束/决策
+       关键词的行）——这些行承载的信息密度最高；
+    2. 其余行按原顺序补齐，直到达到字符预算；
+    3. 明确标注这是抽取式降级摘要，且保留原文片段数，便于事后审计。
+    """
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+
+    keyword_hits = ("约束", "必须", "不得", "决定", "选择", "完成", "修改", "待", "问题", "TODO")
+    structural = [
+        ln
+        for ln in lines
+        if ln.lstrip().startswith(("#", "-", "*", "```")) or any(k in ln for k in keyword_hits)
+    ]
+
+    picked: list[str] = []
+    seen: set[str] = set()
+    for ln in [*structural, *lines]:
+        key = ln.strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(ln)
+
+    rendered = "\n".join(picked)
+    if len(rendered) > max_chars:
+        rendered = rendered[:max_chars] + "\n…（抽取式摘要已达长度上限，完整内容请按 source 回捞）"
+    return rendered
+
+
 def _naive_summary(text: str, max_chars: int = 300) -> str:
-    """无摘要器时的保守降级：截断并明确标注。"""
+    """保留的简单截断实现（供对比实验与外部调用）。"""
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n…（已截断，完整内容请按 source 回捞）"

@@ -70,13 +70,23 @@ services:
       redis:
         condition: service_healthy
     environment:
-      DEVAGENT_ENV: docker
-      DEVAGENT_DB__URL: postgresql+asyncpg://devagent:devagent@postgres:5432/devagent
+      # 只能是 development / testing / production（Settings.env 是 Literal）。
+      # 曾写成 docker，容器会因 ValidationError 直接崩溃重启。
+      DEVAGENT_ENV: production
+      # 键名必须是 DEVAGENT_DATABASE__URL：配置里没有 db 这一层，
+      # 写错会被 extra="ignore" 静默丢弃，容器转而连自己的 localhost 并失败。
+      DEVAGENT_DATABASE__URL: postgresql+asyncpg://devagent:devagent@postgres:5432/devagent
+      # 本文件存在的意义就是持久化，因此显式选 sql 后端（默认是 memory）。
+      DEVAGENT_STORAGE__BACKEND: sql
       DEVAGENT_REDIS__URL: redis://redis:6379/0
-      # 模型 Key 从宿主机环境透传（不要写进本文件）
-      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
-      QWEN_API_KEY: ${QWEN_API_KEY:-}
-      ZHIPU_API_KEY: ${ZHIPU_API_KEY:-}
+      # 模型 Key 从宿主机环境透传（不要写进本文件）。
+      # 必须带 DEVAGENT_MODELS__<PROVIDER>__ 前缀，裸的 DEEPSEEK_API_KEY 不会被读取。
+      DEVAGENT_MODELS__DEEPSEEK__API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEVAGENT_MODELS__DEEPSEEK__BASE_URL: https://api.deepseek.com/v1
+      DEVAGENT_MODELS__QWEN__API_KEY: ${QWEN_API_KEY:-}
+      DEVAGENT_MODELS__QWEN__BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
+      DEVAGENT_MODELS__ZHIPU__API_KEY: ${ZHIPU_API_KEY:-}
+      DEVAGENT_MODELS__ZHIPU__BASE_URL: https://open.bigmodel.cn/api/paas/v4
       DEVAGENT_OBSERVABILITY__METRICS_ENABLED: "true"
     ports:
       - "8000:8000"

@@ -88,13 +88,18 @@ def _setup(args: argparse.Namespace) -> None:
 
 async def _cmd_run(args: argparse.Namespace) -> int:
     from devagent.orchestration import Orchestrator
+    from devagent.tools.runtime import build_test_runtime
 
     settings = get_settings()
-    orchestrator = Orchestrator(settings)
+    # 接上测试运行时，否则 Tester 只是"生成测试"而从不执行，
+    # Verifier 拿到的客观证据会是一条占位符。
+    runtime = build_test_runtime(settings)
+    orchestrator = Orchestrator(settings, test_runner=runtime.runner)
     try:
         result = await orchestrator.run(args.goal, task_id=args.task_id or None)
     finally:
         await orchestrator.aclose()
+        await runtime.aclose()
 
     if args.json:
         print(
@@ -146,8 +151,11 @@ async def _cmd_eval(args: argparse.Namespace) -> int:
     dataset = GoldenSet.load(dataset_path)
     logger.info("eval_dataset_ready", path=dataset_path, count=len(dataset))
 
+    from devagent.tools.runtime import build_test_runtime
+
     gateway = ModelGateway(settings)
-    orchestrator = Orchestrator(settings, gateway=gateway)
+    runtime = build_test_runtime(settings)
+    orchestrator = Orchestrator(settings, gateway=gateway, test_runner=runtime.runner)
 
     judge = None
     if not args.no_judge:
@@ -171,6 +179,7 @@ async def _cmd_eval(args: argparse.Namespace) -> int:
         return 2
     finally:
         await orchestrator.aclose()
+        await runtime.aclose()
 
     output = (
         Path(args.output) if args.output else Path(settings.evaluation.report_dir) / "latest.json"
@@ -273,7 +282,10 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     try:
         import uvicorn
     except ImportError:
-        print("缺少 uvicorn。请安装：pip install 'devagent[api]'", file=sys.stderr)
+        # uvicorn 是基础依赖之一（pyproject 的 dependencies），不存在
+        # ``devagent[api]`` 这个 extra —— 早先的提示会引导用户去装一个
+        # 根本不存在的分组，属于文档级缺陷。
+        print("缺少 uvicorn。请安装：pip install -e .", file=sys.stderr)
         return 2
 
     uvicorn.run(

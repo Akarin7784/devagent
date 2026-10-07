@@ -30,6 +30,7 @@ import { readFileSync } from 'node:fs';
 // 不必给测试运行器加 async 支持。
 import * as components from './js/components.js';
 import * as graphReexports from './graph.js';
+import * as status from './js/status.js';
 import {
   AGENT_COLOR,
   AGENT_FALLBACK_COLOR,
@@ -38,6 +39,7 @@ import {
   STATUS_ICON,
   STATUS_LABEL,
   STATUS_TONE,
+  TASK_STATUS_BADGE,
   agentColor,
   agentLabel,
   statusDotClass,
@@ -46,6 +48,7 @@ import {
   statusLabel,
   statusTone,
   taskStatusBadge,
+  taskStatusLabel,
 } from './js/status.js';
 
 let passed = 0;
@@ -260,6 +263,139 @@ test('任务状态与步骤状态在共享成员上视觉一致', () => {
   for (const s of shared) {
     assert.equal(statusTone(s), taskStatusBadge(s)[0],
       `状态 ${s} 在步骤域与任务域的色调不一致`);
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * 任务级状态的字面量必须与后端 TaskStatus 对齐
+ * ------------------------------------------------------------------ *
+ * 这一组是本轮新增的。起因是一个被"看起来只是没数据"掩盖的错误数字：
+ * overview.js 里把任务成功判定写成了 `t.status === 'success'`，
+ * 而 `success` 是 **StepStatus** 的成员，TaskStatus 的对应值是 `succeeded`。
+ * 于是全部成功时成功率显示「—」，9 成功 1 失败时算出 900%。
+ *
+ * 根因是"任务级状态"与"步骤级状态"共用了一个看起来很合理的字面量
+ * （`running` 两边都有），凭直觉猜另一个的写法必然猜错。
+ * 所以这里改成从词表读 TaskStatus 全集来断言，而不是手抄一份。
+ * ------------------------------------------------------------------ */
+
+/** TaskStatus 的兜底词表 —— 仅在旧 fixture（未含 task_status）时使用。 */
+const TASK_STATUS_FALLBACK = ['pending', 'running', 'succeeded', 'failed', 'paused', 'cancelled'];
+
+/** 当前词表里的 TaskStatus 成员（来自后端 devagent/enums.py）。 */
+const TASK_STATUS = Array.isArray(WORDS.task_status) && WORDS.task_status.length
+  ? WORDS.task_status
+  : TASK_STATUS_FALLBACK;
+
+test('词表包含 TaskStatus 全集（缺了就只能靠手抄，正是漂移的来源）', () => {
+  assert.ok(Array.isArray(TASK_STATUS) && TASK_STATUS.length >= 6,
+    `task_status 词表异常：${JSON.stringify(WORDS.task_status)}`);
+  // 无论词表新旧，这些成员都必须有中文标签与色调用——所以直接断言全集
+  for (const s of TASK_STATUS) {
+    assert.ok(TASK_STATUS_BADGE[s],
+      `TaskStatus.${s} 未在 TASK_STATUS_BADGE 登记，界面会回显英文枚举名`);
+  }
+});
+
+test('TaskStatus 的每个成员都有中文标签（不回显英文枚举名）', () => {
+  for (const s of TASK_STATUS) {
+    const label = taskStatusLabel(s);
+    assert.notEqual(label, s,
+      `TaskStatus.${s} 未登记中文标签：任务列表会显示英文 "${s}"`);
+    assert.ok(label && label.length > 0);
+    // 标签里不允许出现 ASCII 字母 —— 中文界面回显英文枚举名就是这么发生的
+    assert.ok(!/[A-Za-z]/.test(label),
+      `TaskStatus.${s} 的标签 "${label}" 含英文字母，疑似漏翻译`);
+  }
+});
+
+test('TaskStatus 的每个成员都有合法的徽章色调', () => {
+  const VALID_TONES = new Set([
+    'success', 'danger', 'warning', 'info', 'neutral', 'brand', 'running',
+  ]);
+  for (const s of TASK_STATUS) {
+    const [tone] = taskStatusBadge(s);
+    assert.ok(VALID_TONES.has(tone),
+      `TaskStatus.${s} 的 tone "${tone}" 不是 components.css 里定义的色调`);
+  }
+});
+
+test('succeeded 与 success 都存在：任务域用 succeeded，步骤域用 success', () => {
+  // 这条断言把"两个域的字面量不同"这件事钉死。
+  // 后端契约：TaskStatus.SUCCEEDED = "succeeded"；StepStatus.SUCCESS = "success"。
+  assert.ok(TASK_STATUS.includes('succeeded'), 'TaskStatus 里没有 succeeded —— 与后端契约不符');
+  assert.ok(WORDS.step_status.includes('success'), 'StepStatus 里没有 success —— 与后端契约不符');
+  assert.ok(!TASK_STATUS.includes('success'),
+    'success 混进了 TaskStatus：它是 StepStatus 成员，后端任务状态里永远不会出现它');
+
+  // statusLabel 是 StepStatus 的表，遇到任务级字面量会原样回显 ——
+  // 这正是任务列表渲染英文的原因，也是 taskStatusLabel 必须存在的原因。
+  // 这里把这个"域不匹配会静默回显英文"的性质固化成断言（而不是靠注释提醒）。
+  assert.equal(STATUS_LABEL.succeeded, undefined,
+    'succeeded 被登记进了 StepStatus 表 —— 两个域又混在一起了');
+  assert.equal(statusLabel('succeeded'), 'succeeded',
+    'statusLabel 对域外状态本应原样回显；若它开始"猜"标签，说明表被污染了');
+});
+
+test('taskStatusLabel 与 taskStatusBadge 同源（禁止第二份文案）', () => {
+  for (const s of [...TASK_STATUS, 'some_future_status']) {
+    assert.equal(taskStatusLabel(s), taskStatusBadge(s)[1],
+      `${s} 的标签在 taskStatusLabel 与 taskStatusBadge 之间不一致 —— 出现了第二份表`);
+  }
+  assert.equal(taskStatusLabel, status.taskStatusLabel,
+    'taskStatusLabel 不是 status.js 的实现本体');
+});
+
+test('paused 可达且有明确视觉（预算耗尽后任务会停在这里）', () => {
+  // orchestrator.py 在预算耗尽时把任务终态置为 PAUSED。
+  // 漏登记的后果是任务列表显示英文 "paused"。
+  assert.ok(TASK_STATUS.includes('paused'), 'TaskStatus 里没有 paused —— 与后端契约不符');
+  const [tone, label] = taskStatusBadge('paused');
+  assert.equal(tone, 'warning', 'paused 是"需要人工介入"的中间态，不应与中性灰的 pending 混同');
+  assert.equal(label, '已暂停');
+});
+
+/* ------------------------------------------------------------------ *
+ * 提示条正文的渲染方式（XSS）
+ * ------------------------------------------------------------------ *
+ * `alert()` 的字符串正文曾用 `html:` 渲染，而调用方传的是模型产出
+ * （node.lastError / detail.error）。一个 goal 里的 `<img onerror>`
+ * 因此能在与 API 同源的页面里执行 JS。
+ *
+ * 这里断言的是**决策本身**（纯函数），而不是 DOM 结果：
+ * DOM 无关的测试才能零依赖直跑，而这个决策正是漏洞的全部。
+ * ------------------------------------------------------------------ */
+
+test('alert 的字符串正文走 text，绝不当 HTML 解析', () => {
+  const evil = '<img src=x onerror="globalThis.pwned=1">';
+  const opt = components.alertBodyOptions(evil);
+  assert.ok(opt, '字符串正文不应被判为空');
+  assert.equal(opt.text, evil, '字符串正文必须以 text 原样输出');
+  assert.equal(opt.html, undefined,
+    'alertBodyOptions 返回了 html —— 模型产出的文本会被当标记解析（XSS）');
+});
+
+test('alert 的对象正文原样透传（富内容由调用方自己构造节点）', () => {
+  const node = { nodeType: 1 };
+  const opt = components.alertBodyOptions(node);
+  assert.equal(opt.node, node);
+  assert.equal(opt.html, undefined);
+  assert.equal(opt.text, undefined);
+});
+
+test('alert 对空正文返回 null（不产生空 div）', () => {
+  assert.equal(components.alertBodyOptions(''), null);
+  assert.equal(components.alertBodyOptions(null), null);
+  assert.equal(components.alertBodyOptions(undefined), null);
+});
+
+test('alertBodyOptions 是纯安全的：返回结构里只有 text/node 两个键', () => {
+  // 这条是"防逃生舱"：将来有人为了某个调用方顺手加个 html 分支，
+  // 这里会立刻红。富文本请传节点。
+  for (const v of ['x', { nodeType: 1 }]) {
+    const keys = Object.keys(components.alertBodyOptions(v)).sort();
+    assert.deepEqual(keys, v === 'x' ? ['text'] : ['node'],
+      `alertBodyOptions 返回了预期外的键：${keys.join(',')}`);
   }
 });
 

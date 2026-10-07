@@ -32,7 +32,16 @@ class ProviderConfig(BaseModel):
 
     @property
     def enabled(self) -> bool:
-        return self.api_key is not None and bool(self.base_url)
+        """是否「已配置且可用」。
+
+        ``api_key`` 为空串**不算**已配置。docker-compose 里常见的
+        ``${DEEPSEEK_API_KEY:-}`` 在宿主机没设变量时会注入空串，
+        而 ``SecretStr("")`` 是"有值"的 —— 早先的实现据此把 provider 判为
+        enabled，于是运行时报的是上游 401，而不是一句清楚的"未配置"。
+        """
+        if self.api_key is None or not self.api_key.get_secret_value().strip():
+            return False
+        return bool(self.base_url.strip())
 
 
 class ModelsConfig(BaseModel):
@@ -184,6 +193,38 @@ class SandboxConfig(BaseModel):
     network_disabled: bool = True
     read_only_root: bool = True
     workspace_mount: str = ""
+    """测试工作区目录。留空则每次启动使用一个临时目录。
+
+    为什么默认不是仓库目录：模型生成的"测试代码"会先落盘再执行，
+    把仓库当工作区等于让不受信内容直接覆写源码（含 .git/hooks）。
+    """
+
+    allow_local_fallback: bool = Field(
+        default=True,
+        description=(
+            "Docker 不可用时是否降级为本地子进程沙箱。"
+            "默认 True 是为了让没有 Docker 的开发机仍能跑通；"
+            "但它**确实降低了隔离级别**（本地沙箱没有容器边界，"
+            "也无法真正限制内存/网络），生产环境应设为 False 让装配直接失败。"
+        ),
+    )
+    user: str = "10001:10001"
+    """容器内运行用户（``--user``）。显式传入而不是依赖镜像里的 USER 指令，
+    这样换镜像也不会悄悄失去非 root 保证。"""
+
+
+class SecurityConfig(BaseModel):
+    """访问控制。
+
+    默认不启用（``api_key`` 为空）：本地开发与演示需要零配置可用。
+    一旦设置，``/api/v1/**`` 全部要求 ``X-API-Key`` —— 本项目默认绑定
+    0.0.0.0 且没有任何鉴权，任何能访问端口的人都能消耗模型额度。
+    """
+
+    api_key: str = Field(
+        default="",
+        description="非空时对 /api/v1 强制校验 X-API-Key 请求头",
+    )
 
 
 class ObservabilityConfig(BaseModel):
@@ -201,6 +242,15 @@ class EvaluationConfig(BaseModel):
     """评测配置。"""
 
     golden_set_path: str = "datasets/golden_set.jsonl"
+
+    dataset_dir: str = Field(
+        default="datasets",
+        description=(
+            "允许评测接口读取的数据集根目录。"
+            "评测接口接受调用方传入 dataset_path，若不限制范围，"
+            "任何能访问服务的人都能让服务器读取任意可读文件。"
+        ),
+    )
     judge_model: str = "deepseek:deepseek-chat"
     enable_bidirectional_judge: bool = Field(
         default=True,
@@ -295,6 +345,7 @@ class Settings(BaseSettings):
     context: ContextConfig = Field(default_factory=ContextConfig)
     reliability: ReliabilityConfig = Field(default_factory=ReliabilityConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
 

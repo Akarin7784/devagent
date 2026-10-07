@@ -422,6 +422,13 @@ class EvalRunner:
         before_snapshot = self._metrics_snapshot()
         start = time.perf_counter()
         try:
+            # 评测用确定性的 ``eval-{sample.id}`` 作为 task_id（便于报告对照）。
+            # 但这也意味着**同一个样本重复评测时会命中上一次的检查点**，
+            # 一步都不执行却报成功 —— 那正是「评测数字比现实更好」的来源。
+            # 因此每次评测前显式丢弃该 id 的检查点。
+            forget = getattr(self._task_runner, "forget_task", None)
+            if callable(forget):
+                forget(f"eval-{sample.id}")
             result = await self._task_runner.run(sample.goal, task_id=f"eval-{sample.id}")
         except Exception as exc:
             outcome.error = f"{type(exc).__name__}: {exc}"

@@ -5,6 +5,175 @@
 
 ## [Unreleased]
 
+### 修复
+
+**代码审查发现的正确性缺陷（P0/P1）—— 一批"文档承诺了、但实际没生效"的能力**
+
+一次全量审查（含 6 个运行时探针复现）发现：多项被文档当作核心卖点的机制，
+在默认部署路径上并未生效，其中两项的失效方向还是反的。以下逐条修复。
+
+*P0 —— 破坏核心正确性*
+
+- **验证失败曾判为「通过」（fail-open）**：`_verify_node` 捕获异常后返回
+  `Verdict.PASS`，一次瞬时 503 就能让未经验证的产物被标记为"已验证成功"，
+  任务状态还是 `succeeded`、`error` 为空 —— 外部完全观测不到。
+  现改为 fail-closed：判 `REJECT`、计入 `verification_unavailable` 指标、
+  发出 `verification_unavailable` 事件，任务如实失败
+- **跨任务上下文污染**：API 层按进程单例持有 `Orchestrator`（`TaskService`
+  默认并发 4），而上下文空间/熔断器/反思记忆全挂在 `self` 上 ——
+  实测任务 B 的需求提示词里读到了任务 A 的需求原文，且 A 的节点事件被投递到
+  B 的 SSE 流（A 收到 0 个、B 收到 2 个）。现引入 `_RunState` + `ContextVar`：
+  每次 `run()` 从隔离容器**快照**开始，账本/反思/循环检测/span/run_id 全部按运行隔离；
+  `TaskService` 的归属信息同样改为 `ContextVar`（`_current_task_id` 共享字段删除）
+- **测试链从未接线**：四个入口（API / CLI / 两个演示脚本）都没传 `test_runner`，
+  于是 `TesterAgent.execute` 恒返回 `executed=False`，Verifier 的"客观测试证据"
+  是一条字面量 `（测试未执行）`。现新增 `devagent.tools.runtime.build_test_runtime`
+  并在 API / CLI / 评测链路接入；测试工作区默认是**一次性临时目录**
+  （不再默认指向仓库，避免不受信内容覆写源码）
+- **测试证据可伪造**：`PytestOutputParser` 把 stderr 拼在 stdout 之后并倒序扫描，
+  模型自写的 `conftest.py` 往 stderr 写一行 `128 passed` 即可覆盖真实结果，
+  且 `exit_code` 只存不用。现只解析 stdout，`exit_code != 0` 一律不算通过
+
+*P1 —— 核心承诺未落地*
+
+- **装配算法在生产路径上整体失效**：`src/` 内所有 `make_chunk` 都不带 embedding，
+  5 处 `build()` 全传 `task_embedding=None`，而 `cosine_similarity` 遇 `None`
+  恒返回 0 —— 相关性恒 0、冗余惩罚恒 0、**硬去重永不触发**（实测两份完全相同的
+  片段都进上下文）。且"硬去重行为契约"测试喂的是生产环境不存在的 embedding，
+  所以一直全绿。现引入 `chunk_similarity`：有向量用余弦，无向量退化为字符
+  n-gram 的 Jaccard；并新增任务文本参数，使相关性在无嵌入模型时也有区分度
+- **Verifier 上下文只增不减**：`space.add` 从不清空，重试时上一轮**被驳回**的
+  产物与本轮产物同时在场且 `source` 完全相同（`artifact://N1`），Verifier
+  无从分辨该审哪一个。现在每次验证前清空 Verifier 空间，`handoff_to` 也会
+  先移除上一轮投喂的 handoff 片段（否则重试会让硬约束成倍累积）
+- **硬约束静默击穿预算**：硬片段无条件全收且不参与去重，实测预算 2000 时
+  投递 13530 token。现按内容去重 + 新增 `hard_overflow_tokens` 决策字段与
+  `context_hard_overflow` 指标，超预算时在决策说明里显式标注
+- **Tester / Verifier 调用不计账**：每个成功节点实际有 3 次模型调用，
+  而账本与熔断器只看到 1 次 —— 可用预算悄悄变成配置值的约 3 倍。
+  现已全部计入 `total_tokens`、成本与熔断器（`build_smoke` 的 token 总量
+  因此从 2011 变为 4808，这是修复而非回归）
+- **需求/架构步骤的 `steps[].tokens_used` 恒为 0**，与 `total_tokens` 自相矛盾
+- **检查点写在验证之前**：被驳回、重试耗尽的节点也会留下 `completed=True`，
+  同一个 `task_id` 再跑一次会被短路，一步不执行却报成功。现只在**验证通过后**
+  写入，失败路径显式清除；新增 `Orchestrator.forget_task()`，评测在同一进程内
+  重跑同一样本前会先丢弃检查点
+- **位置编排方向写反**：`sorted(reverse=True)` 后取前 N 个当"最新"，而前 N 个
+  恰是最旧的片段。现简化为按 age 降序（最新自然落在最尾）
+- **前端 XSS**：`alert()` 对字符串正文使用 `html:`，而 `node.lastError` 来自
+  Verifier 模型输出的 JSON —— 一句含 `<img onerror>` 的需求即可在控制台执行任意 JS。
+  现字符串正文一律走 `text`，并新增全仓"动态数据不得当 HTML 解析"的静态扫描
+- **概览成功率恒错**：用 `t.status === 'success'` 比较后端实际发出的 `'succeeded'`，
+  全成功时显示"—"、9 成功 1 失败时显示 **900%**
+- **DAG 可视化没有样式**：`graph.js` 用的类名只定义在被孤立的 `web/styles.css` 里，
+  节点在两种主题下都是黑底黑字。规则已迁入 `css/components.css` 并改用语义令牌；
+  无引用它的 `web/app.js`、`web/styles.css` 已删除。同时补齐了三处
+  `marker-end="url(#dag-arrow*)"` 引用却从未定义的箭头 marker
+- **按 README 操作无法启动**：`.env.example` 的三个路由值缺 `provider:` 前缀，
+  `Settings()` 直接抛 `ValidationError`；`docker-compose.yml` 的 `DEVAGENT_ENV: docker`
+  非法；`init_db.sql` 的 `tasks` 表与 ORM 不一致（首次写入即
+  `no such column: tasks.succeeded`）；镜像未安装 `[db]` extra 因而跑不了 SQL 模式
+
+*P2/P3 —— 资源、并发与静默失效*
+
+- 沙箱用 UTF-8 硬解码子进程输出，而 Windows 子进程按 GBK 输出 —— 中文证据被
+  静默替换为 U+FFFD（这也是仓库自带测试在中文路径下失败的原因）
+- 沙箱输出上限在**完全缓冲之后**才生效（200 MiB 输出 → 宿主堆峰值 400 MiB）
+- 超时"强杀"杀不掉容器与孙进程；Docker 工作区此前是读写挂载且缺 `--user`
+- 模型可控的"测试文件路径"可覆写仓库任意既有文件；`_is_safe_relative_path`
+  还接受 `--rootdir=..` 这类 pytest 选项串
+- `CodeIndex` 可经目录联接读到工作区之外；且用 tree-sitter 的**字节**偏移去切
+  `str`，任何含非 ASCII 的文件符号名/导入/文档串都会被切歪
+- `build_sandbox` 失败开放且丢弃调用方策略；`LocalProcessSandbox` 声明了
+  memory/cpu/pids/network 限制却一条都没实施
+- 取消**排队中**的任务会让状态永久停在 `pending`、SSE 永不结束
+  （`try/finally` 原本位于信号量内部）
+- `submit()` 的"先查再写"存在 TOCTOU（同一 task_id 可跑两次；SQL 模式下
+  撞主键抛 `IntegrityError` → 500 而非 409）
+- `EventBus` 历史永不释放，且 SSE 回放取的是**最旧**的 200 条 ——
+  晚到订阅者永远看不到 `task_finished`
+- `CostLedger.records`、指标序列字典均无上界（`node_id` 来自模型输出，
+  取值空间无界）；`context_metrics` 把进程累计值当作"本任务"收益展示
+- 语义缓存的近邻检索只按 `(model, temperature)` 分桶，对系统提示/角色完全无感；
+  降级结果被写进主模型的桶；未定价模型静默记 $0
+- 熔断器预警去重判据失效（判据找 `"tokens"`，文案里是 `"token "`），
+  比例过线后每次 `charge()` 都追加一条；节点 span 在**工作结束后**才创建，
+  于是 trace 里的节点耗时恒为微秒级
+- `InjectionGuard` 用 `str.format` 拼接含来源原文的提示，来源含花括号即抛异常
+  （该路径异常会被验证层的 except 兜住 → 静默跳过验证）
+- 评测双向合并可能产出 `{"overall": 3.5, "passed": false}` 这类自相矛盾结果；
+  重试退避无抖动（并行节点会同步重试，把限流抖动放大成雪崩）
+- `docs`/README 里 `DEVAGENT_MODELS__*__ENABLED`、`DEVAGENT_ORCHESTRATION__MAX_ATTEMPTS`
+  等**不存在**的配置项已改为真实键名；测试数与 smoke token 数同步更新
+
+### 新增
+
+**回归测试与接线**
+
+- `tests/unit/test_regressions.py`（38 个用例）：每条用例对应一个已复现缺陷，
+  命名即说明"以前会怎样"
+- `tests/unit/test_deployment_config.py`（12 个用例）：`.env.example` 能构造
+  `Settings`、compose 的 env 合法、`init_db.sql` 与 ORM 逐列一致、镜像装了 `[db]`
+- `web/pages.test.js`（41）、`web/imports.test.js`（10）：页面纯函数 + 模块图 +
+  "动态数据不得当 HTML 解析"的静态防线；`make web-check` 已纳入
+- `devagent.tools.runtime`：测试运行时装配（沙箱 + 执行器 + 工作区生命周期）
+- 新增配置：`sandbox.allow_local_fallback` / `sandbox.user` / `sandbox.workspace_read_only`、
+  `security.api_key`（非空时 `/api/v1/**` 要求 `X-API-Key`）、
+  `evaluation.dataset_dir`（限定评测接口可读的数据集根目录）
+- 新增指标：`context_hard_overflow`、`verification_unavailable`、`llm_unpriced_calls`；
+  上下文工程指标统一带 `task_id`，前端"本任务收益"终于可归因
+- 跨语言词表新增 `task_status`（后端加枚举 → 前端契约测试立即变红）
+
+### 新增
+
+**整套前端 UI 重设计与实现（可商用级）**
+
+- **设计令牌三层架构**（`web/css/tokens.css`）：`palette`（原始色值）→
+  `semantic`（按用途命名，如 `--surface-base` / `--text-primary` /
+  `--status-danger`）→ 组件令牌。组件只引用语义层，因此明暗切换时
+  组件 CSS **零改动**。共 187 个令牌，无悬空引用（`make web-check` 校验）
+- **明暗双主题**：跟随系统 / 手动三态切换，`prefers-color-scheme` 实时监听；
+  `index.html` 内置防 FOUC 的主题预置脚本
+- **组件库**（`web/js/components.js` + `web/css/components.css`）：
+  按钮（5 变体 × 4 尺寸 + loading 态）、表单、徽章/状态点、卡片、
+  统计卡、表格、标签页、空/错/骨架态、toast、弹层、抽屉、代码 diff、
+  时间线、DAG 画布、KV 列表、图表（donut / 横向条 / 迷你趋势）
+- **图标系统**（`web/js/icons.js`）：77 个内联 SVG，24×24 viewBox、
+  1.75 描边、继承 `currentColor`。不使用图标字体与外部图标库
+- **6 个业务页面**（`web/js/pages/`）：总览、工作台、上下文看板、
+  评测中心、可观测性、设置。覆盖后端全部能力接口
+- **应用外壳**（`web/js/shell.js`）：hash 路由、字段级订阅 store、
+  侧栏/顶栏、连接状态指示、页面 dispose 生命周期
+- **响应式**（`web/css/responsive.css`）：1279/1023/767/639/1600 五档断点
+  + 横屏手机 + `forced-colors`。≤1023px 侧栏转抽屉，≤767px 表格转卡片
+  （`data-label` 与表头一一对应），触摸目标 ≥38px
+- **可访问性**：焦点陷阱与焦点恢复（`activateModal`）、`:focus-visible`、
+  skip-link、`aria-live` 分级通知（错误 `assertive` / 普通 `polite`）、
+  `prefers-reduced-motion` 归零动效、WCAG AA 对比度、表格行键盘可激活、
+  标签页方向键交互
+- **`web/format.test.js`**（27 个断言）：钉住指标解析与哈希路由。
+  这类 bug 不会让页面崩溃，只会**静默显示错误结论**，必须靠测试兜住
+- **`make web-check`** 扩展为三段：全模块语法检查 + 相对导入完整性校验
+  （防路径写错）+ 73 个纯逻辑断言
+
+### 修复
+
+- **前端指标名全线失配**：早期按 `devagent_` 前缀硬编码，但真实 OTLP
+  指标**无前缀**（`llm_calls` / `llm_tokens` / `llm_cost_usd` /
+  `context_compression_ratio` / `context_utilization` / `backtracks` /
+  `hallucination_blocked` 等）。改为后缀匹配的新 `metric()` 系列
+- **直方图取错层级**：结构是三层嵌套（名称 → 标签 → 统计量），此前直接读
+  `histograms[name].p90` 得到 `undefined`。新增 `histOverallMean`
+  （跨标签按 `count` 加权）与 `histMaxQuantile`（取最坏标签的分位）
+- **skip-link 劫持导航**：`#page-root` 被 `parseHash()` 当成未知路由并
+  回退到默认页，导致「跳转到主内容」实际跳转首页。现在页内锚点原样放行
+- **`observability` 页面渲染崩溃**：`mount(container, ...buildLayout())`
+  对单个 DOM 节点做展开，抛 `Spread syntax requires ...iterable`
+- **`renderByState` 传字符串崩溃**：`error` 参数为字符串时被当函数调用。
+  现在同时接受渲染函数与字符串/`Error`
+- **`iconEl('')` 误告警**：未传图标名时调用 `icon(undefined)` 触发
+  「未定义图标」警告并返回 `undefined`。现在空名返回空 fragment
+
 ### 新增
 
 **节点级契约回归测试（跨语言边界）**

@@ -115,7 +115,11 @@ class Observability:
         m.inc_counter(MetricNames.LLM_TOKENS, input_tokens, model=model, direction="input")
         m.inc_counter(MetricNames.LLM_TOKENS, output_tokens, model=model, direction="output")
         m.inc_counter(MetricNames.LLM_COST_USD, cost_usd, model=model)
-        m.observe(MetricNames.LLM_LATENCY_MS, latency_ms, model=model)
+        # 缓存命中不产生真实延迟，绝不能用 0ms 去污染延迟分布：
+        # 命中率一高，p50/p90 就会被拉向 0，看起来"模型变快了"，
+        # 而实际上只是大量请求根本没打到模型。
+        if not cached:
+            m.observe(MetricNames.LLM_LATENCY_MS, latency_ms, model=model)
         if cached:
             m.inc_counter(MetricNames.LLM_CACHE_HITS, 1, model=model)
 
@@ -127,32 +131,57 @@ class Observability:
         tokens_after: int,
         budget: int,
         dropped_chunks: int = 0,
+        task_id: str = "",
+        hard_overflow: int = 0,
     ) -> None:
         """记录一次上下文装配的压缩效果。
 
         ``CONTEXT_TOKENS_SAVED`` 是本项目最有说服力的指标之一：它直接量化
         上下文工程的价值。面试时可以说「系统平均为每次调用节省 X% token，
         且在 golden set 上验证了准确率不降」。
+
+        ``task_id`` 标签把指标**归因到具体任务**。没有它，前端「本任务节省了
+        多少 token」只能显示进程累计值（实测两个不同任务拿到完全相同的数字），
+        这个指标就失去了可信度 —— 一个不可复现的收益数字比没有数字更糟。
         """
         if not self.enabled:
             return
         m = self.metrics
+        # 空 task_id **不进标签**：写一个值为空的标签只会制造一条无意义的
+        # 序列，还会让按精确标签读取的调用方（histogram_stats 是精确匹配）
+        # 突然读不到数据 —— 加标签必须只对"有值"的维度发生。
+        base: dict[str, Any] = {"agent": agent}
+        if task_id:
+            base["task_id"] = task_id
         saved = max(0, tokens_before - tokens_after)
         if saved:
             m.inc_counter(
-                MetricNames.CONTEXT_TOKENS_SAVED, saved, agent=agent, reason="compress+dedup"
+                MetricNames.CONTEXT_TOKENS_SAVED,
+                saved,
+                reason="compress+dedup",
+                **base,
             )
         if tokens_before > 0:
             m.observe(
                 MetricNames.CONTEXT_COMPRESSION_RATIO,
                 tokens_after / tokens_before,
-                agent=agent,
+                **base,
             )
         if budget > 0:
-            m.observe(MetricNames.CONTEXT_UTILIZATION, tokens_after / budget, agent=agent)
+            m.observe(MetricNames.CONTEXT_UTILIZATION, tokens_after / budget, **base)
         if dropped_chunks:
             m.inc_counter(
-                MetricNames.CONTEXT_CHUNKS_DROPPED, dropped_chunks, agent=agent, reason="budget"
+                MetricNames.CONTEXT_CHUNKS_DROPPED,
+                dropped_chunks,
+                reason="budget",
+                **base,
+            )
+        if hard_overflow > 0:
+            # 硬约束击穿预算必须可见：它是「上下文窗口即将溢出」的前兆。
+            m.inc_counter(
+                MetricNames.CONTEXT_HARD_OVERFLOW,
+                hard_overflow,
+                **base,
             )
 
 

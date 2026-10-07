@@ -4,9 +4,12 @@
 
 **1. 惰性导入 + 清晰报错**
 
-``sqlalchemy`` 不是硬依赖（见 ``pyproject.toml`` 的 ``[db]`` extra）。
+本项目的**异步数据库驱动**不是硬依赖：``sqlalchemy[asyncio]``（即 greenlet）、
+``asyncpg``、``aiosqlite`` 都在 ``pyproject.toml`` 的 ``[db]`` extra 里
+（裸 ``sqlalchemy`` 本身在基础依赖中，但缺 greenlet 时 ``sqlalchemy.ext.asyncio``
+会导入失败，且报的是容易误导的 ``No module named 'greenlet'``）。
 若未安装就调用，应抛出一条**能直接告诉你怎么办**的错误，
-而不是 ``ModuleNotFoundError: No module named 'sqlalchemy'``。
+而不是让上面那条误导性信息直接冒到调用方。
 
 **2. 内存 SQLite 与文件 SQLite 都支持**
 

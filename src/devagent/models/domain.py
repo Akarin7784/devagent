@@ -269,6 +269,11 @@ class AssemblyDecision(_ImmutableModel):
     tokens_before: int = Field(ge=0)
     tokens_after: int = Field(ge=0)
     budget_total: int = Field(ge=0)
+    hard_overflow_tokens: int = Field(
+        default=0,
+        ge=0,
+        description="硬约束超出输入预算的 token 数（>0 表示预算护栏被硬约束击穿，需告警）",
+    )
     compression_applied: bool = False
     routing_tier: ModelTier | None = None
     reason: str = Field(default="", description="人类可读的装配说明")
