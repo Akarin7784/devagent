@@ -49,9 +49,19 @@ from devagent.context.tokenizer import (
     TokenCounter,
     cosine_similarity,
 )
+from devagent.context.trust import (
+    KNOWN_INJECTION_PATTERNS,
+    InjectionGuard,
+    InjectionRisk,
+    TrustAssessment,
+    TrustLevel,
+    assess_trust,
+    looks_like_injection,
+)
 
 __all__ = [
     "DEFAULT_TEMPLATE",
+    "KNOWN_INJECTION_PATTERNS",
     "TEMPLATES",
     "AgentContextSpace",
     "AssemblyResult",
@@ -67,14 +77,20 @@ __all__ = [
     "ContextPolicyError",
     "EchoSummarizer",
     "HeuristicTokenCounter",
+    "InjectionGuard",
+    "InjectionRisk",
     "ModelSpec",
     "ScoreBreakdown",
     "ScoringWeights",
     "StructuredSummary",
     "Summarizer",
     "TokenCounter",
+    "TrustAssessment",
+    "TrustLevel",
+    "assess_trust",
     "cosine_similarity",
     "estimate_signals",
     "estimate_tokens",
+    "looks_like_injection",
     "make_chunk",
 ]

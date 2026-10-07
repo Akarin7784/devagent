@@ -126,6 +126,9 @@ class Orchestrator:
         self._settings = settings
         self._gateway = gateway or ModelGateway(settings)
         self._context = context_engine or ContextEngine(settings.context)
+        # 注入防护器：从上下文引擎取，保证与装配打分用的是同一份配置。
+        # 不在这里新建实例 —— 两处独立构造会在配置变更时悄悄分叉。
+        self._guard = self._context.guard
         # 进度回调：可选、纯观测性，失败绝不影响编排（见 _emit 的注释）。
         self._on_event = on_event
         self._config = config or OrchestratorConfig(
@@ -257,7 +260,9 @@ class Orchestrator:
             task_embedding=None,
             current_step=step_id,
         )
-        invocation = AgentInvocation(task_id=task_id, step_id=step_id, bundle=bundle, attempt=1)
+        invocation = AgentInvocation(
+            task_id=task_id, step_id=step_id, bundle=bundle, attempt=1, guard=self._guard
+        )
         agent = self._agents[AgentType.REQUIREMENT]
 
         try:
@@ -305,7 +310,12 @@ class Orchestrator:
             current_step=step_id,
         )
         invocation = AgentInvocation(
-            task_id=task_id, step_id=step_id, bundle=bundle, handoff=handoff, attempt=1
+            task_id=task_id,
+            step_id=step_id,
+            bundle=bundle,
+            handoff=handoff,
+            attempt=1,
+            guard=self._guard,
         )
         agent = self._agents[AgentType.ARCHITECT]
 
@@ -535,6 +545,7 @@ class Orchestrator:
             lessons=lessons,
             attempt=attempt,
             routing_signals=signals,
+            guard=self._guard,
         )
 
         # 执行 Agent
@@ -704,6 +715,7 @@ class Orchestrator:
             bundle=bundle,
             handoff=verifier_handoff,
             attempt=1,
+            guard=self._guard,
         )
 
         try:
@@ -749,7 +761,12 @@ class Orchestrator:
             budget_total=handoff.budget_tokens,
         )
         invocation = AgentInvocation(
-            task_id=task_id, step_id=step_id, bundle=bundle, handoff=handoff, attempt=1
+            task_id=task_id,
+            step_id=step_id,
+            bundle=bundle,
+            handoff=handoff,
+            attempt=1,
+            guard=self._guard,
         )
         try:
             output, outcome = await tester.generate_and_run(invocation)

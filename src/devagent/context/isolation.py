@@ -30,6 +30,7 @@ from devagent.context.budget import BudgetAllocator
 from devagent.context.compression import CompressionResult, ContextCompressor
 from devagent.context.routing import ComplexityRouter
 from devagent.context.tokenizer import TokenCounter, Vector
+from devagent.context.trust import InjectionGuard
 from devagent.enums import AgentType, ContextKind
 from devagent.models.domain import (
     AgentHandoff,
@@ -193,11 +194,38 @@ class ContextBundle:
         return sum(c.tokens for c in self.chunks)
 
     def render(self, *, separator: str = "\n\n---\n\n") -> str:
-        """把片段渲染为单一文本（用于 prompt 拼接）。"""
+        """把片段渲染为单一文本（用于 prompt 拼接）。
+
+        **不包含信任边界。** 需要边界时用 ``render_guarded()`` ——
+        保留这个方法是为了让对比实验（"开/关防护"）能拿到基线文本。
+        """
         return separator.join(c.content for c in self.chunks)
+
+    def render_guarded(
+        self,
+        guard: InjectionGuard,
+        *,
+        separator: str = "\n\n---\n\n",
+    ) -> str:
+        """渲染为带信任边界的文本（注入防护）。
+
+        与 ``render()`` 的差异**只在不可信片段上**：全部可信时两者
+        逐字节相同，因此开启防护对可信路径零成本、零影响。
+        """
+        text = guard.render(self.chunks)
+        # guard.render 内部固定用 "---" 分隔；这里只在需要替换分隔符时接管，
+        # 以免让 guard 感知"分隔符"这种纯展示参数。
+        if separator == "\n\n---\n\n":
+            return text
+        return text.replace("\n\n---\n\n", separator)
 
     def by_kind(self, kind: ContextKind) -> list[ContextChunk]:
         return [c for c in self.chunks if c.kind is kind]
+
+    @property
+    def trust_summary(self) -> dict[str, object]:
+        """各信任等级的片段分布（供报告与前端展示）。"""
+        return InjectionGuard().summarize(self.chunks)
 
 
 class ContextEngine:
@@ -233,6 +261,9 @@ class ContextEngine:
         self._allocator = allocator or BudgetAllocator()
         self._compressor = compressor or ContextCompressor(token_counter=token_counter)
         self._router = router or ComplexityRouter()
+        # 注入防护：默认按配置开关。关闭时 render() 与 render_guarded()
+        # 输出一致，因此调用方无需分支判断。
+        self._guard = InjectionGuard(enabled=config.injection_guard)
 
     # ------------------------------------------------------------------ #
     # 装配入口
@@ -326,6 +357,11 @@ class ContextEngine:
     @property
     def router(self) -> ComplexityRouter:
         return self._router
+
+    @property
+    def guard(self) -> InjectionGuard:
+        """注入防护器（供 Agent 渲染上下文时使用）。"""
+        return self._guard
 
 
 __all__ = [

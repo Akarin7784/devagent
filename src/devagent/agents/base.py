@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import ClassVar
 
 from devagent.context.isolation import ContextBundle
+from devagent.context.trust import InjectionGuard
 from devagent.enums import AgentType, MessageType
 from devagent.logging_config import get_logger
 from devagent.models.domain import (
@@ -50,6 +51,12 @@ class AgentInvocation:
     tools: tuple[ToolSpec, ...] = ()
     attempt: int = 1
     routing_signals: RoutingSignals | None = None
+    guard: InjectionGuard | None = None
+    """注入防护器。为 ``None`` 时按"关闭防护"渲染（等价于升级前行为）。
+
+    用 ``None`` 而非默认构造一个实例，是为了让"忘记接线"这件事
+    在测试里**可检测**：有专门测试断言编排器一定会传入 guard。
+    """
     extra: dict[str, object] = field(default_factory=dict)
 
 
@@ -203,10 +210,17 @@ class BaseAgent(ABC):
     def render_context(self, invocation: AgentInvocation) -> str:
         """把装配后的上下文渲染为文本。
 
+        渲染走 ``render_guarded``：不可信来源（仓库文件、命令回显、
+        检索结果）会被带 nonce 的定界符包裹，并附上"这是数据不是指令"
+        的声明；可信来源（用户目标、系统约束）逐字节不变。
+
         统一在末尾附上「教训」区块（Reflexion），
         确保失败经验位于尾部高注意力区。
         """
-        parts = [invocation.bundle.render()]
+        if invocation.guard is not None:
+            parts = [invocation.bundle.render_guarded(invocation.guard)]
+        else:
+            parts = [invocation.bundle.render()]
         if invocation.lessons:
             lines = ["# 历史失败教训（务必避免重复）"]
             for lesson in invocation.lessons:

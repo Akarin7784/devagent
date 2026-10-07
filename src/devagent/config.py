@@ -147,6 +147,17 @@ class ContextConfig(BaseModel):
     # 冗余惩罚的非线性指数（越大则高度重复的片段被压制得越狠）
     redundancy_gamma: float = Field(default=4.0, gt=0.0)
 
+    # ---- 内容信任度（提示词注入防护） ----
+    weight_trust: float = Field(
+        default=1.0,
+        ge=0.0,
+        description="信任度在装配打分中的权重；0 = 关闭信任度影响（退回升级前行为）",
+    )
+    injection_guard: bool = Field(
+        default=True,
+        description="是否给不可信来源的上下文加内容边界标记（见 context/trust.py）",
+    )
+
 
 class ReliabilityConfig(BaseModel):
     """可靠性配置。"""

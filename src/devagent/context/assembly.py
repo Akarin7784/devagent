@@ -13,6 +13,7 @@
              + w2·recency(c)                  # 时效衰减 e^(-λ·age)
              + w3·dependency(c, step)         # 是否为当前步骤硬依赖
              + w4·density(c)                  # 信息密度 = 有效信息 / tokens
+             + w6·trust(c)                    # 来源可信度（注入防护）
              - w5·redundancy(c, selected)     # 与已选项的最大余弦相似度
 
 选择算法：类 MMR（Maximal Marginal Relevance）贪心——
@@ -20,12 +21,17 @@
 
 位置编排：模型对序列首尾注意力更强（lost-in-the-middle），
 因此把硬约束放头部、最新状态放尾部，辅助材料放中间。
+
+信任度项（w6）对齐 ``context/trust.py``：来源越不可信，越需要更高的
+相关性才能挤进预算。它**不替代**渲染层的边界标记 —— 打分只决定
+"选不选"，边界标记决定"选了之后模型怎么看待它"，两者不可互相替代。
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 from devagent.config import ContextConfig
 from devagent.context.tokenizer import (
@@ -34,6 +40,7 @@ from devagent.context.tokenizer import (
     Vector,
     cosine_similarity,
 )
+from devagent.context.trust import assess_trust
 from devagent.enums import ContextKind
 from devagent.models.domain import (
     AssemblyDecision,
@@ -63,6 +70,15 @@ class ScoringWeights:
     redundancy_gamma: float = 4.0
     """冗余惩罚的非线性指数：越大则「高度重复」被压制得越狠。"""
 
+    trust: float = 1.0
+    """信任度权重。为 0 则完全忽略来源可信度（退回升级前的行为）。
+
+    为什么要给信任度一个**权重**而不是直接乘到总分上：乘以一个常数会
+    同时缩小所有片段，等价于把总预算放大 —— 排序不变，只是阈值漂移。
+    作为加性项才真正改变排序，让"高可信但相关性一般"的片段有机会
+    胜过"低可信但看起来很相关"的片段。这正是注入防护需要的效果。
+    """
+
     @classmethod
     def from_config(cls, cfg: ContextConfig) -> ScoringWeights:
         return cls(
@@ -74,6 +90,7 @@ class ScoringWeights:
             recency_lambda=cfg.recency_lambda,
             redundancy_cosine_threshold=cfg.redundancy_cosine_threshold,
             redundancy_gamma=cfg.redundancy_gamma,
+            trust=cfg.weight_trust,
         )
 
 
@@ -87,7 +104,22 @@ class ScoreBreakdown:
     dependency: float = 0.0
     density: float = 0.0
     redundancy: float = 0.0
+    trust: float = 0.0
+    trust_level: str = ""
     total: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "chunk_id": self.chunk_id,
+            "relevance": round(self.relevance, 4),
+            "recency": round(self.recency, 4),
+            "dependency": round(self.dependency, 4),
+            "density": round(self.density, 4),
+            "redundancy": round(self.redundancy, 4),
+            "trust": round(self.trust, 6),
+            "trust_level": self.trust_level,
+            "total": round(self.total, 4),
+        }
 
 
 @dataclass(slots=True)
@@ -176,11 +208,19 @@ class ContextAssembler:
                 max_sim = sim
         b.redundancy = max(0.0, max_sim) ** w.redundancy_gamma
 
+        # 信任度：来源决定权重，与内容无关（见 context/trust.py）。
+        # 放在这里而不是在装配主循环里，是为了让「为什么这个片段被选中」
+        # 能在单条打分明细中完整回答 —— 调试注入问题时这是唯一线索。
+        assessment = assess_trust(chunk)
+        b.trust = assessment.weight
+        b.trust_level = assessment.level.name
+
         b.total = (
             w.relevance * b.relevance
             + w.recency * b.recency
             + w.dependency * b.dependency
             + w.density * b.density
+            + w.trust * b.trust
             - w.redundancy * b.redundancy
         )
         return b
@@ -371,7 +411,8 @@ def make_chunk(
 
 
 # 延迟导入 Any 避免顶部循环依赖（AgentType 仅用于类型标注）
-from typing import Any  # noqa: E402
+# 注：Any 已在顶部导入（ScoreBreakdown.to_dict 需要），此处保留说明以免
+# 后来者误以为可以安全删除顶部那一行。
 
 __all__ = [
     "AssemblyResult",

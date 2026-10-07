@@ -52,10 +52,36 @@
 - 49 个新测试（35 个判定逻辑 + 8 个运行器接线 + 6 个 CLI 输出）
 - ADR-0008
 
+**提示词注入防护（内容信任度分级）**
+
+- `devagent.context.trust`：按**来源**标注信任等级，与内容长什么样无关
+  - `TrustLevel`：SYSTEM / USER / WORKSPACE / EXTERNAL / UNKNOWN
+  - 未登记的 scheme 一律落到 UNKNOWN（保守默认）
+  - scheme 按 `://` 精确切分查表，避免 `artifact` 误命中 `artifact-content`
+- `InjectionGuard`：渲染时给不可信内容加**带随机 nonce** 的边界
+  - nonce 每次渲染新生成（`secrets.token_hex(8)`，2^64 空间），
+    攻击者无法通过预写闭合标签逃逸
+  - 声明写在边界**之上**（模型对边界附近注意力最高）
+  - 声明中不嵌标签字面量，避免模型把说明误当边界
+- 信任度**参与装配打分**（`ScoringWeights.trust`）：
+  外部内容权重 0.25、来源不明 0.0625 —— 需 4/16 倍相关性才能竞争预算
+  - **单侧**映射（只惩罚低于 WORKSPACE 的等级）：SYSTEM 权重恒为 1.0。
+    若用双侧距离，SYSTEM 会算出 0.0625 反而低于外部内容 ——
+    那等于让防护机制把系统约束挤出上下文
+- **零影响承诺**：SYSTEM / USER / WORKSPACE 权重全为 1.0，
+  升级前所有内部来源片段的打分逐位不变（既有 446 个测试未改一行即全绿）
+- **明确不做内容过滤**：注入内容原样保留，只加"这是数据不是指令"的声明。
+  有测试断言启发式检测函数**不出现在**渲染路径源码里
+- `ContextBundle.render_guarded()` + `trust_summary`；`AgentInvocation.guard`
+  由编排器在全部 5 个构造点注入
+- `ContextConfig`：`DEVAGENT_CONTEXT__INJECTION_GUARD`（默认 true）、
+  `DEVAGENT_CONTEXT__WEIGHT_TRUST`（默认 1.0）
+- 79 个新测试（69 个 trust 模块 + 6 个 Agent 接线 + 4 个端到端）
+- ADR-0009
+
 ### 计划中
 
 - 前端 DAG 可视化与 diff 查看器
-- 提示词注入防护（内容信任度分级）
 
 ### 修复
 
