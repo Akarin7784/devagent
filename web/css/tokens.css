@@ -1,0 +1,396 @@
+/* ==========================================================================
+   DevAgent Design Tokens — 设计令牌（唯一真源）
+   --------------------------------------------------------------------------
+   分层原则：**原始值 → 语义别名 → 组件令牌**。
+
+   - 第一层 palette：只描述「这是什么颜色」，不含用途。改品牌色只改这里。
+   - 第二层 semantic：描述「这个颜色用来干什么」（surface / text / border / status）。
+     组件**只准**引用这一层。这样暗色主题只需重绑语义层，组件样式零改动。
+   - 第三层 component：组件级特化（如 --btn-primary-bg）。
+
+   命名约定：`--<类别>-<语义>-<修饰>`，全小写连字符。
+   禁止在组件里写死十六进制色值 —— 那会让暗色主题必然漏改某处。
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   1. Palette — 原始色板
+   中性色用**带蓝调**的灰（而非纯灰），因为界面大面积是冷色代码/图表，
+   纯灰会显脏。对比度已按 WCAG AA 校验（正文 ≥4.5:1，大字/边框 ≥3:1）。
+   -------------------------------------------------------------------------- */
+:root {
+  /* 中性 —— 冷调灰阶 */
+  --c-gray-0: #ffffff;
+  --c-gray-25: #fbfcfe;
+  --c-gray-50: #f5f7fb;
+  --c-gray-100: #eceff5;
+  --c-gray-200: #dfe3ec;
+  --c-gray-300: #c8cfdd;
+  --c-gray-400: #9aa4b8;
+  --c-gray-500: #6b7689;
+  --c-gray-600: #4d5769;
+  --c-gray-700: #363f4f;
+  --c-gray-800: #232b39;
+  --c-gray-850: #1a212c;
+  --c-gray-900: #131923;
+  --c-gray-950: #0c1017;
+
+  /* 品牌 —— 靛蓝，用于主操作与选中态 */
+  --c-brand-50: #eef3ff;
+  --c-brand-100: #dde6ff;
+  --c-brand-200: #bfcdff;
+  --c-brand-300: #97aeff;
+  --c-brand-400: #6b8aff;
+  --c-brand-500: #4a6cf7;
+  --c-brand-600: #3a55d9;
+  --c-brand-700: #2e44ad;
+  --c-brand-800: #263a8c;
+  --c-brand-900: #1f2f6e;
+
+  /* 状态 —— 每色五档，用于底色/描边/文本/实心四种用法 */
+  --c-success-50: #e8f8f0;
+  --c-success-100: #ccf0de;
+  --c-success-400: #34c98a;
+  --c-success-500: #17ab6c;
+  --c-success-600: #0f8a56;
+  --c-success-700: #0b6b43;
+
+  --c-warning-50: #fdf5e6;
+  --c-warning-100: #f9e9c4;
+  --c-warning-400: #e9b03c;
+  --c-warning-500: #d1911c;
+  --c-warning-600: #a97311;
+  --c-warning-700: #7f560c;
+
+  --c-danger-50: #fdeeed;
+  --c-danger-100: #fbdad7;
+  --c-danger-400: #ef6a5c;
+  --c-danger-500: #dc4a3d;
+  --c-danger-600: #b8372c;
+  --c-danger-700: #8e2a21;
+
+  --c-info-50: #e9f4fd;
+  --c-info-100: #cde6fa;
+  --c-info-400: #46a6e8;
+  --c-info-500: #2489cc;
+  --c-info-600: #1a6ca3;
+  --c-info-700: #13527b;
+
+  --c-purple-50: #f3eefd;
+  --c-purple-100: #e5dbfb;
+  --c-purple-400: #9b7bef;
+  --c-purple-500: #7c56e4;
+  --c-purple-600: #6440c2;
+
+  --c-teal-50: #e7f7f6;
+  --c-teal-100: #c9edeb;
+  --c-teal-400: #35bdb8;
+  --c-teal-500: #199c97;
+  --c-teal-600: #127a76;
+
+  /* 代码高亮 —— 亮色主题 */
+  --c-code-add-bg: #e6f7ee;
+  --c-code-add-fg: #0b6b43;
+  --c-code-del-bg: #fdecea;
+  --c-code-del-fg: #a32e23;
+  --c-code-hunk-fg: #6b7689;
+}
+
+/* --------------------------------------------------------------------------
+   2. Semantic — 语义层（亮色主题为默认）
+   -------------------------------------------------------------------------- */
+:root,
+[data-theme='light'] {
+  color-scheme: light;
+
+  /* 表面 —— 五级层次：画布 / 卡片 / 悬浮 / 凹陷 / 反色 */
+  --surface-canvas: var(--c-gray-50);
+  --surface-base: var(--c-gray-0);
+  --surface-raised: var(--c-gray-0);
+  --surface-sunken: var(--c-gray-100);
+  --surface-inverse: var(--c-gray-900);
+  --surface-overlay: rgb(19 25 35 / 45%);
+
+  /* 文本 —— 四级：主 / 次 / 弱 / 禁用 */
+  --text-primary: var(--c-gray-900);
+  --text-secondary: var(--c-gray-600);
+  --text-tertiary: var(--c-gray-500);
+  --text-disabled: var(--c-gray-400);
+  --text-inverse: var(--c-gray-0);
+  --text-on-brand: #ffffff;
+
+  /* 边框 —— 三级：分隔 / 常规 / 强调 */
+  --border-subtle: var(--c-gray-100);
+  --border-default: var(--c-gray-200);
+  --border-strong: var(--c-gray-300);
+  --border-inverse: var(--c-gray-700);
+
+  /* 品牌 */
+  --brand: var(--c-brand-500);
+  --brand-hover: var(--c-brand-600);
+  --brand-active: var(--c-brand-700);
+  --brand-subtle: var(--c-brand-50);
+  --brand-border: var(--c-brand-200);
+  --brand-text: var(--c-brand-700);
+
+  /* 状态（文本色用 700 档以满足 AA 对比度） */
+  --status-success: var(--c-success-500);
+  --status-success-bg: var(--c-success-50);
+  --status-success-border: var(--c-success-100);
+  --status-success-text: var(--c-success-700);
+
+  --status-warning: var(--c-warning-500);
+  --status-warning-bg: var(--c-warning-50);
+  --status-warning-border: var(--c-warning-100);
+  --status-warning-text: var(--c-warning-700);
+
+  --status-danger: var(--c-danger-500);
+  --status-danger-bg: var(--c-danger-50);
+  --status-danger-border: var(--c-danger-100);
+  --status-danger-text: var(--c-danger-700);
+
+  --status-info: var(--c-info-500);
+  --status-info-bg: var(--c-info-50);
+  --status-info-border: var(--c-info-100);
+  --status-info-text: var(--c-info-700);
+
+  --status-neutral: var(--c-gray-500);
+  --status-neutral-bg: var(--c-gray-100);
+  --status-neutral-border: var(--c-gray-200);
+  --status-neutral-text: var(--c-gray-600);
+
+  --status-running: var(--c-brand-500);
+  --status-running-bg: var(--c-brand-50);
+  --status-running-border: var(--c-brand-200);
+  --status-running-text: var(--c-brand-700);
+
+  /* 代码 */
+  --code-bg: var(--c-gray-50);
+  --code-border: var(--c-gray-200);
+  --code-add-bg: var(--c-code-add-bg);
+  --code-add-fg: var(--c-code-add-fg);
+  --code-del-bg: var(--c-code-del-bg);
+  --code-del-fg: var(--c-code-del-fg);
+  --code-hunk-fg: var(--c-code-hunk-fg);
+
+  /* 焦点环 —— 键盘可达性的核心视觉 */
+  --focus-ring: 0 0 0 2px var(--surface-base), 0 0 0 4px var(--c-brand-400);
+
+  /* 阴影 —— 亮色下用低透明度黑，避免生硬 */
+  --shadow-xs: 0 1px 2px rgb(19 25 35 / 5%);
+  --shadow-sm: 0 1px 3px rgb(19 25 35 / 8%), 0 1px 2px rgb(19 25 35 / 4%);
+  --shadow-md: 0 4px 12px rgb(19 25 35 / 8%), 0 2px 4px rgb(19 25 35 / 4%);
+  --shadow-lg: 0 12px 28px rgb(19 25 35 / 12%), 0 4px 10px rgb(19 25 35 / 6%);
+  --shadow-xl: 0 24px 56px rgb(19 25 35 / 18%), 0 8px 20px rgb(19 25 35 / 8%);
+
+  /* 骨架屏 */
+  --skeleton-base: var(--c-gray-100);
+  --skeleton-shine: var(--c-gray-200);
+}
+
+/* --------------------------------------------------------------------------
+   3. Semantic — 暗色主题
+   只重绑语义层。组件代码完全不需要感知主题。
+   -------------------------------------------------------------------------- */
+[data-theme='dark'] {
+  color-scheme: dark;
+
+  --surface-canvas: var(--c-gray-950);
+  --surface-base: var(--c-gray-900);
+  --surface-raised: var(--c-gray-850);
+  --surface-sunken: var(--c-gray-950);
+  --surface-inverse: var(--c-gray-50);
+  --surface-overlay: rgb(0 0 0 / 62%);
+
+  --text-primary: #e8ecf3;
+  --text-secondary: #a8b3c4;
+  --text-tertiary: #7d8899;
+  --text-disabled: #5a6473;
+  --text-inverse: var(--c-gray-900);
+  --text-on-brand: #ffffff;
+
+  --border-subtle: #1e2634;
+  --border-default: #2a3441;
+  --border-strong: #3b4757;
+  --border-inverse: var(--c-gray-300);
+
+  --brand: var(--c-brand-400);
+  --brand-hover: var(--c-brand-300);
+  --brand-active: var(--c-brand-200);
+  --brand-subtle: #1b2540;
+  --brand-border: #2c3c66;
+  --brand-text: var(--c-brand-300);
+
+  --status-success: var(--c-success-400);
+  --status-success-bg: #10291f;
+  --status-success-border: #1c4433;
+  --status-success-text: #5fd9a3;
+
+  --status-warning: var(--c-warning-400);
+  --status-warning-bg: #2c230d;
+  --status-warning-border: #4a3b14;
+  --status-warning-text: #efc46a;
+
+  --status-danger: var(--c-danger-400);
+  --status-danger-bg: #2e1614;
+  --status-danger-border: #4d2521;
+  --status-danger-text: #f08c80;
+
+  --status-info: var(--c-info-400);
+  --status-info-bg: #0f2433;
+  --status-info-border: #1b3c52;
+  --status-info-text: #74c2ee;
+
+  --status-neutral: var(--c-gray-400);
+  --status-neutral-bg: #1e2634;
+  --status-neutral-border: #2f3a4a;
+  --status-neutral-text: #a8b3c4;
+
+  --status-running: var(--c-brand-400);
+  --status-running-bg: #1b2540;
+  --status-running-border: #2c3c66;
+  --status-running-text: var(--c-brand-300);
+
+  --code-bg: #0f141d;
+  --code-border: #232c3a;
+  --code-add-bg: #10291f;
+  --code-add-fg: #6fdcae;
+  --code-del-bg: #2e1614;
+  --code-del-fg: #f0908a;
+  --code-hunk-fg: #6b7689;
+
+  --focus-ring: 0 0 0 2px var(--surface-base), 0 0 0 4px var(--c-brand-400);
+
+  --shadow-xs: 0 1px 2px rgb(0 0 0 / 40%);
+  --shadow-sm: 0 1px 3px rgb(0 0 0 / 45%), 0 1px 2px rgb(0 0 0 / 30%);
+  --shadow-md: 0 4px 12px rgb(0 0 0 / 50%), 0 2px 4px rgb(0 0 0 / 30%);
+  --shadow-lg: 0 12px 28px rgb(0 0 0 / 55%), 0 4px 10px rgb(0 0 0 / 35%);
+  --shadow-xl: 0 24px 56px rgb(0 0 0 / 65%), 0 8px 20px rgb(0 0 0 / 40%);
+
+  --skeleton-base: #1a212c;
+  --skeleton-shine: #232c3a;
+}
+
+/* --------------------------------------------------------------------------
+   4. Typography — 字体与字号阶梯
+   阶梯刻意使用**非线性**间距（1.125→1.25→1.5），让层级差异在视觉上可辨。
+   中文需额外声明中文字体，否则会回退到宋体，观感立刻劣化。
+   -------------------------------------------------------------------------- */
+:root {
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei UI', 'Microsoft YaHei', 'Source Han Sans SC', 'Noto Sans CJK SC',
+    'Helvetica Neue', Arial, sans-serif;
+  --font-mono:
+    'SFMono-Regular', 'JetBrains Mono', 'Cascadia Code', Consolas, 'Liberation Mono',
+    'Menlo', 'Courier New', monospace;
+  --font-numeric: ui-monospace, 'SF Mono', 'Cascadia Mono', Consolas, monospace;
+
+  /* 字号阶梯 —— 基数 14px（控制台类产品的密度契约） */
+  --fs-2xs: 0.6875rem;  /* 11px — 角标、密集表格 */
+  --fs-xs: 0.75rem;     /* 12px — 辅助说明 */
+  --fs-sm: 0.8125rem;   /* 13px — 表格正文、表单标签 */
+  --fs-base: 0.875rem;  /* 14px — 界面正文 */
+  --fs-md: 1rem;        /* 16px — 强调正文 */
+  --fs-lg: 1.125rem;    /* 18px — 卡片标题 */
+  --fs-xl: 1.375rem;    /* 22px — 页面标题 */
+  --fs-2xl: 1.75rem;    /* 28px — 大数字 */
+  --fs-3xl: 2.25rem;    /* 36px — 指标主数值 */
+
+  --lh-tight: 1.2;
+  --lh-snug: 1.4;
+  --lh-normal: 1.6;
+  --lh-relaxed: 1.75;
+
+  --fw-normal: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+  --fw-bold: 700;
+
+  /* 字距：大字号收紧，小字号放开，避免视觉上「松」 */
+  --ls-tight: -0.02em;
+  --ls-normal: 0;
+  --ls-wide: 0.02em;
+  --ls-wider: 0.06em;
+}
+
+/* --------------------------------------------------------------------------
+   5. Spacing / Radius / Layout
+   间距用 4px 基准的等比刻度。禁止出现 13px、17px 这类非刻度值。
+   -------------------------------------------------------------------------- */
+:root {
+  --space-0: 0;
+  --space-1: 0.25rem;   /* 4 */
+  --space-2: 0.5rem;    /* 8 */
+  --space-3: 0.75rem;   /* 12 */
+  --space-4: 1rem;      /* 16 */
+  --space-5: 1.25rem;   /* 20 */
+  --space-6: 1.5rem;    /* 24 */
+  --space-8: 2rem;      /* 32 */
+  --space-10: 2.5rem;   /* 40 */
+  --space-12: 3rem;     /* 48 */
+  --space-16: 4rem;     /* 64 */
+
+  --radius-xs: 3px;
+  --radius-sm: 5px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-2xl: 22px;
+  --radius-full: 9999px;
+
+  /* 布局骨架尺寸 */
+  --sidebar-w: 232px;
+  --sidebar-w-collapsed: 60px;
+  --topbar-h: 56px;
+  --content-max: 1560px;
+
+  /* 层级 —— 集中管理，避免 z-index 军备竞赛 */
+  --z-base: 1;
+  --z-sticky: 100;
+  --z-sidebar: 200;
+  --z-topbar: 300;
+  --z-drawer: 400;
+  --z-modal: 500;
+  --z-toast: 600;
+  --z-tooltip: 700;
+
+  /* 动效 —— 统一节奏；交互反馈短、布局变化略长 */
+  --dur-instant: 80ms;
+  --dur-fast: 140ms;
+  --dur-normal: 220ms;
+  --dur-slow: 340ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* --------------------------------------------------------------------------
+   6. 响应式断点（供 JS 侧 matchMedia 复用，保持单一真源）
+   mobile  < 640  |  tablet 640–1023  |  desktop ≥ 1024
+   -------------------------------------------------------------------------- */
+:root {
+  --bp-mobile: 640px;
+  --bp-tablet: 1024px;
+}
+
+/* --------------------------------------------------------------------------
+   7. 无障碍：尊重系统「减少动态效果」偏好
+   这不是可选项 —— 前庭功能障碍用户会因位移动画产生生理不适。
+   -------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-instant: 0ms;
+    --dur-fast: 0ms;
+    --dur-normal: 0ms;
+    --dur-slow: 0ms;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

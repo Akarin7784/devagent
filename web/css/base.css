@@ -1,0 +1,264 @@
+/* ==========================================================================
+   Base — 重置与全局排版
+   只做三件事：抹平浏览器差异、建立可预测的盒模型、定义文档级默认值。
+   组件样式一律不放这里。
+   ========================================================================== */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  /* 不锁 body 滚动（会让键盘用户无法整页翻阅），仅在弹层打开时用属性控制 */
+  text-size-adjust: 100%;
+  scroll-behavior: smooth;
+  /* 锚点跳转时给 sticky 顶栏留出空间 */
+  scroll-padding-top: calc(var(--topbar-h) + var(--space-4));
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: var(--fs-base);
+  line-height: var(--lh-normal);
+  color: var(--text-primary);
+  background: var(--surface-canvas);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* 主题切换时给一点过渡，避免闪白/闪黑 */
+  transition: background-color var(--dur-normal) var(--ease-out),
+    color var(--dur-normal) var(--ease-out);
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  margin: 0;
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-tight);
+  letter-spacing: var(--ls-tight);
+  color: var(--text-primary);
+  /* 中文标题在窄容器里断行要按词，避免「上/下文」这类割裂 */
+  word-break: keep-all;
+  overflow-wrap: break-word;
+}
+
+p {
+  margin: 0;
+}
+
+ul,
+ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+a {
+  color: var(--brand-text);
+  text-decoration: none;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+a:hover {
+  color: var(--brand-hover);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+  margin: 0;
+}
+
+button {
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+/* 数字对齐：所有表格数字用等宽，否则列会「跳」 */
+table {
+  border-collapse: collapse;
+  border-spacing: 0;
+}
+
+img,
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+hr {
+  border: none;
+  border-top: 1px solid var(--border-subtle);
+  margin: var(--space-4) 0;
+}
+
+code,
+kbd,
+pre,
+samp {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+/* --------------------------------------------------------------------------
+   焦点可见性
+   只在键盘导航时显示焦点环（:focus-visible），鼠标点击不显示 —— 兼顾美观
+   与可达性。**绝不允许** `outline: none` 而不给替代视觉。
+   -------------------------------------------------------------------------- */
+:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+  border-radius: var(--radius-xs);
+}
+
+/* 自定义组件的焦点环用 box-shadow，避免被 overflow:hidden 裁切 */
+.focus-ring:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* --------------------------------------------------------------------------
+   工具类 —— 只保留高频且语义清晰的少量工具类，
+   防止演变成「工具类地狱」导致样式来源不可追溯。
+   -------------------------------------------------------------------------- */
+
+/* 仅供屏幕阅读器 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* 跳转到主内容 —— 键盘用户的第一个可聚焦元素 */
+.skip-link {
+  position: absolute;
+  top: var(--space-2);
+  left: var(--space-2);
+  z-index: var(--z-toast);
+  padding: var(--space-2) var(--space-4);
+  background: var(--brand);
+  color: var(--text-on-brand);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  box-shadow: var(--shadow-lg);
+  transform: translateY(-200%);
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+  text-decoration: none;
+}
+
+.hidden {
+  display: none !important;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* 文本截断 */
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 多行截断 */
+.clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* 数字/等宽 */
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+.text-secondary {
+  color: var(--text-secondary);
+}
+
+.text-tertiary {
+  color: var(--text-tertiary);
+}
+
+/* --------------------------------------------------------------------------
+   自定义滚动条 —— 细、低对比，不抢视觉
+   -------------------------------------------------------------------------- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius-full);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-tertiary);
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* 打印：隐藏导航与交互件，只留内容 */
+@media print {
+  .app-sidebar,
+  .app-topbar,
+  .toast-region,
+  .btn {
+    display: none !important;
+  }
+
+  .app-main {
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  body {
+    background: #fff;
+  }
+}

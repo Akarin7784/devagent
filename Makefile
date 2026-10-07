@@ -92,10 +92,27 @@ web-words:  ## 导出跨语言词表（从 devagent/enums.py 生成前端可读�
 	               ensure_ascii=False, indent=2) + '\n', encoding='utf-8')"
 	@echo "[web-words] web/test_contract_words.json 已更新"
 
-web-check: web-words  ## 校验前端（语法检查 + 纯逻辑测试，零依赖）
-	$(NODE) --check web/graph.js
-	$(NODE) --check web/app.js
+web-check: web-words  ## 校验前端（语法检查 + 纯逻辑测试 + 模块图完整性，零依赖）
+	@echo "[web-check] 语法检查（全部 ES 模块）"
+	@for f in $$(find web -name '*.js' -not -name '*.test.js' | sort); do \
+		$(NODE) --check "$$f" || exit 1; \
+	done
+	@echo "[web-check] 校验相对导入是否都存在（防止路径写错）"
+	@$(NODE) -e "const fs=require('fs'),p=require('path');let bad=0,n=0; \
+		(function w(d){for(const e of fs.readdirSync(d,{withFileTypes:true})){const f=p.join(d,e.name); \
+		if(e.isDirectory()){w(f);continue} if(!f.endsWith('.js'))continue; \
+		const s=fs.readFileSync(f,'utf8'); \
+		for(const m of s.matchAll(/from\s*['\''\"](\.[^'\''\"]+)['\''\"]/g)){n++; \
+		if(!fs.existsSync(p.resolve(p.dirname(f),m[1]))){console.log('  缺失:',f,'->',m[1]);bad++;}}}})('web'); \
+		console.log('  检查 '+n+' 条相对导入，缺失 '+bad+' 条'); process.exit(bad?1:0)"
+	@echo "[web-check] 纯逻辑测试"
 	$(NODE) web/graph.test.js
+	$(NODE) web/format.test.js
+	@echo "[web-check] 状态映射契约（跨语言词表驱动）"
+	$(NODE) web/status.test.js
+	@echo "[web-check] 事件流去重与回放判定"
+	$(NODE) web/eventstream.test.js
+	@echo "[web-check] 通过"
 
 web-serve:  ## 用静态服务器托管前端（零依赖）
 	$(PYTHON) -m http.server 5173 --directory web

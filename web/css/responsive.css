@@ -1,0 +1,420 @@
+/* ==========================================================================
+   Responsive — 响应式适配
+   三档：mobile (<640) / tablet (640–1023) / desktop (≥1024)
+
+   采用 **mobile-first 的反向覆盖**（desktop-first）写法：基础样式按桌面设计，
+   向下覆盖移动端。理由：本产品是控制台式应用，桌面是主场景，移动端是
+   补充查看场景。若反过来写会产生大量 desktop 覆盖，噪音更大。
+
+   适配策略（而非简单堆叠）：
+   - 侧边栏：≥1024 常驻；<1024 变抽屉
+   - 三栏工作台：≥1280 三栏 → 1024–1279 两栏（详情下沉为整行）→ <1024 单列
+   - 表格：<768 变卡片式堆叠（横滑在手机上是可用的但很累）
+   - 触摸目标：<1024 统一提升到 ≥40px（Apple HIG 建议 44px）
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   ≥1280px：工作台三栏并排
+   --------------------------------------------------------------------------
+   与 responsive.css 顶部注释里的「≥1280 三栏」对应。
+   左右两栏固定宽（左队列 280、右详情 320），中间主区吃剩余空间。
+   主区用 minmax(0, 1fr) 而不是 1fr —— grid 子项的默认 min-width:auto
+   会被 DAG 画布的固有宽度撑开，导致整个网格横向溢出。
+   -------------------------------------------------------------------------- */
+@media (min-width: 1280px) {
+  .workbench {
+    grid-template-columns: 280px minmax(0, 1fr) 320px;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   ≤1279px：工作台洞察区下沉为整行
+   --------------------------------------------------------------------------
+   1280 以下容纳不了三栏，右栏（节点详情）下沉到主区下方整行展示。
+   保持可见而非隐藏：用户点了 DAG 节点后必须能看到详情，
+   若在小屏上直接 conceal，点击就会「没有反应」。
+   -------------------------------------------------------------------------- */
+@media (max-width: 1279px) {
+  .workbench {
+    grid-template-columns: 260px minmax(0, 1fr);
+  }
+
+  .workbench-aside {
+    position: static;
+  }
+
+  /* 详情区跨满两列，成为主区下方的整行 */
+  .workbench-detail {
+    grid-column: 1 / -1;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   ≤1023px：平板 —— 侧栏变抽屉，网格降列
+   -------------------------------------------------------------------------- */
+@media (max-width: 1023px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .app-sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    z-index: var(--z-drawer);
+    width: min(280px, 84vw);
+    height: 100vh;
+    height: 100dvh;
+    transform: translateX(-101%);
+    transition: transform var(--dur-normal) var(--ease-out);
+    box-shadow: var(--shadow-xl);
+    border-right: 1px solid var(--border-default);
+  }
+
+  .nav-toggle {
+    display: inline-flex;
+  }
+
+  .app-topbar {
+    padding-left: var(--space-3);
+  }
+
+  .app-content {
+    padding: var(--space-4) var(--space-4) var(--space-12);
+  }
+
+  /* 触摸目标提升 */
+  .btn {
+    height: 38px;
+    padding: 0 var(--space-4);
+  }
+
+  .btn-sm {
+    height: 32px;
+  }
+
+  .btn-icon {
+    width: 38px;
+    height: 38px;
+  }
+
+  .btn-icon.btn-sm {
+    width: 32px;
+    height: 32px;
+  }
+
+  .nav-item {
+    min-height: 42px;
+    font-size: var(--fs-base);
+  }
+
+  .input,
+  .textarea,
+  .select {
+    min-height: 38px;
+  }
+
+  /* 网格降列 */
+  .grid-cols-4 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .grid-cols-3 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .workbench {
+    grid-template-columns: 1fr;
+  }
+
+  /* 任务队列在窄屏限高，避免撑满整页把主区挤到屏幕外 */
+  .task-list {
+    max-height: 280px;
+  }
+
+  .drawer {
+    width: min(560px, 100vw);
+  }
+
+  .code {
+    max-height: 320px;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   ≤767px：表格转卡片式堆叠
+   --------------------------------------------------------------------------
+   横滑表格在手机上「能用但难用」：用户看不到列头，容易迷失。
+   改为每行一张卡，用 data-label 属性做键名。
+   -------------------------------------------------------------------------- */
+@media (max-width: 767px) {
+  .table-wrap-stack .table,
+  .table-wrap-stack .table tbody,
+  .table-wrap-stack .table tr,
+  .table-wrap-stack .table td {
+    display: block;
+    width: 100%;
+  }
+
+  .table-wrap-stack .table thead {
+    /* 视觉上隐藏，但保留给屏幕阅读器 */
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+  }
+
+  .table-wrap-stack .table tr {
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    margin-bottom: var(--space-3);
+    padding: var(--space-2) 0;
+    background: var(--surface-base);
+  }
+
+  .table-wrap-stack .table td {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-4);
+    border-bottom: none;
+    padding: var(--space-2) var(--space-3);
+    text-align: left;
+  }
+
+  .table-wrap-stack .table td::before {
+    content: attr(data-label);
+    flex: none;
+    font-size: var(--fs-2xs);
+    font-weight: var(--fw-semibold);
+    letter-spacing: var(--ls-wide);
+    text-transform: uppercase;
+    color: var(--text-tertiary);
+    min-width: 72px;
+    padding-top: 2px;
+  }
+
+  .table-wrap-stack .table td.num {
+    text-align: right;
+  }
+
+  .table-wrap-stack .table td[data-label]:not([data-label]) {
+    display: block;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   ≤639px：手机
+   -------------------------------------------------------------------------- */
+@media (max-width: 639px) {
+  :root {
+    --content-max: 100%;
+  }
+
+  .app-content {
+    padding: var(--space-3) var(--space-3) var(--space-12);
+  }
+
+  .app-topbar {
+    min-height: 52px;
+    padding: var(--space-2) var(--space-3);
+  }
+
+  /* 顶栏副标题在手机上占两行且信息量低，隐藏 */
+  .topbar-title .subtitle {
+    display: none;
+  }
+
+  .topbar-title h1 {
+    font-size: var(--fs-md);
+  }
+
+  /* 连接徽章在手机上退化为纯色点（文字交给侧栏） */
+  #topbar-status span:last-child {
+    display: none;
+  }
+
+  .page-head {
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+  }
+
+  .page-head h1 {
+    font-size: var(--fs-lg);
+  }
+
+  .page-head-actions {
+    width: 100%;
+  }
+
+  .page-head-actions .btn {
+    flex: 1;
+    justify-content: center;
+  }
+
+  .grid-cols-4,
+  .grid-cols-3,
+  .grid-cols-2 {
+    grid-template-columns: 1fr;
+  }
+
+  .grid-auto,
+  .grid-auto-wide {
+    grid-template-columns: 1fr;
+  }
+
+  /* 指标大数字缩小，避免溢出 */
+  .stat-card-value {
+    font-size: var(--fs-xl);
+  }
+
+  .stat-card {
+    padding: var(--space-3);
+  }
+
+  /* 键值列表单列 */
+  .kv {
+    grid-template-columns: 1fr;
+    gap: var(--space-2);
+  }
+
+  /* 时间线：时间戳换到标题上方 */
+  .timeline-item {
+    grid-template-columns: 1fr;
+    gap: var(--space-1);
+    margin-left: var(--space-3);
+    padding-right: var(--space-3);
+  }
+
+  .timeline-time {
+    font-size: var(--fs-2xs);
+  }
+
+  /* 上下文片段：分数下沉到独立行 */
+  .chunk {
+    grid-template-columns: auto 1fr;
+  }
+
+  .chunk-scores {
+    grid-column: 2;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3);
+  }
+
+  /* 表单操作按钮全宽，符合移动端拇指操作习惯 */
+  .form-actions {
+    flex-direction: column-reverse;
+  }
+
+  .form-actions .btn {
+    width: 100%;
+  }
+
+  .drawer {
+    width: 100vw;
+  }
+
+  /* Toast 在手机上贴顶通栏 */
+  .toast-region {
+    top: var(--space-2);
+    right: var(--space-2);
+    left: var(--space-2);
+    width: auto;
+  }
+
+  .modal {
+    max-height: 90vh;
+  }
+
+  .modal-footer {
+    flex-direction: column-reverse;
+  }
+
+  .modal-footer .btn {
+    width: 100%;
+  }
+
+  .diff-line .ln {
+    width: 30px;
+    padding: 0 var(--space-1);
+  }
+
+  .diff-line .lt {
+    padding-right: var(--space-2);
+  }
+
+  .hbar-row {
+    grid-template-columns: 1fr auto;
+    gap: var(--space-1) var(--space-2);
+  }
+
+  .hbar-label {
+    grid-column: 1 / -1;
+  }
+
+  .toolbar {
+    padding: var(--space-2);
+  }
+
+  /* 工具栏内的搜索框占满整行 */
+  .toolbar .input-group {
+    flex: 1 1 100%;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   ≥1600px：超宽屏 —— 内容居中，避免行长过长影响阅读
+   -------------------------------------------------------------------------- */
+@media (min-width: 1600px) {
+  .app-content {
+    padding-left: var(--space-8);
+    padding-right: var(--space-8);
+  }
+}
+
+/* --------------------------------------------------------------------------
+   高度受限的横屏手机：压缩纵向留白
+   -------------------------------------------------------------------------- */
+@media (max-height: 520px) and (orientation: landscape) {
+  .app-topbar {
+    min-height: 44px;
+  }
+
+  .app-content {
+    padding-top: var(--space-2);
+  }
+}
+
+/* --------------------------------------------------------------------------
+   高对比度模式（Windows 强制颜色）—— 保证边框与文本不被吃掉
+   -------------------------------------------------------------------------- */
+@media (forced-colors: active) {
+  .card,
+  .stat-card,
+  .chunk,
+  .diff-file,
+  .toast,
+  .modal,
+  .drawer {
+    border: 1px solid CanvasText;
+  }
+
+  .btn {
+    border: 1px solid ButtonText;
+  }
+
+  .dot,
+  .bar-fill,
+  .hbar-fill {
+    forced-color-adjust: none;
+  }
+
+  /* 焦点环在强制颜色下用系统色，否则可能不可见 */
+  :focus-visible {
+    outline: 2px solid Highlight;
+  }
+}

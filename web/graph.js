@@ -21,6 +21,27 @@
  * 水平直线，这正是我们希望读者第一眼看到的东西。
  */
 
+// 状态/角色映射表已收敛到 ./js/status.js（唯一真源）。
+// 这里把**原有公开 API 原样再导出**，让既有调用方（workbench.js 等页面
+// 以及 graph.test.js）无需改动 import 路径，同时保证全站只有一份表 ——
+// 不会再出现"改了 A 忘了 B"的缺口。
+//
+// 注意必须逐个列出，不能用 `export *`：那样会把 status.js 里的
+// taskStatusBadge 等与本文件无关的符号也泄漏出去，模糊模块边界。
+export {
+  AGENT_COLOR,
+  STATUS_GROUP,
+  agentColor,
+  statusGroup,
+  statusLabel,
+} from './js/status.js';
+
+import {
+  agentColor as _agentColor,
+  statusGroup as _statusGroup,
+  statusLabel as _statusLabel,
+} from './js/status.js';
+
 /** 节点矩形的固定尺寸（SVG 用户单位）。 */
 export const NODE_W = 168;
 export const NODE_H = 62;
@@ -178,93 +199,18 @@ function edgePath(from, to) {
 
 /* ------------------------------------------------------------------ *
  * 状态语义
- * ------------------------------------------------------------------ */
-
-/**
- * 节点状态 → 视觉分组。
+ * ------------------------------------------------------------------ *
+ * 表的定义已迁到 ./js/status.js，这里只做**本地别名**：
+ * 文件内的布局/渲染代码仍写作 statusGroup(...)、agentColor(...)，
+ * 改动最小；而表本身全站只有一份。
  *
- * `backtracked` 单独成组，而不是并进 `fail`：它表示「判定未通过、
- * 将回退重跑」，是一次**仍在进行中**的过程，与终态失败完全不同。
- * 混在一起会让读者误判任务已经失败。
+ * 为什么不留在这里：`components.js` 也需要同一批映射（任务列表的圆点、
+ * 徽章），两处各存一份就一定会漂移 —— 这不是假设，是已经发生过的事故。
  */
-/**
- * 后端状态字面量 → 视觉分组。
- *
- * **必须覆盖 `devagent.enums.StepStatus` 的全部成员。**
- * 这是一份跨语言契约：Python 产出字符串，JS 消费，中间没有类型系统兜底。
- * 漏登记一个状态的后果不是报错，而是**静默降级为 `pending`（"待执行"）** ——
- * 一个"验证未通过"的节点会显示成"还没开始跑"，比不显示更误导。
- *
- * 所以 `web/graph.test.js` 里有一条断言逐个检查 StepStatus 全集，
- * 新增枚举成员而忘记登记前端时，测试会红。
- *
- * 注意 `backtracked` 不是 StepStatus 成员（枚举里是 `rejected`）：
- * 它只存在于事件层，是 `applyEvent` 收到 `node_verdict: reject` 时的**派生态**，
- * 用来表达"这次驳回触发了回退重跑"，语义比 `rejected` 更具体。
- */
-export const STATUS_GROUP = {
-  pending: 'pending', // StepStatus.PENDING
-  ready: 'ready', // StepStatus.READY —— 依赖已满足，等待调度
-  running: 'running', // StepStatus.RUNNING
-  verifying: 'running', // StepStatus.VERIFYING —— 与 running 同组：都是"正在占用资源"
-  success: 'ok', // StepStatus.SUCCESS
-  rejected: 'backtrack', // StepStatus.REJECTED —— 被驳回，必然触发上游重跑
-  failed: 'fail', // StepStatus.FAILED
-  skipped: 'muted', // StepStatus.SKIPPED
-  backtracked: 'backtrack', // 事件层派生态，非 StepStatus 成员
-};
 
-/** 兜底分组：只有真正未知的状态才会落到这里。 */
-const FALLBACK_GROUP = 'pending';
-
-export function statusGroup(status) {
-  return STATUS_GROUP[status] || FALLBACK_GROUP;
-}
-
-/**
- * 状态的中文短标签（画在节点右下角）。
- *
- * 与 STATUS_GROUP 同源，同样必须覆盖 StepStatus 全集：
- * 漏登记会**回显英文枚举名**（如 "verifying"），中文界面里很扎眼。
- */
-const STATUS_LABEL = {
-  pending: '待执行',
-  ready: '待调度',
-  running: '执行中',
-  verifying: '校验中',
-  success: '成功',
-  rejected: '已驳回',
-  failed: '失败',
-  skipped: '跳过',
-  backtracked: '回退重跑',
-};
-
-export function statusLabel(status) {
-  return STATUS_LABEL[status] || status || FALLBACK_GROUP;
-}
-
-/**
- * 角色 → 稳定配色（按角色而非状态，避免状态与角色两种语义混用同一通道）。
- *
- * **必须覆盖 `devagent.enums.AgentType` 的全部成员**，理由同 STATUS_GROUP。
- * 配色漏登记的后果同样是静默降级：所有未登记角色共用同一个灰色，
- * 于是"编排器"和"评审员"看起来是同一个角色，图例失去意义。
- */
-const AGENT_COLOR = {
-  orchestrator: '#8b7bd8', // 编排器：紫，只做调度不参与执行
-  requirement: '#c77dd8', // 需求澄清：洋红，任务最上游
-  architect: '#4aa3df', // 方案设计：蓝，产出 DAG 本身
-  coder: '#5b8cff', // 编码：亮蓝，图上占比最大的角色
-  tester: '#e0a83c', // 测试：橙
-  verifier: '#35c48a', // 独立验证：绿，与 coder 的蓝刻意拉开
-  reviewer: '#d98b5f', // 代码审查：棕橙，与 tester 的橙区分
-};
-
-const AGENT_FALLBACK = '#7a8291';
-
-export function agentColor(agentType) {
-  return AGENT_COLOR[agentType] || AGENT_FALLBACK;
-}
+const statusGroup = _statusGroup;
+const statusLabel = _statusLabel;
+const agentColor = _agentColor;
 
 /* ------------------------------------------------------------------ *
  * 图状态（增量更新）
