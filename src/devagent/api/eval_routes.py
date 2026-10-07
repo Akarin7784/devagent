@@ -21,8 +21,7 @@ async def execute_evaluation(app: Any, payload: RunEvalRequest) -> dict[str, Any
 
     复用 ``app.state`` 上已有的 gateway（若存在），避免重复建连接池。
     """
-    from devagent.evaluation import EvalRunner, GoldenSet, LLMJudge
-    from devagent.evaluation.judge import GatewayJudgeBackend
+    from devagent.evaluation import EvalRunner, GoldenSet, build_judge
     from devagent.models.gateway import ModelGateway
     from devagent.orchestration import Orchestrator
 
@@ -36,10 +35,11 @@ async def execute_evaluation(app: Any, payload: RunEvalRequest) -> dict[str, Any
 
     judge = None
     if payload.use_judge:
-        judge = LLMJudge(
-            GatewayJudgeBackend(gateway),
-            model=settings.evaluation.judge_model,
-            bidirectional=settings.evaluation.enable_bidirectional_judge,
+        # 与 CLI 走同一个工厂，保证两个入口跑出的结论可比较
+        judge = build_judge(
+            gateway,
+            settings,
+            candidate_model=settings.routing.medium_model,
         )
 
     runner = EvalRunner(task_runner=orchestrator, judge=judge)

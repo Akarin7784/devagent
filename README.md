@@ -4,7 +4,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-398%20passing-brightgreen)](#测试)
+[![Tests](https://img.shields.io/badge/tests-446%20passing-brightgreen)](#测试)
 [![mypy](https://img.shields.io/badge/mypy-strict-blue)](https://mypy-lang.org/)
 [![Ruff](https://img.shields.io/badge/code%20style-ruff-000000)](https://github.com/astral-sh/ruff)
 
@@ -278,6 +278,10 @@ DEVAGENT_ORCHESTRATION__MAX_ATTEMPTS=3
 | `DEVAGENT_DATABASE__URL` | 本地 Postgres | `sql` 模式下的连接串；测试用 `sqlite+aiosqlite:///./devagent.db` |
 | `DEVAGENT_CACHE__SEMANTIC` | `false` | 开启向量检索语义缓存（需嵌入模型） |
 | `DEVAGENT_CACHE__SIMILARITY_THRESHOLD` | `0.92` | 语义命中的余弦相似度阈值 |
+| `DEVAGENT_EVALUATION__JUDGE_MODEL` | `deepseek:deepseek-chat` | 主裁判模型 |
+| `DEVAGENT_EVALUATION__REFERENCE_JUDGE_MODEL` | `qwen:qwen-plus` | 异构参考裁判（用于标定自我偏好偏差） |
+| `DEVAGENT_EVALUATION__ENABLE_BIDIRECTIONAL_JUDGE` | `true` | 双向评估（对冲位置偏差） |
+| `DEVAGENT_EVALUATION__CALIBRATION_SAMPLE_LIMIT` | `0` | 标定用样本数上限；`0` = 全部 |
 
 ### 任务持久化（可选）
 
@@ -311,6 +315,52 @@ curl localhost:8000/api/v1/cache                   # 命中统计
 `/cache` 会分别报告 `exact_hits` 与 `semantic_hits` —— 后者就是升级
 带来的**增量**。若它长期接近 0，说明该场景下请求差异本就很大，
 应关掉语义检索以免白付嵌入成本。
+
+### 评测可信度：异构裁判与偏差标定
+
+LLM-as-Judge 有一个绕不开的缺陷：**模型给自己（或同族模型）的输出打分系统性偏高**。
+默认配置下这件事必然发生 —— 候选模型与裁判模型都可能是 `deepseek-chat`。
+
+本项目不假装这个问题不存在，而是把它变成报告里的一个字段：
+
+| 情形 | 处理 |
+| --- | --- |
+| 主裁判与候选**异构** | 直接用，标 `judge_relation=heterogeneous` |
+| 主裁判与候选**同源** + 已标定 | 按偏差扣减，并重算 `passed` |
+| 主裁判与候选**同源** + 未标定 | **如实返回**并标 `uncalibrated_self_preference=true` |
+
+异构判定按**模型族**而非模型名 —— `deepseek-chat` 与 `deepseek-reasoner`
+名字不同但同族，把它们当异构裁判是自欺欺人。
+
+```bash
+export DEVAGENT_EVALUATION__JUDGE_MODEL=deepseek:deepseek-chat
+export DEVAGENT_EVALUATION__REFERENCE_JUDGE_MODEL=qwen:qwen-plus
+devagent eval --category requirement
+```
+
+评测报告会带上标定结果：
+
+```json
+"calibration": {
+  "judge_model": "deepseek:deepseek-chat",
+  "reference_model": "qwen:qwen-plus",
+  "sample_count": 25,
+  "bias": 0.42,
+  "reliable": true
+}
+```
+
+`devagent eval` 会把这件事打印在摘要里，且**区分"没有值"的两种情形** ——
+同源但未标定（提示分数可能偏高）、样本不足（明确说明**分数未校正**）：
+
+```
+  平均裁判分    ：3.00
+  裁判偏差      ：+0.42（已校正，参考裁判 qwen:qwen-plus，25 样本）
+```
+
+**样本数 < 20 时标定判为不可靠，不用于校正** —— 用未经验证的常数扣分，
+比不扣分更糟：它会让分数看起来已经被修正过。
+详见 [ADR-0008](docs/adr/0008-异构裁判与偏差标定.md)。
 
 **嵌入模型不可用时自动降级为精确匹配**，功能不受影响（缓存是优化而非功能）。
 详见 [ADR-0007](docs/adr/0007-语义缓存向量检索而非精确匹配.md)。
@@ -356,7 +406,7 @@ curl -N http://localhost:8000/api/v1/tasks/<id>/events
 ## 测试
 
 ```bash
-make test            # 全量（398 个）
+make test            # 全量（446 个）
 make test-unit       # 仅单元测试
 make check           # ruff + mypy --strict
 ```
@@ -364,10 +414,10 @@ make check           # ruff + mypy --strict
 当前状态：
 
 ```
-398 passed in 21.5s
+446 passed in 19.6s
 ruff check .......... 通过
 ruff format --check . 通过
-mypy --strict ....... 52 个源文件，0 错误
+mypy --strict ....... 59 个源文件，0 错误
 ```
 
 测试覆盖了若干**回归场景**，每一个都对应一个曾经真实存在的 bug：

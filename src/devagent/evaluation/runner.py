@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from devagent.evaluation.dataset import GoldenSample, GoldenSet
+from devagent.evaluation.heterogeneous import JudgePanel
 from devagent.evaluation.judge import JudgeResult, LLMJudge
 from devagent.logging_config import get_logger
 
@@ -112,6 +113,12 @@ class EvalReport:
     judge_model: str = ""
     candidate_model: str = ""
     judge_same_source: bool = False
+    calibration: dict[str, Any] = field(default_factory=dict)
+    """裁判偏差标定结果（``CalibrationResult.to_dict()``）。
+
+    放进报告而不是只打日志，是因为「分数是否被校正过」会直接影响
+    读者对 ``mean_judge_score`` 的解读 —— 不写出来就是误导。
+    """
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -245,6 +252,7 @@ class EvalReport:
             "judge_model": self.judge_model,
             "candidate_model": self.candidate_model,
             "judge_same_source": self.judge_same_source,
+            "calibration": self.calibration,
             "categories": self.by_category(),
         }
 
@@ -282,7 +290,7 @@ class EvalRunner:
         self,
         *,
         task_runner: TaskRunner,
-        judge: LLMJudge | None = None,
+        judge: LLMJudge | JudgePanel | None = None,
         collect_context_metrics: bool = True,
     ) -> None:
         self._task_runner = task_runner
@@ -296,7 +304,18 @@ class EvalRunner:
         categories: list[str] | None = None,
         max_samples: int | None = None,
         metadata: dict[str, Any] | None = None,
+        calibrate: bool = True,
+        calibration_samples: int = 0,
     ) -> EvalReport:
+        """跑完数据集并产出报告。
+
+        Args:
+            calibrate: 当裁判是 ``JudgePanel`` 且配了异构参考裁判时，
+                是否先做偏差标定。**标定会在真正的评测之前额外跑一轮
+                双裁判评估**（即样本数 × 2 次裁判调用），因此有成本。
+            calibration_samples: 标定用样本数。``0`` 表示用全部样本。
+                低于 20 时标定结果标记为不可靠，不会用于分数校正。
+        """
         samples: list[GoldenSample] = list(dataset)
         if categories:
             wanted = set(categories)
@@ -304,12 +323,17 @@ class EvalRunner:
         if max_samples is not None:
             samples = samples[:max_samples]
 
+        calibration: dict[str, Any] = {}
+        if calibrate:
+            calibration = await self._maybe_calibrate(samples, calibration_samples)
+
         report = EvalReport(
             dataset_name=dataset.name,
             started_at=time.time(),
-            judge_model=getattr(self._judge, "_model", "") if self._judge else "",
-            candidate_model=getattr(self._judge, "_candidate_model", "") if self._judge else "",
-            judge_same_source=bool(self._judge and self._judge.same_source_as_candidate),
+            judge_model=self._judge_model(),
+            candidate_model=self._judge_candidate_model(),
+            judge_same_source=self._judge_same_source(),
+            calibration=calibration,
             metadata=metadata or {},
         )
 
@@ -326,6 +350,67 @@ class EvalRunner:
             judge_score=round(report.mean_judge_score, 3),
         )
         return report
+
+    # ------------------------------------------------------------------ #
+    # 裁判信息提取（同时兼容 LLMJudge 与 JudgePanel）
+    # ------------------------------------------------------------------ #
+
+    async def _maybe_calibrate(self, samples: list[GoldenSample], limit: int) -> dict[str, Any]:
+        """在正式评测前做一次偏差标定。
+
+        为什么用**真实样本**而不是构造样本：偏差是"同源裁判在真实分布上
+        偏多少"，用与评测同分布的样本标定才有代表性。
+
+        标定用的是**期望验收标准**（而非系统实际产出）—— 因为标定的目的是
+        测量"裁判这个模型的评分习惯"，与候选输出的质量分布关系不大。
+        这样可以在真正跑任务之前就完成标定，省一轮昂贵的编排执行。
+        """
+        if not isinstance(self._judge, JudgePanel) or self._judge.reference is None:
+            return {}
+
+        pool = samples[:limit] if limit > 0 else samples
+        if not pool:
+            return {}
+
+        triples = [
+            (
+                s.goal,
+                s.expected_criteria or ["完成用户目标"],
+                # 用验收标准文本本身作为"候选输出"：这是一个内容中性的探针，
+                # 让两个裁判对同样的输入打分，从而暴露它们的系统性差异。
+                "\n".join(s.expected_criteria or ["完成用户目标"]),
+            )
+            for s in pool
+        ]
+
+        calib = await self._judge.calibrate(triples)
+        return calib.to_dict() if calib is not None else {}
+
+    def _judge_model(self) -> str:
+        if self._judge is None:
+            return ""
+        if isinstance(self._judge, JudgePanel):
+            return self._judge._primary_model
+        return str(getattr(self._judge, "_model", ""))
+
+    def _judge_candidate_model(self) -> str:
+        if self._judge is None:
+            return ""
+        if isinstance(self._judge, JudgePanel):
+            return self._judge.candidate_model
+        return str(getattr(self._judge, "_candidate_model", ""))
+
+    def _judge_same_source(self) -> bool:
+        """裁判与候选是否同源。
+
+        ``JudgePanel`` 的情形直接看它的异构判定 —— 那是经过**模型族**比较的，
+        比 ``LLMJudge`` 里按模型名后缀比较更准确。
+        """
+        if self._judge is None:
+            return False
+        if isinstance(self._judge, JudgePanel):
+            return not self._judge.primary_is_heterogeneous
+        return bool(getattr(self._judge, "same_source_as_candidate", False))
 
     async def _evaluate_one(self, sample: GoldenSample) -> SampleOutcome:
         outcome = SampleOutcome(

@@ -195,6 +195,24 @@ class EvaluationConfig(BaseModel):
         default=True,
         description="启用双向评估以消除 LLM-as-Judge 的位置偏差",
     )
+
+    reference_judge_model: str = Field(
+        default="qwen:qwen-plus",
+        description=(
+            "异构参考裁判。与 judge_model **不同模型族**时，可用于标定"
+            "judge_model 的自我偏好偏差。留空则不做标定。"
+        ),
+    )
+
+    calibration_sample_limit: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "标定用的样本数上限。0 表示用数据集全部样本。"
+            "样本数低于 20 时标定结果不可靠，不会用于分数校正。"
+        ),
+    )
+
     report_dir: str = "reports/eval"
 
 

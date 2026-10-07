@@ -23,6 +23,7 @@ from devagent.evaluation import (
     GoldenSet,
     LLMJudge,
 )
+from devagent.evaluation.heterogeneous import JudgePanel
 from devagent.evaluation.judge import JudgeResult
 from devagent.evaluation.runner import SampleOutcome
 from devagent.models.provider import ChatMessage
@@ -395,6 +396,181 @@ class TestEvalRunner:
         data = json.loads(path.read_text(encoding="utf-8"))
         assert data["summary"]["total"] == 1
         assert len(data["outcomes"]) == 1
+
+
+# ---------------------------------------------------------------------- #
+# 运行器 × 异构裁判：标定结果必须进入报告
+# ---------------------------------------------------------------------- #
+
+
+def _calibratable_dataset(n: int = 25) -> GoldenSet:
+    """构造带验收标准、样本数足以通过可靠性门槛的数据集。
+
+    样本数必须 ≥ ``_MIN_CALIBRATION_SAMPLES``（20），否则标定结果会被
+    判为不可靠而**不用于校正** —— 那样就测不到校正逻辑。
+    """
+    return GoldenSet.from_dicts(
+        [
+            {
+                "id": f"s{i}",
+                "category": "req",
+                "goal": f"给用户列表加分页 {i}",
+                "expected_criteria": ["响应体包含 total 字段", "支持 page 与 size 参数"],
+            }
+            for i in range(n)
+        ],
+        name="calib",
+    )
+
+
+class _PerModelJudgeBackend:
+    """按**模型名**返回不同分数的裁判后端。
+
+    与 ``_ScriptedJudgeBackend`` 的区别：后者按调用顺序发牌，遇到
+    「主裁判与参考裁判交替调用」的场景很容易对错位，本类按模型名分派，
+    更贴近真实（真实里两个模型本来就是不同的端点）。
+    """
+
+    def __init__(self, scores: dict[str, float], *, default: float = 3.0) -> None:
+        self.scores = scores
+        self.default = default
+        self.models: list[str] = []
+
+    async def complete(self, messages: list[ChatMessage], *, model: str) -> str:
+        self.models.append(model)
+        return _judge_payload(self.scores.get(model, self.default))
+
+
+class TestEvalRunnerCalibration:
+    """验证标定链路：``JudgePanel`` → ``_maybe_calibrate`` → ``EvalReport``。"""
+
+    def _panel(self, backend: _PerModelJudgeBackend) -> JudgePanel:
+        return JudgePanel(
+            primary=LLMJudge(backend, model="deepseek:deepseek-chat", bidirectional=False),
+            reference=LLMJudge(backend, model="qwen:qwen-plus", bidirectional=False),
+            candidate_model="deepseek:deepseek-chat",
+        )
+
+    @staticmethod
+    def _dataset(n: int) -> GoldenSet:
+        return GoldenSet.from_dicts(
+            [{"id": f"s{i}", "category": "req", "goal": f"g{i}"} for i in range(n)],
+            name="test",
+        )
+
+    async def test_calibration_reaches_report(self) -> None:
+        """标定结果必须出现在报告里，而不是只进日志。
+
+        ``mean_judge_score`` 是否被校正过，直接决定读者怎么解读这个数字；
+        不写进报告就是误导。
+        """
+        # 主裁判系统性高估 +2 分
+        backend = _PerModelJudgeBackend({"deepseek:deepseek-chat": 5.0, "qwen:qwen-plus": 3.0})
+        runner = EvalRunner(task_runner=_FakeTaskRunner(), judge=self._panel(backend))
+
+        report = await runner.run(_calibratable_dataset(25))
+
+        assert report.calibration, "标定结果为空，说明链路断了"
+        assert report.calibration["judge_model"] == "deepseek:deepseek-chat"
+        assert report.calibration["reference_model"] == "qwen:qwen-plus"
+        assert report.calibration["sample_count"] == 25
+        assert report.calibration["bias"] == pytest.approx(2.0)
+        assert report.calibration["reliable"] is True
+
+        # summary() 是落盘与 API 返回的共同出口，必须带上
+        assert report.summary()["calibration"]["bias"] == pytest.approx(2.0)
+
+    async def test_calibration_corrects_scores_downward(self) -> None:
+        """偏差 +2 → 主裁判的 5.0 应被校正到 3.0 附近。
+
+        注意分母：标定与评估用的是同一套样本，因此校正后的分数应当
+        回到参考裁判的水平（3.0），而不是「随机变小」。
+        """
+        backend = _PerModelJudgeBackend({"deepseek:deepseek-chat": 5.0, "qwen:qwen-plus": 3.0})
+        runner = EvalRunner(task_runner=_FakeTaskRunner(), judge=self._panel(backend))
+
+        report = await runner.run(_calibratable_dataset(25))
+
+        assert report.mean_judge_score == pytest.approx(3.0, abs=1e-6)
+        judged = [o.judge for o in report.outcomes if o.judge is not None]
+        assert judged
+        for j in judged:
+            assert j is not None
+            # JudgePanel 的自检标签统一收在 raw["judge_panel"] 下，
+            # 以免与裁判后端返回的字段（scores/overall）混淆。
+            tags = j.raw["judge_panel"]
+            assert tags["calibrated"] is True
+            assert tags["judge_relation"] == "self"
+            assert tags["bias_applied"] == pytest.approx(2.0)
+
+    async def test_calibrate_false_skips_both_calibration_and_correction(self) -> None:
+        """``calibrate=False`` 必须同时跳过标定与校正 —— 只跳一半最危险。"""
+        backend = _PerModelJudgeBackend({"deepseek:deepseek-chat": 5.0, "qwen:qwen-plus": 3.0})
+        runner = EvalRunner(task_runner=_FakeTaskRunner(), judge=self._panel(backend))
+
+        report = await runner.run(_calibratable_dataset(25), calibrate=False)
+
+        assert report.calibration == {}
+        # 未校正 → 保留原始 5.0
+        assert report.mean_judge_score == pytest.approx(5.0)
+
+    async def test_insufficient_samples_are_marked_unreliable(self) -> None:
+        """样本不足时不得校正：用一个猜出来的偏差扣分比不扣更糟。"""
+        backend = _PerModelJudgeBackend({"deepseek:deepseek-chat": 5.0, "qwen:qwen-plus": 3.0})
+        runner = EvalRunner(task_runner=_FakeTaskRunner(), judge=self._panel(backend))
+
+        report = await runner.run(_calibratable_dataset(5))
+
+        assert report.calibration["sample_count"] == 5
+        assert report.calibration["reliable"] is False
+        # 不可靠 → 不校正，分数保持 5.0
+        assert report.mean_judge_score == pytest.approx(5.0)
+
+    async def test_judge_same_source_flag_from_panel(self) -> None:
+        """同源判定必须走 JudgePanel 的**模型族**比较，而非模型名后缀。
+
+        deepseek-chat 当裁判、deepseek-chat 当候选 —— 名字完全相同，
+        但旧实现按后缀比较容易出错；这里锁住 panel 的族判定结果。
+        """
+        backend = _PerModelJudgeBackend({"deepseek:deepseek-chat": 4.0, "qwen:qwen-plus": 4.0})
+        runner = EvalRunner(task_runner=_FakeTaskRunner(), judge=self._panel(backend))
+        report = await runner.run(self._dataset(1), calibrate=False)
+
+        assert report.judge_model == "deepseek:deepseek-chat"
+        assert report.candidate_model == "deepseek:deepseek-chat"
+        assert report.judge_same_source is True
+
+    async def test_plain_judge_path_has_no_calibration(self) -> None:
+        """普通 ``LLMJudge`` 不应触发标定 —— 回归保护。"""
+        backend = _ScriptedJudgeBackend([_judge_payload(4.0)] * 4)
+        judge = LLMJudge(backend, bidirectional=False)
+        runner = EvalRunner(task_runner=_FakeTaskRunner(), judge=judge)
+
+        report = await runner.run(self._dataset(2))
+
+        assert report.calibration == {}
+        assert report.mean_judge_score == pytest.approx(4.0)
+
+    async def test_calibration_does_not_consume_eval_samples(self) -> None:
+        """标定用样本与评估用样本是**两套独立调用**，不能互相消耗。
+
+        这点容易写错：若把标定的探针结果当成评估结果复用，
+        标定一开评测分数就会"凭空变好"。
+        """
+        backend = _PerModelJudgeBackend({"deepseek:deepseek-chat": 5.0, "qwen:qwen-plus": 3.0})
+        runner = EvalRunner(task_runner=_FakeTaskRunner(), judge=self._panel(backend))
+
+        report = await runner.run(_calibratable_dataset(25))
+
+        # 标定轮：25 样本 × 2 裁判 = 50 次
+        # 评估轮：25 样本 × 1 裁判（只有主裁判参与产出评分）= 25 次
+        # 参考裁判只在标定轮出现 —— 这正是「标定 ≠ 评估」的证据。
+        assert len(backend.models) == 75
+        assert backend.models.count("qwen:qwen-plus") == 25
+        assert report.total == 25
+        assert all(o.judge is not None for o in report.outcomes)
+        # 每个 outcome 的分数都来自**评估轮**，且都已被校正
+        assert report.mean_judge_score == pytest.approx(3.0, abs=1e-6)
 
 
 # ---------------------------------------------------------------------- #

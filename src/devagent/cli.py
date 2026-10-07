@@ -20,6 +20,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from devagent.config import get_settings
 from devagent.logging_config import configure_logging, get_logger
@@ -136,8 +137,7 @@ async def _cmd_run(args: argparse.Namespace) -> int:
 
 async def _cmd_eval(args: argparse.Namespace) -> int:
     from devagent.agents.base import AgentContextError
-    from devagent.evaluation import EvalRunner, GoldenSet, LLMJudge
-    from devagent.evaluation.judge import GatewayJudgeBackend
+    from devagent.evaluation import EvalRunner, GoldenSet, build_judge
     from devagent.models.gateway import ModelGateway
     from devagent.orchestration import Orchestrator
 
@@ -151,10 +151,11 @@ async def _cmd_eval(args: argparse.Namespace) -> int:
 
     judge = None
     if not args.no_judge:
-        judge = LLMJudge(
-            GatewayJudgeBackend(gateway),
-            model=settings.evaluation.judge_model,
-            bidirectional=settings.evaluation.enable_bidirectional_judge,
+        # 与 API 走同一个工厂，保证命令行与网页跑出的结论可比较
+        judge = build_judge(
+            gateway,
+            settings,
+            candidate_model=settings.routing.medium_model,
         )
 
     runner = EvalRunner(task_runner=orchestrator, judge=judge)
@@ -190,9 +191,42 @@ async def _cmd_eval(args: argparse.Namespace) -> int:
         print(f"  平均上下文节省：{summary['mean_context_savings']:.1%}")
         print(f"  总 token      ：{summary['total_tokens']}")
         print(f"  总成本        ：${summary['total_cost_usd']:.4f}")
+        _print_calibration(summary)
         print(f"  报告已写入    ：{output}")
 
     return 0
+
+
+def _print_calibration(summary: dict[str, Any]) -> None:
+    """打印裁判偏差标定结果。
+
+    单独抽出来，是因为这段输出的**存在本身**就是结论的一部分：
+    若裁判与被测模型同源且未标定，读者必须知道 ``平均裁判分`` 可能系统性偏高，
+    否则这个数字会被误读。
+
+    ``calibration`` 存在两种"没有值"的情况，必须区分：
+    - 空字典 → 未做标定（裁判已异构，或关闭了标定）
+    - 有值但 ``reliable=False`` → 做了标定但样本不足，**分数未被校正**
+    """
+    calib: dict[str, Any] = summary.get("calibration") or {}
+    if not calib:
+        if summary.get("judge_same_source"):
+            print("  裁判偏差      ：未标定（裁判与被测模型同族，分数可能系统性偏高）")
+        return
+
+    bias = calib.get("bias", 0.0)
+    if not calib.get("reliable", False):
+        print(
+            f"  裁判偏差      ：样本不足（{calib.get('sample_count', 0)} < 20），"
+            "标定不可靠，**分数未校正**"
+        )
+        return
+
+    print(
+        f"  裁判偏差      ：{bias:+.2f}（已校正，"
+        f"参考裁判 {calib.get('reference_model', '')}，"
+        f"{calib.get('sample_count', 0)} 样本）"
+    )
 
 
 # ---------------------------------------------------------------------- #

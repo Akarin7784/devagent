@@ -29,9 +29,31 @@
 - `GET /api/v1/cache` 端点 + 前端缓存看板（会明确提示"语义命中为 0"需关闭）
 - 43 个新测试（37 个判定逻辑 + 6 个网关接线）
 
+**异构裁判与偏差标定**
+
+- `JudgePanel`：主裁判 + 可选**异构参考裁判** + 标定出的偏差，三者在同一对象内闭环
+- **按模型族**判定异构（`deepseek-chat` 与 `deepseek-reasoner` 属同族，
+  名字不同不算异构）—— 误判为异构会让"异构裁判"变成自欺欺人
+- `model_family()` 显式处理裸模型名（无 `provider:` 前缀）的输入
+- `CalibrationResult`：`bias` / `relative_bias` / `trustworth`，样本数 < 20 时判为不可靠
+- 三种情形**刻意不同**地处理：
+  - 主裁判异构 → 直接用，标 `judge_relation=heterogeneous`（不浪费算力校正）
+  - 同源 + 已标定 → 按偏差扣减，并**用主裁判自己的阈值重算 `passed`**
+  - 同源 + 未标定 → **如实返回**并标 `uncalibrated_self_preference=true`，
+    绝不用猜出来的常数扣分（那会让分数看起来已被修正）
+- `build_judge()` 工厂：CLI 与 API 共用，保证两个入口的结论可比较；
+  配了同族参考裁判时直接拒绝（`reference_judge_same_family`）
+- `EvalReport.calibration` 字段 + `summary()` 输出 —— 分数是否被校正过
+  直接决定读者怎么解读 `mean_judge_score`，不写出来就是误导
+- 标定用**真实 golden set 的验收标准文本**作探针：内容中性、分布一致，
+  且能在跑昂贵的编排之前完成
+- CLI `devagent eval` 输出裁判偏差行，并区分三种"没有值"：
+  未标定（同族风险提示）/ 样本不足（明确说明**分数未校正**）/ 已校正（带符号的 bias）
+- 49 个新测试（35 个判定逻辑 + 8 个运行器接线 + 6 个 CLI 输出）
+- ADR-0008
+
 ### 计划中
 
-- 异构模型裁判（消除 LLM-as-Judge 的自我偏好偏差，见 ADR-0005 的局限章节）
 - 前端 DAG 可视化与 diff 查看器
 - 提示词注入防护（内容信任度分级）
 
