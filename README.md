@@ -197,7 +197,7 @@ devagent serve --port 8000
 | 可观测性 | `src/devagent/observability/` | 自研 Span/Metrics，可降级 OTLP |
 | 评测 | `src/devagent/evaluation/` | Golden set、双向 LLM-as-Judge、轨迹指标 |
 | API | `src/devagent/api/` | FastAPI + SSE 流式进度 |
-| 前端 | `web/` | 零构建控制台（原生 ES Module） |
+| 前端 | `web/` | 零构建控制台：DAG 依赖图 + diff 查看器（原生 ES Module） |
 
 ---
 
@@ -447,8 +447,41 @@ devagent serve --port 8000                # 启动 API
 curl -N http://localhost:8000/api/v1/tasks/<id>/events
 ```
 
-事件类型：`task.started` / `node.started` / `node.verdict` / `node.finished` / `task.finished`。
+事件类型：`task_started` / `node_started` / `node_verdict` / `node_finished` / `task_finished`。
 支持**历史回放**（晚订阅者也能拿到完整时间线），慢消费者采用丢弃最旧事件策略，绝不阻塞主流程。
+
+`node.*` 事件携带 `node_id` / `agent_type` / `deps` / `attempt` / `status`，
+前端据此**即时更新 DAG 依赖图**：`backtracked` 表示「判定未通过、将回退重跑」，
+`attempt` 递增对应重跑轮次（详见 [ADR-0010](docs/adr/0010-前端DAG自研层次布局.md)）。
+
+---
+
+## 前端
+
+`web/` 是**零构建**的依赖图控制台：无需 `npm install`，打开 `web/index.html` 即用。
+
+| 面板 | 内容 |
+| --- | --- |
+| 任务 DAG | 节点按状态着色（成功/执行中/回退/失败），`×N` 徽标显示重跑轮次 |
+| 节点详情 | 点击节点查看角色、依赖、token 与**代码改动 diff**（逐行着色） |
+| 执行时间线 | SSE 事件的原始流水，与 DAG 互为补充 |
+| 上下文看板 | token 节省、压缩比、预算利用率、缓存命中 |
+
+想在没有 API Key 的环境下看到完整 DAG：
+
+```bash
+# 启动注入了脚本化假模型的 API（真实路由 + 真实 SSE，仅模型被替换）
+PYTHONPATH=src python scripts/serve_demo.py --port 8812
+# 另开一个终端托管前端
+make web-serve          # http://localhost:5173
+# 浏览器打开：http://localhost:5173/?api=http://127.0.0.1:8812
+```
+
+前端逻辑（布局、事件叠加、diff 解析）可在无浏览器环境下测试：
+
+```bash
+make web-check          # node --check + 40 个纯逻辑断言
+```
 
 ---
 
@@ -458,12 +491,14 @@ curl -N http://localhost:8000/api/v1/tasks/<id>/events
 make test            # 全量（526 个）
 make test-unit       # 仅单元测试
 make check           # ruff + mypy --strict
+make web-check       # 前端语法 + 逻辑测试（40 个）
 ```
 
 当前状态：
 
 ```
 526 passed in 23.2s
+40 passed (web/graph.test.js)
 ruff check .......... 通过
 ruff format --check . 通过
 mypy --strict ....... 60 个源文件，0 错误
@@ -538,6 +573,14 @@ mypy --strict ....... 60 个源文件，0 错误
 
 为了让「clone 下来就能跑」成立。`web/` 使用原生 ES Module + 无构建步骤，
 打开 `index.html` 即可。零 `npm install` 意味着零依赖地狱。
+连 DAG 布局也是自研的约 200 行层次布局，而不是引入 d3 / mermaid —
+理由见 [ADR-0010](docs/adr/0010-前端DAG自研层次布局.md)。
+
+**DAG 图为什么不用 mermaid？**
+
+因为方向相反：mermaid 是**声明式**的（给它文本、它渲染静态图），
+而这里需要**实时更新**（节点状态随 SSE 事件逐秒变化）。用 mermaid
+意味着每次事件都重建整图，既慢又会丢失用户的选中状态。
 
 **支持哪些模型？**
 
