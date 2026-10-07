@@ -1,0 +1,105 @@
+name: Bug 报告
+description: 报告一个可复现的缺陷
+title: "[Bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。请尽量提供可复现的最小信息。
+        **注意脱敏**：不要粘贴 API Key、内网地址或真实业务数据。
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 问题描述
+      description: 实际发生了什么？
+      placeholder: 执行 `devagent run "..."` 时……
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+      description: 你认为应该发生什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 尽量最小化。如果能用 `scripts/demo_smoke.py` 复现最好。
+      placeholder: |
+        1. 配置 `DEEPSEEK_API_KEY`
+        2. 执行 `devagent run "为 /users 增加分页"`
+        3. 观察到……
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志
+      description: 推荐用 `--log-json` 输出后粘贴关键片段
+      render: shell
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: 涉及模块
+      description: 如果不确定，选「不确定」
+      multiple: true
+      options:
+        - 上下文工程 (context)
+        - 编排 (orchestration)
+        - Agent (agents)
+        - 模型网关 (models)
+        - API / SSE (api)
+        - 前端 (web)
+        - 评测 (evaluation)
+        - 可观测性 (observability)
+        - 可靠性 (reliability)
+        - 沙箱 / 工具 (tools)
+        - CLI
+        - 不确定
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / 提交
+      description: 输出 `devagent --version` 或给出 commit hash
+      placeholder: "0.1.0 / abc1234"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python 版本
+      placeholder: "3.13.12"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: 操作系统
+      placeholder: "Windows 11 / Ubuntu 24.04 / macOS 15"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: 模型供应商
+      multiple: true
+      options:
+        - DeepSeek
+        - 通义千问
+        - 智谱
+        - 其他 OpenAI 兼容
+        - 未配置（用了 demo_smoke.py）

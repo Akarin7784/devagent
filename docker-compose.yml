@@ -1,0 +1,95 @@
+# DevAgent 本地开发依赖服务
+#
+# 说明：项目默认以**内存模式**运行，不需要任何外部服务即可跑通冒烟与全量测试。
+# 本文件用于需要持久化 / 向量检索 / 分布式缓存时的完整部署。
+#
+# 启动：docker compose up -d
+# 停止：docker compose down
+# 清空数据：docker compose down -v
+
+services:
+  # ------------------------------------------------------------------ #
+  # PostgreSQL + pgvector（任务持久化 + 代码向量检索）
+  # ------------------------------------------------------------------ #
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: devagent-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: devagent
+      POSTGRES_PASSWORD: devagent
+      POSTGRES_DB: devagent
+      # 中文环境下建议显式指定，避免排序行为不一致
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devagent -d devagent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ------------------------------------------------------------------ #
+  # Redis（语义缓存共享 + 任务队列）
+  # ------------------------------------------------------------------ #
+  redis:
+    image: redis:7-alpine
+    container_name: devagent-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ------------------------------------------------------------------ #
+  # 应用本体（可选：本地开发时更推荐直接 uvicorn --reload）
+  # ------------------------------------------------------------------ #
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: devagent-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DEVAGENT_ENV: docker
+      DEVAGENT_DB__URL: postgresql+asyncpg://devagent:devagent@postgres:5432/devagent
+      DEVAGENT_REDIS__URL: redis://redis:6379/0
+      # 模型 Key 从宿主机环境透传（不要写进本文件）
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      QWEN_API_KEY: ${QWEN_API_KEY:-}
+      ZHIPU_API_KEY: ${ZHIPU_API_KEY:-}
+      DEVAGENT_OBSERVABILITY__METRICS_ENABLED: "true"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    profiles: ["full"]
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local

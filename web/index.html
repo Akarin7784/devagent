@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DevAgent · 多 Agent 协作研发助手</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">DA</span>
+      <div>
+        <h1>DevAgent</h1>
+        <p class="subtitle">多 Agent 协作 · 上下文工程驱动</p>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span id="health-badge" class="badge badge-muted">连接中…</span>
+      <input id="api-base" class="api-input" value="" placeholder="API 地址（留空=同源）" />
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- 左栏：任务提交 + 列表 -->
+    <section class="panel panel-left">
+      <h2>提交需求</h2>
+      <form id="task-form" class="stack">
+        <textarea id="goal" rows="5" placeholder="例如：为 /users 接口增加分页参数，非法参数返回 400"></textarea>
+        <div class="row">
+          <label class="checkbox">
+            <input type="checkbox" id="use-observability" checked />
+            采集上下文指标
+          </label>
+          <button type="submit" class="btn btn-primary">开始执行</button>
+        </div>
+      </form>
+
+      <h2 class="mt">任务列表</h2>
+      <ul id="task-list" class="task-list"></ul>
+    </section>
+
+    <!-- 中栏：执行时间线 -->
+    <section class="panel panel-mid">
+      <div class="panel-head">
+        <h2>执行时间线</h2>
+        <div class="legend">
+          <span class="dot dot-running"></span>运行中
+          <span class="dot dot-ok"></span>成功
+          <span class="dot dot-fail"></span>失败
+        </div>
+      </div>
+      <div id="summary" class="summary hidden"></div>
+      <ol id="timeline" class="timeline">
+        <li class="empty">提交一个需求后，这里会显示实时执行事件</li>
+      </ol>
+    </section>
+
+    <!-- 右栏：上下文工程看板 -->
+    <section class="panel panel-right">
+      <div class="panel-head">
+        <h2>上下文工程看板</h2>
+        <button id="refresh-context" class="btn btn-ghost">刷新</button>
+      </div>
+      <div id="context-metrics" class="metrics">
+        <p class="empty">执行任务后，这里会显示 token 节省、压缩比与预算利用率</p>
+      </div>
+      <h3 class="mt-sm">指标快照</h3>
+      <pre id="raw-metrics" class="code">—</pre>
+    </section>
+  </main>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

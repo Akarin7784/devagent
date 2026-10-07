@@ -1,0 +1,172 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "devagent"
+version = "0.1.0"
+description = "Multi-agent collaborative software development assistant with context engineering at its core"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+authors = [{ name = "DevAgent Contributors" }]
+keywords = ["ai", "agent", "llm", "multi-agent", "context-engineering", "code-generation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Code Generators",
+]
+
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "httpx>=0.27.0",
+    "sqlalchemy>=2.0.36",
+    "alembic>=1.14.0",
+    "asyncpg>=0.30.0",
+    "redis>=5.2.0",
+    "pgvector>=0.3.6",
+    "sse-starlette>=2.1.0",
+    "tenacity>=9.0.0",
+    "structlog>=24.4.0",
+    "opentelemetry-api>=1.28.0",
+    "opentelemetry-sdk>=1.28.0",
+    "tree-sitter>=0.23.0",
+    "tree-sitter-python>=0.23.0",
+    "numpy>=2.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "pytest-mock>=3.14.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+    "types-redis>=4.6.0",
+    "pre-commit>=4.0.0",
+]
+sandbox = [
+    "docker>=7.1.0",
+]
+eval = [
+    "pandas>=2.2.0",
+    "tabulate>=0.9.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/devagent/devagent"
+Documentation = "https://github.com/devagent/devagent/tree/main/docs"
+Repository = "https://github.com/devagent/devagent"
+Issues = "https://github.com/devagent/devagent/issues"
+
+[project.scripts]
+devagent = "devagent.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/devagent"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+    "ARG",  # flake8-unused-arguments
+    "SIM",  # flake8-simplify
+    "TID",  # flake8-tidy-imports
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # function call in default argument (needed for FastAPI Depends)
+    # 本项目文档与注释使用中文，全角标点（，。：（））是**正确**写法，
+    # 不应被判定为 ambiguous unicode。这三个规则对中文项目是纯噪音。
+    "RUF001", # ambiguous-unicode-character-string
+    "RUF002", # ambiguous-unicode-character-docstring
+    "RUF003", # ambiguous-unicode-character-comment
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ARG001", "ARG002"]
+# 冒烟脚本中的假 Provider 必须与 ModelProvider Protocol 的完整签名保持一致
+# （含它不使用的参数），否则无法通过类型检查替换真实实现。
+"scripts/demo_smoke.py" = ["ARG002"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["devagent"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_any_generics = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+show_error_codes = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["tree_sitter.*", "tree_sitter_python.*"]
+ignore_missing_imports = true
+
+# 可选依赖：在代码中用 try/except ImportError 惰性导入并优雅降级，
+# 因此未安装时不应报 import-not-found（这是「可选」的定义）。
+[[tool.mypy.overrides]]
+module = [
+    "opentelemetry.*",
+    "uvicorn.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+# 产品类 TesterAgent / TestRunOutcome 名称以 Test 开头，
+# pytest 会尝试收集但它们带 __init__ 因而被跳过，仅产生噪音警告。
+filterwarnings = [
+    "ignore::UserWarning",
+]
+markers = [
+    "unit: unit tests (fast, no external deps)",
+    "integration: integration tests (require DB/Redis)",
+    "e2e: end-to-end tests (require LLM API keys)",
+    "slow: slow running tests",
+]
+
+[tool.coverage.run]
+source = ["src/devagent"]
+branch = true
+omit = ["*/tests/*", "*/migrations/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@abstractmethod",
+]

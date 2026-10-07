@@ -1,0 +1,62 @@
+# 预提交检查：在 git commit 时自动运行
+#
+# 安装：pre-commit install
+# 手动全量运行：pre-commit run --all-files
+
+default_language_version:
+  python: python3.13
+
+repos:
+  # ------------------------------------------------------------------ #
+  # 通用文件检查
+  # ------------------------------------------------------------------ #
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '\.(md|jsonl)$'   # Markdown 行尾双空格是换行语法
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+        exclude: '\.vscode/'       # VSCode 配置允许 JSONC 注释
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: detect-private-key
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+
+  # ------------------------------------------------------------------ #
+  # Ruff：lint + format
+  # ------------------------------------------------------------------ #
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # ------------------------------------------------------------------ #
+  # Mypy：类型检查（只查 src，与 CI 一致）
+  # ------------------------------------------------------------------ #
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.13.0
+    hooks:
+      - id: mypy
+        files: ^src/
+        args: [--strict, --config-file=pyproject.toml]
+        additional_dependencies:
+          - pydantic>=2.9.0
+          - pydantic-settings>=2.6.0
+          - fastapi>=0.115.0
+          - structlog>=24.4.0
+
+  # ------------------------------------------------------------------ #
+  # 安全：阻止提交密钥
+  # ------------------------------------------------------------------ #
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks

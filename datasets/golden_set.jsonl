@@ -1,0 +1,28 @@
+# Golden Set — 上下文工程评测基准
+#
+# 格式：JSONL（每行一个 JSON 对象，# 开头为注释行）
+# 字段说明：
+#   id                 唯一标识（规则：<category>-<序号>）
+#   category           场景类别，用于分组统计
+#   goal               交给系统的自然语言需求
+#   expected_criteria  期望被识别为「可验收」的标准
+#   forbidden_criteria 期望被**剔除**的不可验收表述（测试需求 Agent 的过滤能力）
+#   tags               自由标签，便于切分
+#
+# 设计意图：
+#   1. requirement 类样本带 forbidden_criteria —— 直接检验「不可验证词过滤」是否生效；
+#   2. context 类样本刻意构造高冗余输入 —— 检验装配算法的硬去重与非线性冗余惩罚；
+#   3. scale 类样本给超大上下文 —— 检验预算分配与压缩阈值是否按预期触发。
+{"id": "req-001", "category": "requirement", "goal": "为 /users 接口增加分页参数", "expected_criteria": ["支持 page 参数", "支持 page_size 参数", "非法参数返回 400"], "forbidden_criteria": ["运行流畅", "代码优雅", "性能良好"], "tags": ["api", "validation"]}
+{"id": "req-002", "category": "requirement", "goal": "给用户列表加个搜索框，能按名字找", "expected_criteria": ["支持按 name 模糊匹配", "空关键词返回全部", "结果按相关性排序"], "forbidden_criteria": ["体验友好", "界面美观"], "tags": ["api", "search"]}
+{"id": "req-003", "category": "requirement", "goal": "订单表加一个软删除字段，删除后列表不再显示", "expected_criteria": ["新增 deleted_at 字段", "默认查询过滤已删除记录", "提供恢复接口"], "forbidden_criteria": ["逻辑合理", "尽量高效"], "tags": ["db", "migration"]}
+{"id": "req-004", "category": "requirement", "goal": "登录接口要做限流，防止暴力破解", "expected_criteria": ["同一 IP 每分钟最多 5 次尝试", "超过阈值返回 429", "锁定时长可配置"], "forbidden_criteria": ["安全性高", "适当防刷"], "tags": ["security", "rate-limit"]}
+{"id": "req-005", "category": "requirement", "goal": "把配置文件从 JSON 换成 YAML，同时保持向后兼容", "expected_criteria": ["支持 .yaml 与 .yml 后缀", "检测到 .json 时仍可解析", "解析失败给出明确错误行号"], "forbidden_criteria": ["格式优雅", "扩展性好"], "tags": ["config", "compat"]}
+{"id": "ctx-001", "category": "context", "goal": "重构 utils.py 中的日期处理函数，统一使用 datetime 而非字符串拼接", "expected_criteria": ["移除所有字符串日期拼接", "统一走 datetime 对象", "保持对外函数签名不变"], "tags": ["refactor", "dedup"]}
+{"id": "ctx-002", "category": "context", "goal": "修复缓存穿透问题，空结果也要写入短 TTL 缓存", "expected_criteria": ["空结果写入缓存且 TTL <= 60s", "正常结果 TTL 不受影响", "增加缓存命中率埋点"], "tags": ["cache", "fix"]}
+{"id": "ctx-003", "category": "context", "goal": "给现有 DAG 调度器增加节点超时中断能力", "expected_criteria": ["每个节点支持 timeout 配置", "超时节点标记为 FAILED 且原因含 timeout", "超时后下游节点标记 SKIPPED"], "tags": ["orchestration", "feature"]}
+{"id": "scale-001", "category": "scale", "goal": "在一个 20 个模块的仓库里定位所有直接读写数据库的地方并统一收敛到 repository 层", "expected_criteria": ["列出全部直接 DB 调用点", "给出 repository 接口设计", "保持行为等价"], "tags": ["large-context", "migration"]}
+{"id": "scale-002", "category": "scale", "goal": "为现有 15 个 HTTP 接口补齐统一错误响应格式", "expected_criteria": ["定义统一错误结构 code/message/detail", "所有接口失败路径返回该结构", "不改变成功响应格式"], "tags": ["large-context", "api"]}
+{"id": "edge-001", "category": "edge_case", "goal": "优化一下系统", "expected_criteria": ["通过追问澄清具体优化目标", "给出可验收的量化标准"], "forbidden_criteria": ["性能提升 10 倍", "明显改善"], "tags": ["ambiguous", "clarify"]}
+{"id": "edge-002", "category": "edge_case", "goal": "让代码更好一点", "expected_criteria": ["识别需求不可验收并追问", "列出候选的可量化改进方向"], "forbidden_criteria": ["代码更优雅", "质量更高"], "tags": ["ambiguous", "clarify"]}
+{"id": "edge-003", "category": "edge_case", "goal": "删除用户时不要真的删除数据，但也要让用户查不到自己的信息", "expected_criteria": ["采用软删除实现", "用户侧查询返回 404", "保留恢复能力"], "tags": ["conflict", "soft-delete"]}

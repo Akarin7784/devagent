@@ -1,0 +1,36 @@
+name: 配置 / 文档问题
+description: 文档错误、配置疑问、使用求助
+title: "[Docs] "
+labels: ["documentation", "question"]
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: 类型
+      options:
+        - 文档有错误
+        - 文档缺失
+        - 配置不知道怎么填
+        - 想确认某个行为是否符合预期
+        - 其他
+    validations:
+      required: true
+
+  - type: input
+    id: location
+    attributes:
+      label: 相关文档 / 位置
+      placeholder: "README.md 的「配置」章节 / ADR-0002"
+
+  - type: textarea
+    id: detail
+    attributes:
+      label: 具体说明
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: 你已经尝试过什么
+      description: 这能帮我们判断是文档问题还是真实缺陷

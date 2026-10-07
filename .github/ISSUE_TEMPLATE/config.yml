@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 问题讨论
+    url: https://github.com/devagent/devagent/discussions
+    about: 使用疑问、设计讨论、想法分享请走 Discussions
+  - name: 安全漏洞
+    url: https://github.com/devagent/devagent/security/advisories/new
+    about: 请勿在公开 Issue 中披露安全问题，使用私密渠道
