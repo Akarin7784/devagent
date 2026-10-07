@@ -280,6 +280,12 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8000, gt=0, le=65535)
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
 
+    # 前端静态托管。
+    # 默认 None = 不托管，`GET /` 返回 API 元信息 JSON（保持既有行为与测试）。
+    # 设为目录路径（如 "web"）后，该目录会被挂载到 `/`，
+    # 于是「后端 + 前端」同源，一个地址即可访问，无跨域、无 ?api= 参数。
+    web_dir: str | None = None
+
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     redis: RedisConfig = Field(default_factory=RedisConfig)

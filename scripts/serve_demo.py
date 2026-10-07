@@ -34,13 +34,18 @@ sys.path.insert(0, str(_ROOT / "src"))
 sys.path.insert(0, str(_ROOT / "scripts"))
 
 
-def build_app(port: int = 8812):
+def build_app(port: int = 8812, web_dir: str | None = "web"):
     """构造注入了 DemoProvider 的 FastAPI 应用。
 
-    关键点：**orchestrator 必须用新网关重建**。
+    关键点一：**orchestrator 必须用新网关重建**。
     只替换 `app.state.gateway` 是无效的 —— `create_app` 在 lifespan 里
     已经用旧网关构造了 `Orchestrator`，而 Orchestrator 是按值持有网关引用的。
     这是一个很容易踩的坑：替换后「看起来什么都没变」，任务依旧走真实供应商。
+
+    关键点二：**默认把 `web/` 挂到根路径**（同源托管）。
+    分端口运行时前端必须靠 `?api=` 才知道后端在哪，这个参数一旦丢失
+    （直接敲 5173、或从收藏夹打开）界面就报「无法连接到服务端」。
+    同源后基址恒为空，问题从根上消失。传 `web_dir=None` 可关闭。
     """
     from demo_smoke import DemoProvider
 
@@ -51,6 +56,9 @@ def build_app(port: int = 8812):
     from devagent.orchestration import Orchestrator
 
     settings = get_settings()
+    # 演示服务器默认同源托管前端；通过环境变量可覆盖。
+    if web_dir is not None:
+        settings.web_dir = web_dir
     app = create_app(settings)
     # `app.router.lifespan_context` 已经是 `@asynccontextmanager` 包装后的
     # **可调用对象**（Starlette 在 `Router.__init__` 里替原始 lifespan 包好了）。
@@ -81,8 +89,8 @@ def build_app(port: int = 8812):
                 bus=inner_app.state.bus,
             )
             print(
-                f"[serve_demo] 已注入脚本化假模型，"
-                f"打开 web/index.html?api=http://127.0.0.1:{port} 查看 DAG",
+                f"[serve_demo] 已注入脚本化假模型\n"
+                f"[serve_demo] 界面与接口同源，直接打开：http://127.0.0.1:{port}/",
                 flush=True,
             )
             yield
@@ -95,11 +103,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="DevAgent 演示服务器（假模型 + 真实 API）")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8812)
+    parser.add_argument(
+        "--web-dir",
+        default="web",
+        help="前端静态目录（相对项目根）；传空字符串则仅提供 API",
+    )
     args = parser.parse_args()
 
     import uvicorn
 
-    uvicorn.run(build_app(args.port), host=args.host, port=args.port, log_level="info")
+    app = build_app(args.port, web_dir=args.web_dir or None)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 
 

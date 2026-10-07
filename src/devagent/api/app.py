@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -129,7 +130,64 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "api_prefix": "/api/v1",
         }
 
+    _maybe_mount_frontend(app, resolved)
+
     return app
+
+
+def _maybe_mount_frontend(app: FastAPI, settings: Settings) -> Path | None:
+    """把前端静态目录挂载到 `/`，实现同源访问。
+
+    为什么需要：前后端分端口运行时，前端必须靠 ``?api=`` 参数才知道后端在哪。
+    这个参数一旦丢失（用户直接敲 ``localhost:5173``、或从收藏夹打开），
+    前端就会把请求打到自己的静态服务器上，得到 404，界面显示
+    「无法连接到服务端」—— 一个**纯配置问题伪装成服务故障**的典型陷阱。
+    同源托管后基址恒为空，问题从根上消失。
+
+    挂载点必须在 ``/api/v1`` 已注册**之后**：Starlette 按注册顺序匹配路由，
+    先挂 ``/`` 会吞掉所有 API 请求。这里通过「先注册 API、最后挂载前端」的顺序
+    保证 API 优先级。
+
+    返回实际挂载的目录；未启用或目录不存在时返回 ``None``。
+    """
+    from fastapi.staticfiles import StaticFiles
+
+    raw = (settings.web_dir or "").strip()
+    if not raw:
+        return None
+
+    # 相对路径按「项目根」解析 —— 而项目根是 config.py 往上三层
+    # （src/devagent/config.py -> src/devagent -> src -> 项目根），
+    # 这样无论从哪个工作目录启动服务都能定位到 web/。
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = Path(__file__).resolve().parents[3] / raw
+
+    if not candidate.is_dir():
+        logger.warning("web_dir_not_found", web_dir=str(candidate))
+        return None
+
+    index = candidate / "index.html"
+    if not index.is_file():
+        logger.warning("web_dir_without_index", web_dir=str(candidate))
+        return None
+
+    # `GET /` 已在上文注册，Starlette 按注册顺序匹配 —— 若不处理，根路径仍会
+    # 命中那个 JSON 端点，而不是 index.html。这里把该路由从表里摘掉，
+    # 让后面的 mount 接管。摘除而非「后注册覆盖」是因为路由匹配是**首个命中即返回**，
+    # 后注册的同路径路由永远不会被走到。
+    app.routes[:] = [
+        r
+        for r in app.routes
+        if not (getattr(r, "path", None) == "/" and "GET" in (getattr(r, "methods", None) or set()))
+    ]
+
+    # html=True 让 `/` 回落到 index.html；SPA 用 hash 路由（#/workbench），
+    # 不经过服务端，因此无需额外的 catch-all 重写规则。
+    app.mount("/", StaticFiles(directory=str(candidate), html=True), name="web")
+
+    logger.info("frontend_mounted", web_dir=str(candidate))
+    return candidate
 
 
 def _debug_enabled() -> bool:
