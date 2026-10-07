@@ -120,22 +120,57 @@ const EVENT_LABELS = {
   task_cancelled: '任务取消',
   node_started: '节点开始',
   node_finished: '节点完成',
+  node_verdict: '验证判定',
   ping: '心跳',
 };
 
-function timelineItem(ev) {
+/** 事件的视觉分类，决定时间线条目左侧色条。 */
+function eventTone(ev) {
+  if (ev.kind === 'node_verdict') {
+    return ev.verdict === 'pass' ? 'ok' : 'fail';
+  }
+  if (ev.kind === 'node_finished') {
+    if (ev.status === 'success') return 'ok';
+    if (ev.status === 'failed') return 'fail';
+    if (ev.status === 'backtracked') return 'warn';
+    if (ev.status === 'skipped') return 'muted';
+    return 'running';
+  }
+  if (ev.kind === 'task_finished') return ev.succeeded ? 'ok' : 'fail';
+  if (ev.kind === 'task_cancelled') return 'fail';
+  if (ev.kind === 'task_started' || ev.kind === 'node_started') return 'running';
+  return 'muted';
+}
+
+/** 时间线条目的标题：节点事件优先显示节点 id + 角色。 */
+function eventTitle(ev) {
   const label = EVENT_LABELS[ev.kind] || ev.kind;
+  if (ev.node_id) return `${label} · ${ev.node_id}${ev.agent_type ? ` (${ev.agent_type})` : ''}`;
+  return label;
+}
+
+function timelineItem(ev) {
+  const tone = eventTone(ev);
+  // 已经体现在标题里的字段不再重复展示
+  const skip = new Set(['kind', 'task_id', 'timestamp', 'node_id', 'agent_type', 'verdict']);
   const body = Object.entries(ev)
-    .filter(([k]) => !['kind', 'task_id', 'timestamp'].includes(k))
+    .filter(([k, v]) => !skip.has(k) && v !== '' && v != null && !(Array.isArray(v) && !v.length))
     .map(([k, v]) => {
-      const val = typeof v === 'object' ? JSON.stringify(v) : v;
-      return `${k}: ${esc(String(val).slice(0, 160))}`;
+      let val;
+      if (Array.isArray(v)) {
+        val = v.join('；');
+      } else if (typeof v === 'object') {
+        val = JSON.stringify(v);
+      } else {
+        val = v;
+      }
+      return `<span class="ev-field"><b>${esc(k)}</b> ${esc(String(val).slice(0, 200))}</span>`;
     })
-    .join(' · ');
-  return `<li class="ev-${esc(ev.kind)}">
+    .join('');
+  return `<li class="ev tone-${tone}">
       <span class="ev-time">${fmtTime(ev.timestamp)}</span>
-      <span class="ev-kind">${esc(label)}</span>
-      <div class="ev-body">${body}</div>
+      <span class="ev-title">${esc(eventTitle(ev))}</span>
+      ${body ? `<div class="ev-body">${body}</div>` : ''}
     </li>`;
 }
 
@@ -173,43 +208,53 @@ function renderSummary(data) {
     ${data.error ? `<div class="ev-body" style="color:var(--fail);margin-top:8px">${esc(data.error)}</div>` : ''}`;
 }
 
-/** 上下文工程看板 —— 本项目最有展示价值的一块。 */
+/**
+ * 上下文工程看板 —— 本项目最有展示价值的一块。
+ *
+ * 数据来自 `GET /tasks/{id}/context`，结构为：
+ *   { task_id, metrics: { tokens_saved, chunks_dropped,
+ *                         compression_ratio: {count, sum, mean, min, max},
+ *                         utilization:       {count, sum, mean, min, max, p50, p90} } }
+ * 这些数值是**进程级累计**（非单任务切片），因此文案上标注清楚，
+ * 避免读者误以为只统计了当前任务。
+ */
 function renderContextMetrics(payload) {
   const container = $('context-metrics');
   const m = payload?.metrics || {};
-  const saved = m.tokens_saved ?? 0;
-  const dropped = m.chunks_dropped ?? 0;
+  const saved = Math.round(m.tokens_saved ?? 0);
+  const dropped = Math.round(m.chunks_dropped ?? 0);
   const ratio = m.compression_ratio || {};
   const util = m.utilization || {};
 
-  const rows = [];
+  const rows = [
+    metricRow('上下文节省 token（累计）', saved.toLocaleString('zh-CN'), null),
+    metricRow('装配淘汰片段数（累计）', String(dropped), null),
+  ];
 
-  if (saved > 0) {
-    rows.push(metricRow('上下文节省 token', String(saved), null));
-  }
-  if (dropped > 0) {
-    rows.push(metricRow('装配淘汰片段数', String(dropped), null));
-  }
   if (ratio.count) {
+    const mean = ratio.mean ?? 0;
+    const pct = (1 - mean) * 100;   // 压缩比 <1 表示省下来了
     rows.push(metricRow(
-      '压缩比（压缩后/压缩前）',
-      `${(ratio.mean ?? 0).toFixed(3)}  (${ratio.count} 次)`,
-      ratio.mean ?? 0,
+      '压缩比 = 压缩后/压缩前',
+      `${mean.toFixed(3)}  （省 ${pct.toFixed(1)}%，${ratio.count | 0} 次）`,
+      pct / 100,
     ));
   }
+
   if (util.count) {
     rows.push(metricRow(
       '预算利用率',
-      `${(util.mean ?? 0).toFixed(1)}%  (p90 ${(util.p90 ?? 0).toFixed(1)}%)`,
+      `${(util.mean ?? 0).toFixed(1)}%   p90 ${(util.p90 ?? 0).toFixed(1)}%   n=${util.count | 0}`,
       (util.mean ?? 0) / 100,
     ));
   }
 
-  if (!rows.length) {
-    container.innerHTML = '<p class="empty">当前任务暂无上下文压缩记录（输入未超阈值或未启用指标采集）</p>';
-    return;
-  }
-  container.innerHTML = rows.join('');
+  const hint = saved === 0 && dropped === 0 && !ratio.count && !util.count
+    ? '<p class="empty">暂无上下文记录：可能未启用指标采集（启动时加 <code>--trace</code> 或设 '
+      + '<code>DEVAGENT_OBSERVABILITY__METRICS_ENABLED=true</code>），或本任务输入未超压缩阈值。</p>'
+    : '<p class="hint">数值为服务进程内的累计值，非单个任务切片。</p>';
+
+  container.innerHTML = rows.join('') + hint;
 }
 
 function metricRow(name, value, ratio) {
@@ -245,14 +290,14 @@ function subscribe(taskId) {
       payload = { raw: e.data };
     }
     if (kind !== 'ping') appendTimeline({ kind, ...payload });
-    if (kind === 'task_finished') {
+    if (kind === 'task_finished' || kind === 'task_cancelled') {
       es.close();
       state.stream = null;
       refreshTask(taskId);
     }
   };
 
-  ['task_started', 'task_finished', 'task_cancelled', 'node_started', 'node_finished', 'ping']
+  ['task_started', 'task_finished', 'task_cancelled', 'node_started', 'node_finished', 'node_verdict', 'ping']
     .forEach((kind) => es.addEventListener(kind, handle(kind)));
 
   es.onerror = () => {
@@ -313,7 +358,9 @@ async function bootstrap() {
 
   try {
     const h = await api.health();
-    renderHealth(true, `${h.providers.length} 个提供商 · obs=${h.observability_enabled}`);
+    const providers = Array.isArray(h.providers) ? h.providers : [];
+    const names = providers.length ? providers.join('/') : '未配置（仅离线冒烟）';
+    renderHealth(true, `${names} · 指标=${h.observability_enabled ? '开' : '关'}`);
   } catch (err) {
     renderHealth(false, String(err.message || err));
   }

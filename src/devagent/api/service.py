@@ -52,6 +52,30 @@ class TaskService:
         self._bus = bus or EventBus()
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._running: dict[str, asyncio.Task[None]] = {}
+        # 把 Orchestrator 的进度回调接到 EventBus，使 DAG 节点的开始/完成/判定
+        # 能实时推给前端。task_id 在回调时需要，因此用「当前执行中的任务 id」
+        # 传递 —— 编排器一次 run 只对应一个 task_id，且 _execute 内是串行发起。
+        self._current_task_id: str = ""
+        """当前执行中的任务 id（供进度回调定位；一次 run 只对应一个）。"""
+
+        self._current_goal: str = ""
+        """当前任务的 goal（供 task_started 事件携带）。"""
+
+        orchestrator._on_event = self._on_orchestrator_event
+
+    def _on_orchestrator_event(self, kind: str, payload: dict[str, Any]) -> None:
+        """将编排器进度回调转为 SSE 事件。
+
+        注意：这是同步回调（编排器不便 await 每个事件），而 ``bus.publish``
+        也是同步的（内部用 put_nowait + 丢最旧策略），因此无需 async。
+        """
+        tid = self._current_task_id
+        if not tid:
+            return
+        # 把当前 goal 附在第一个事件上，前端据此显示任务标题
+        if kind == "task_started":
+            payload = {"goal": self._current_goal, **payload}
+        self._publish(tid, kind, payload)
 
     @property
     def bus(self) -> EventBus:
@@ -93,6 +117,9 @@ class TaskService:
     async def _execute(self, task_id: str, goal: str) -> None:
         """后台执行任务，全程发事件。"""
         async with self._semaphore:
+            # 供进度回调定位当前任务（见 _on_orchestrator_event）
+            self._current_task_id = task_id
+            self._current_goal = goal
             self._publish(task_id, "task_started", {"goal": goal})
             self._update(task_id, {"status": TaskStatus.RUNNING.value})
             started = time.perf_counter()
@@ -130,6 +157,9 @@ class TaskService:
             finally:
                 self._bus.close(task_id)
                 self._running.pop(task_id, None)
+                if self._current_task_id == task_id:
+                    self._current_task_id = ""
+                    self._current_goal = ""
 
     def _publish(self, task_id: str, kind: str, payload: dict[str, Any]) -> None:
         self._bus.publish(TaskEvent(kind=kind, task_id=task_id, payload=payload))

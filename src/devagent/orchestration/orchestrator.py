@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -59,6 +60,11 @@ from devagent.reliability import (
 )
 
 logger = get_logger(__name__)
+
+# 进度事件回调签名：(kind, payload)。kind 如 node_started / node_finished。
+# 用普通 Callable 而不是 Protocol，是为了让调用方可以直接传一个 sync 函数
+# （API 层内部转成 EventBus publish），无需定义类。
+EventHook = Callable[[str, dict[str, Any]], None]
 
 
 class OrchestrationError(RuntimeError):
@@ -115,10 +121,13 @@ class Orchestrator:
         config: OrchestratorConfig | None = None,
         checkpoint_store: TaskCheckpointStore | None = None,
         test_runner: Any = None,
+        on_event: EventHook | None = None,
     ) -> None:
         self._settings = settings
         self._gateway = gateway or ModelGateway(settings)
         self._context = context_engine or ContextEngine(settings.context)
+        # 进度回调：可选、纯观测性，失败绝不影响编排（见 _emit 的注释）。
+        self._on_event = on_event
         self._config = config or OrchestratorConfig(
             max_steps=settings.reliability.max_task_steps,
             max_tokens=settings.reliability.max_task_tokens,
@@ -148,6 +157,26 @@ class Orchestrator:
         """当前运行实例标识，用于区分「同次运行的重试」与「跨运行恢复」。"""
         self._task_span: Span | None = None
         """任务根 span。节点 span 挂在其下，形成完整调用树。"""
+
+    # ------------------------------------------------------------------ #
+    # 进度事件
+    # ------------------------------------------------------------------ #
+
+    def _emit(self, kind: str, **payload: Any) -> None:
+        """发出一个进度事件（可选能力，默认没有任何订阅者）。
+
+        设计要点：**回调异常绝不能影响编排**。订阅方（如 SSE 推送）
+        可能因为客户端断连、队列满等原因抛异常，而任务本身必须继续跑完
+        —— 「观测失败导致业务失败」是最不该出现的一类耦合。
+        因此这里吞掉异常并降级为一条日志。
+        """
+        hook = self._on_event
+        if hook is None:
+            return
+        try:
+            hook(kind, payload)
+        except Exception:
+            logger.warning("event_hook_failed", kind=kind, exc_info=True)
 
     # ------------------------------------------------------------------ #
     # 主入口
@@ -380,6 +409,16 @@ class Orchestrator:
         node = dag.nodes[node_id]
         obs = get_observability()
         node_start = time.perf_counter()
+        # attempt 在进入 _execute_node_inner 后才自增，因此这里预告「本次是第几次」。
+        self._emit(
+            "node_started",
+            node_id=node_id,
+            goal=node.goal[:200],
+            agent_type=node.agent_type.value,
+            deps=list(node.deps),
+            attempt=dag.states[node_id].attempt + 1,
+            total_nodes=len(dag.nodes),
+        )
         try:
             await self._execute_node_inner(task_id, dag, node_id, upstream_handoff, result)
         finally:
@@ -387,17 +426,31 @@ class Orchestrator:
             # 放在 finally 而不是各分支里，是因为 _execute_node_inner 有 6 个
             # return 点，逐个埋点必然漏 —— 「一个 finally」胜过「六处复制」。
             duration = (time.perf_counter() - node_start) * 1000
-            status = dag.states[node_id].status.value
+            state = dag.states[node_id]
+            status = state.status.value
             agent_name = node.agent_type.value
             obs.inc(MetricNames.NODE_EXECUTIONS, 1, node_type=agent_name, status=status)
             obs.observe(MetricNames.NODE_DURATION_MS, duration, node_type=agent_name)
+            self._emit(
+                "node_finished",
+                node_id=node_id,
+                agent_type=agent_name,
+                # 被驳回后重置为 PENDING 表示「将回退重跑」。对前端而言这不是
+                # 「完成」，而是「判定未通过 → 进入下一轮」，因此显式标注为
+                # backtracked，避免 UI 上显示成一次莫名其妙的 pending 完成。
+                status="backtracked" if state.status is StepStatus.PENDING else status,
+                attempt=state.attempt,
+                duration_ms=round(duration, 1),
+                tokens_used=state.tokens_used,
+                last_error=state.last_error or "",
+            )
             if self._task_span is not None:
                 with obs.span(
                     "node.execute",
                     parent=self._task_span,
                     node_id=node_id,
                     node_type=agent_name,
-                    attempt=dag.states[node_id].attempt,
+                    attempt=state.attempt,
                     status=status,
                 ) as span:
                     span.set_attribute("duration_ms", round(duration, 3))
@@ -522,6 +575,19 @@ class Orchestrator:
 
         # 验证（Tester 与 Verifier 参与时）
         verdict, feedback = await self._verify_node(task_id, node_id, output, handoff, result)
+
+        # 验证结论是本项目最值得展示的时刻（尤其是驳回 + 回退），
+        # 因此单独发一个事件，而不是让前端从 node_finished 反推。
+        self._emit(
+            "node_verdict",
+            node_id=node_id,
+            agent_type=node.agent_type.value,
+            verdict=verdict.value,
+            attempt=attempt,
+            failed_criteria=list(feedback.failed_criteria) if feedback else [],
+            suggestions=list(feedback.suggestions) if feedback else [],
+            lesson=(feedback.lesson if feedback else "") or "",
+        )
 
         if verdict is Verdict.PASS:
             dag.mark(node_id, StepStatus.SUCCESS, tokens_used=output.tokens_used)

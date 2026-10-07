@@ -188,10 +188,27 @@ textarea:focus, .api-input:focus { outline: 1px solid var(--accent); }
   padding: 6px 0;
 }
 
-.ev-kind { font-family: var(--mono); font-size: 11px; color: var(--accent); }
+.ev-title { font-family: var(--mono); font-size: 11px; color: var(--accent); }
 .ev-time { float: right; font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
-.ev-body { margin-top: 3px; color: var(--text-dim); font-size: 12px; word-break: break-word; }
+.ev-body {
+  margin-top: 4px;
+  color: var(--text-dim);
+  font-size: 12px;
+  word-break: break-word;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+.ev-field b { color: var(--text); font-weight: 600; margin-right: 4px; }
 
+/* 时间线左侧色条按事件语义着色（由 eventTone() 给出） */
+.tone-running { border-left-color: var(--warn); }
+.tone-ok { border-left-color: var(--ok); }
+.tone-fail { border-left-color: var(--fail); }
+.tone-warn { border-left-color: var(--warn); }
+.tone-muted { border-left-color: var(--border); }
+
+/* 兼容旧的事件类名写法（保留以免遗漏） */
 .ev-task_started { border-left-color: var(--accent); }
 .ev-task_finished { border-left-color: var(--ok); }
 .ev-task_cancelled, .ev-error { border-left-color: var(--fail); }
@@ -230,6 +247,15 @@ textarea:focus, .api-input:focus { outline: 1px solid var(--accent); }
 
 .bar { height: 7px; background: var(--bg-elev); border-radius: 4px; overflow: hidden; }
 .bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--ok)); }
+
+.hint { font-size: 11px; color: var(--text-dim); margin: 0; opacity: 0.8; }
+.metrics code {
+  font-family: var(--mono);
+  font-size: 11px;
+  background: var(--bg-elev);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
 
 .code {
   background: var(--bg-elev);

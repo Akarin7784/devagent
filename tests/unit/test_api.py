@@ -471,3 +471,124 @@ class TestSseEventFormat:
         assert data["kind"] == "node_finished"
         assert data["node"] == "N1"
         assert "task_id" in data
+
+
+# ---------------------------------------------------------------------- #
+# Orchestrator 进度事件桥接
+# ---------------------------------------------------------------------- #
+
+
+class _EmittingOrchestrator:
+    """模拟 Orchestrator 在运行中通过 _on_event 回调发进度事件。"""
+
+    def __init__(self) -> None:
+        self._on_event: Any = None
+
+    async def run(self, goal: str, *, task_id: str | None = None) -> _FakeResult:
+        assert self._on_event is not None, "TaskService 必须接管 _on_event"
+        self._on_event("node_started", {"node_id": "N1", "agent_type": "coder"})
+        self._on_event(
+            "node_verdict",
+            {"node_id": "N1", "verdict": "reject", "failed_criteria": ["返回 total"]},
+        )
+        self._on_event("node_finished", {"node_id": "N1", "status": "success"})
+        return _FakeResult(task_id or "t", goal)
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _RaisingHookOrchestrator:
+    """回调抛异常时，任务本身必须照常完成（观测失败不得影响业务）。"""
+
+    def __init__(self) -> None:
+        self._on_event: Any = None
+        self.reached_end = False
+
+    async def run(self, goal: str, *, task_id: str | None = None) -> _FakeResult:
+        if self._on_event is not None:
+            self._on_event("node_started", {"node_id": "N1"})
+        self.reached_end = True
+        return _FakeResult(task_id or "t", goal)
+
+    async def aclose(self) -> None:
+        return None
+
+
+class TestOrchestratorEventBridge:
+    async def test_progress_events_reach_bus(self) -> None:
+        """编排器的进度回调应被 TaskService 转成总线事件。"""
+        orch = _EmittingOrchestrator()
+        store = InMemoryTaskStore()
+        service = TaskService(orch, store=store)
+        tid = service.submit("g")
+        await service.wait(tid)
+
+        queue = service.bus.subscribe(tid)
+        kinds = []
+        while not queue.empty():
+            kinds.append(queue.get_nowait().kind)
+
+        assert "node_started" in kinds
+        assert "node_verdict" in kinds
+        assert "node_finished" in kinds
+        assert kinds.index("node_started") < kinds.index("node_finished")
+
+    async def test_verdict_event_carries_failed_criteria(self) -> None:
+        """驳回事件必须带失败标准，前端才能解释「为什么回退」。"""
+        orch = _EmittingOrchestrator()
+        service = TaskService(orch, store=InMemoryTaskStore())
+        tid = service.submit("g")
+        await service.wait(tid)
+
+        queue = service.bus.subscribe(tid)
+        verdicts = []
+        while not queue.empty():
+            ev = queue.get_nowait()
+            if ev.kind == "node_verdict":
+                verdicts.append(ev.payload)
+
+        assert verdicts and verdicts[0]["verdict"] == "reject"
+        assert verdicts[0]["failed_criteria"] == ["返回 total"]
+
+    async def test_hook_exception_is_swallowed_by_orchestrator(self) -> None:
+        """事件回调抛异常时不得向外传播。
+
+        真实场景：SSE 客户端断连导致 publish 失败。此时任务必须继续跑完，
+        「观测失败导致业务失败」是最不该出现的耦合。这里直接验证
+        Orchestrator._emit 的吞异常行为。
+        """
+        from devagent.orchestration.orchestrator import Orchestrator
+
+        def _boom(kind: str, payload: dict[str, Any]) -> None:
+            raise ValueError("bus down")
+
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._on_event = _boom
+        Orchestrator._emit(orch, "node_started", node_id="N1")  # 不应抛异常
+
+    async def test_hook_failure_does_not_block_task_completion(self) -> None:
+        """端到端：回调始终抛异常时，任务仍应正常完成。"""
+        orch = _RaisingHookOrchestrator()
+        service = TaskService(orch, store=InMemoryTaskStore())
+        # 把桥接方法本身替换为抛异常版本，模拟总线故障
+        service._on_orchestrator_event = _raise_bus_down  # type: ignore[method-assign]
+
+        tid = service.submit("g")
+        await service.wait(tid)
+
+        assert orch.reached_end, "回调异常后编排仍应执行到结尾"
+        assert (service.get(tid) or {}).get("succeeded") is True
+
+    async def test_no_hook_is_silent_noop(self) -> None:
+        """未设置回调时 _emit 必须是零成本空操作。"""
+        from devagent.orchestration.orchestrator import Orchestrator
+
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._on_event = None
+        Orchestrator._emit(orch, "node_started", node_id="N1")  # 不应抛异常
+
+
+def _raise_bus_down(kind: str, payload: dict[str, Any]) -> None:
+    """模拟 EventBus 发布失败。"""
+    raise RuntimeError("bus down")
