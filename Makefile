@@ -4,11 +4,12 @@
 .PHONY: help install install-dev lint format typecheck test test-unit test-integration \
         test-cov test-fast check check-fix clean smoke run cli-eval index \
         pre-commit prepare-release docker-up docker-down docker-logs docker-build \
-        sandbox-build docs-links
+        sandbox-build docs-links web-check web-serve
 
 PYTHON := python
 SRC := src/devagent
 TESTS := tests
+NODE := node
 
 help:  ## 显示所有可用命令
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -78,6 +79,11 @@ migrate:  ## 执行数据库迁移
 # ---------- 前端 ----------
 # 注：web/ 为零构建前端，无需 npm install，直接打开 web/index.html 即可。
 # 只有需要本地静态服务器（避免 file:// 的 CORS 限制）时才用下面这条。
+
+web-check:  ## 校验前端（语法检查 + 纯逻辑测试，零依赖）
+	$(NODE) --check web/graph.js
+	$(NODE) --check web/app.js
+	$(NODE) web/graph.test.js
 
 web-serve:  ## 用静态服务器托管前端（零依赖）
 	$(PYTHON) -m http.server 5173 --directory web

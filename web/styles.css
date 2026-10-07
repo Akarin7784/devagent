@@ -160,6 +160,156 @@ textarea:focus, .api-input:focus { outline: 1px solid var(--accent); }
 .task-item .goal { font-size: 13px; margin-bottom: 3px; }
 .task-meta { font-size: 11px; color: var(--text-dim); font-family: var(--mono); }
 
+/* ---------- 任务 DAG ---------- */
+
+.dag-wrap {
+  margin-top: 10px;
+  overflow: auto;
+  max-height: 46vh;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px;
+}
+
+/* SVG 用 viewBox 描述自身尺寸，这里只限制最小高度以免空图塌陷 */
+.dag { display: block; min-height: 90px; }
+.dag-wrap .empty { padding: 22px 8px; text-align: center; }
+
+.dag-edge {
+  fill: none;
+  stroke: var(--border);
+  stroke-width: 1.6;
+  transition: stroke 0.2s;
+}
+.dag-edge.done { stroke: var(--ok); }
+.dag-edge.bad { stroke: var(--warn); }
+/* 回退边：虚线，让「这条边是逆着依赖方向走的」一眼可辨 */
+.dag-edge.back { stroke-dasharray: 5 4; stroke: var(--warn); }
+
+.dag-node { cursor: pointer; }
+.dag-node:focus { outline: none; }
+.dag-node .node-bg {
+  fill: var(--bg-panel);
+  stroke: var(--border);
+  stroke-width: 1.4;
+  transition: stroke 0.2s, fill 0.2s;
+}
+.dag-node:hover .node-bg { stroke: var(--accent); }
+.dag-node.selected .node-bg { stroke: var(--accent); stroke-width: 2.2; }
+
+.dag-node .node-accent { transition: fill 0.2s; }
+.dag-node .node-dot { fill: var(--border); transition: fill 0.2s; }
+
+.dag-node .node-agent { fill: var(--text); font-size: 12px; font-weight: 600; }
+.dag-node .node-id { fill: var(--text-dim); font-family: var(--mono); font-size: 10px; }
+.dag-node .node-goal { fill: var(--text-dim); font-size: 10.5px; }
+.dag-node .node-status { font-size: 10.5px; font-family: var(--mono); }
+.dag-node .node-tokens { fill: var(--text-dim); font-family: var(--mono); font-size: 10px; }
+
+.dag-node .node-badge .badge-bg { fill: var(--warn); opacity: 0.22; }
+.dag-node .node-badge .badge-text { fill: var(--warn); font-family: var(--mono); font-size: 10px; }
+
+/* 状态 → 视觉（与 graph.js 的 statusGroup() 一一对应） */
+.dag-node.s-pending .node-dot { fill: var(--border); }
+.dag-node.s-pending .node-status { fill: var(--text-dim); }
+
+.dag-node.s-running .node-bg { stroke: var(--warn); }
+.dag-node.s-running .node-dot { fill: var(--warn); }
+.dag-node.s-running .node-status { fill: var(--warn); }
+/* 执行中脉冲：让「当前正在跑哪个节点」在长任务里始终可见 */
+.dag-node.s-running .node-bg { animation: dag-pulse 1.4s ease-in-out infinite; }
+@keyframes dag-pulse {
+  0%, 100% { stroke-opacity: 1; }
+  50% { stroke-opacity: 0.42; }
+}
+
+.dag-node.s-ok .node-bg { stroke: var(--ok); }
+.dag-node.s-ok .node-dot { fill: var(--ok); }
+.dag-node.s-ok .node-status { fill: var(--ok); }
+
+.dag-node.s-backtrack .node-bg { stroke: var(--warn); stroke-dasharray: 5 3; }
+.dag-node.s-backtrack .node-dot { fill: var(--warn); }
+.dag-node.s-backtrack .node-status { fill: var(--warn); }
+
+.dag-node.s-fail .node-bg { stroke: var(--fail); }
+.dag-node.s-fail .node-dot { fill: var(--fail); }
+.dag-node.s-fail .node-status { fill: var(--fail); }
+
+.dag-node.s-muted { opacity: 0.55; }
+
+.legend .dot-pending { background: var(--border); }
+.legend .dot-backtrack { background: var(--warn); }
+.legend .dot-sm { margin-left: 8px; }
+
+/* ---------- 节点详情（含 diff） ---------- */
+
+.dag-detail {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elev);
+  overflow: hidden;
+}
+.dag-detail.hidden { display: none; }
+
+.detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.detail-title { font-family: var(--mono); font-size: 12px; color: var(--accent); }
+.detail-goal { padding: 9px 12px; font-size: 12px; color: var(--text-dim); }
+
+.diff-file { border-top: 1px solid var(--border); }
+.diff-file-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 12px;
+  background: var(--bg-panel);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.diff-file-reason { padding: 5px 12px; font-size: 11.5px; color: var(--text-dim); }
+.diff-stat-add { color: var(--ok); font-family: var(--mono); font-size: 11px; }
+.diff-stat-del { color: var(--fail); font-family: var(--mono); font-size: 11px; }
+
+.diff-body {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-x: auto;
+  max-height: 260px;
+  overflow-y: auto;
+  background: #12141a;
+}
+.diff-line { display: flex; white-space: pre; }
+.diff-line .ln {
+  flex: 0 0 44px;
+  text-align: right;
+  padding-right: 8px;
+  color: #5a6373;
+  user-select: none;
+}
+.diff-line .lt { flex: 1; padding-right: 10px; }
+
+/* 增删配色遵循「中国股市」习惯的反向约定：此处是代码 diff，
+ * 沿用国际 diff 通行约定（增绿删红），因为读者预期来自 git。
+ * 项目里唯一的「红涨绿跌」场景是金融图表，与本页无关。 */
+.diff-line.add { background: rgba(53, 196, 138, 0.10); }
+.diff-line.add .lt { color: #7fe0b0; }
+.diff-line.del { background: rgba(226, 86, 74, 0.10); }
+.diff-line.del .lt { color: #f0938a; }
+.diff-line.ctx .lt { color: var(--text-dim); }
+.diff-line.hunk { background: rgba(91, 140, 255, 0.09); }
+.diff-line.hunk .lt { color: var(--accent); }
+.diff-line.meta .lt { color: #6b7484; font-style: italic; }
+
 /* ---------- 时间线 ---------- */
 .timeline {
   list-style: none;

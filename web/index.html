@@ -40,9 +40,20 @@
       <ul id="task-list" class="task-list"></ul>
     </section>
 
-    <!-- 中栏：执行时间线 -->
+    <!-- 中栏：任务 DAG + 执行时间线 -->
     <section class="panel panel-mid">
       <div class="panel-head">
+        <h2>任务 DAG</h2>
+        <div class="legend" id="dag-legend"></div>
+      </div>
+      <div class="dag-wrap">
+        <div id="dag-empty" class="empty">提交任务后，这里会显示节点依赖与实时的执行状态</div>
+        <svg id="dag" class="dag" xmlns="http://www.w3.org/2000/svg" role="img"
+             aria-label="任务依赖图"></svg>
+      </div>
+      <div id="dag-detail" class="dag-detail hidden"></div>
+
+      <div class="panel-head mt">
         <h2>执行时间线</h2>
         <div class="legend">
           <span class="dot dot-running"></span>运行中

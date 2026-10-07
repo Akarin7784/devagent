@@ -6,8 +6,15 @@
  * 引入 React + Vite 会带来 node_modules 依赖，而核心价值（展示多 Agent
  * 协作与上下文工程的效果）并不需要组件框架。
  *
- * 数据结构一目了然：一个 API 客户端 + 一个 SSE 订阅 + 三块渲染函数。
+ * 模块划分：
+ * - `graph.js`：DAG 布局（纯函数）+ SVG 渲染 + diff 解析，与 DOM 状态解耦；
+ * - `app.js`（本文件）：API 客户端、SSE 订阅、各面板渲染与生命周期。
  */
+
+import {
+  LEGEND_ITEMS, applyEvent, buildGraphState, diffStats, layoutDag,
+  parseDiff, renderDag, statusLabel,
+} from './graph.js';
 
 const API_PREFIX = '/api/v1';
 
@@ -69,6 +76,12 @@ const api = {
     return r.json();
   },
 
+  async getTask(taskId) {
+    const r = await fetch(url(`/tasks/${taskId}`));
+    if (!r.ok) throw new Error(`task ${r.status}`);
+    return r.json();
+  },
+
   async metrics() {
     const r = await fetch(url('/metrics'));
     if (!r.ok) throw new Error(`metrics ${r.status}`);
@@ -90,6 +103,14 @@ const state = {
   activeTaskId: '',
   stream: null,
   tasks: [],
+  /** 当前任务的图状态：nodeId → {status, group, attempt, tokens, ...} */
+  graph: new Map(),
+  /** 当前任务最近一次布局结果（用于节点详情里回查 deps/agent） */
+  graphLayout: null,
+  /** 最近一次拿到的 task 详情（diff 数据源） */
+  taskDetail: null,
+  /** 当前选中的节点 id（详情面板展示对象） */
+  selectedNode: '',
 };
 
 /* ------------------------------------------------------------------ *
@@ -344,6 +365,260 @@ function metricRow(name, value, ratio) {
 }
 
 /* ------------------------------------------------------------------ *
+ * 任务 DAG
+ * ------------------------------------------------------------------ */
+
+/** 渲染图例。由 `graph.js` 的 LEGEND_ITEMS 驱动，保证与节点着色同源。 */
+function renderDagLegend() {
+  const el = $('dag-legend');
+  if (!el || el.dataset.ready) return;
+  el.innerHTML = LEGEND_ITEMS.map(
+    (i) => `<span class="dot dot-${i.group} dot-sm"></span>${esc(i.label)}`,
+  ).join('');
+  el.dataset.ready = '1';
+}
+
+/**
+ * 用服务端返回的 `nodes` 快照重建图状态并渲染。
+ *
+ * 这是**权威路径**：每次任务结束、或切换任务时都会走一遍，用它覆盖
+ * SSE 增量累积出来的乐观状态。两者分离的好处是——即使 SSE 丢了几条
+ * 事件，界面最终也会自愈，而不是停留在错误状态。
+ */
+function renderDagFromNodes(nodes) {
+  const svg = $('dag');
+  const empty = $('dag-empty');
+  const list = Array.isArray(nodes) ? nodes.filter((n) => n && n.id) : [];
+
+  if (!list.length) {
+    state.graph = new Map();
+    state.graphLayout = null;
+    svg.style.display = 'none';
+    empty.style.display = '';
+    empty.textContent = state.activeTaskId
+      ? '该任务没有 DAG 结构（可能来自离线冒烟或旧版本记录）'
+      : '提交任务后，这里会显示节点依赖与实时的执行状态';
+    renderNodeDetail();
+    return;
+  }
+
+  state.graph = buildGraphState(list);
+  paintDag();
+  empty.style.display = 'none';
+  svg.style.display = '';
+}
+
+/** 用当前 `state.graph` 重画（布局 + 节点 + 边 + 详情）。 */
+function paintDag() {
+  const svg = $('dag');
+  const nodes = [...state.graph.values()];
+  if (!nodes.length) return;
+
+  let layout;
+  try {
+    layout = layoutDag(nodes);
+  } catch (err) {
+    // 环等畸形输入：降级为提示，而不是让整个页面脚本挂掉。
+    // 「可视化失败导致控制台白屏」是不可接受的 —— 数据本身还在跑。
+    state.graphLayout = null;
+    svg.style.display = 'none';
+    const empty = $('dag-empty');
+    empty.style.display = '';
+    empty.textContent = `依赖图无法渲染：${err.message}`;
+    return;
+  }
+  state.graphLayout = layout;
+  renderDag(svg, layout, state.graph, {
+    selected: state.selectedNode,
+    onSelect: (id) => {
+      state.selectedNode = state.selectedNode === id ? '' : id;
+      paintDag();
+    },
+  });
+  renderNodeDetail();
+}
+
+/**
+ * 节点详情面板：显示该节点的 role / 依赖 / 状态 / token，
+ * 以及**它对应的代码改动 diff**。
+ *
+ * diff 的来源是 `GET /tasks/{id}` 的 `steps[].output` —— Coder 的输出是
+ * Markdown，其中改动以 ```diff 围栏包裹。这样做而不是给 Coder 单独开
+ * 一个 API 字段，是因为 output 本身就是「给人看的交付物」，前端解析它
+ * 不会引入新的服务端契约；代价是解析器要容忍模型偶尔的格式漂移。
+ */
+function renderNodeDetail() {
+  const el = $('dag-detail');
+  const id = state.selectedNode;
+  if (!el) return;
+  if (!id || !state.graph.has(id)) {
+    el.classList.add('hidden');
+    el.innerHTML = '';
+    return;
+  }
+
+  const node = state.graph.get(id);
+  const changes = node.agentType === 'coder' ? extractChanges(state.taskDetail, id) : [];
+  const deps = node.deps.length ? node.deps.join('、') : '（无依赖，起始节点）';
+  const meta = [
+    ['角色', node.agentType || '—'],
+    ['状态', statusLabel(node.status)],
+    ['尝试次数', String(node.attempt)],
+    ['依赖', deps],
+    ['token', node.tokens ? String(node.tokens) : '—'],
+  ].map(([k, v]) => `
+      <div>
+        <div class="stat-label">${esc(k)}</div>
+        <div class="stat-value" style="font-size:13px">${esc(v)}</div>
+      </div>`).join('');
+
+  const diffHtml = changes.length
+    ? changes.map(renderChange).join('')
+    : (node.agentType === 'coder'
+      ? '<p class="diff-file-reason">该节点暂无结构化 diff（任务可能尚未完成或输出未按约定格式给出）。</p>'
+      : '');
+
+  el.classList.remove('hidden');
+  el.innerHTML = `
+    <div class="detail-head">
+      <span class="detail-title">${esc(id)} · ${esc(node.agentType || '')}</span>
+      <button class="btn btn-ghost" id="detail-close">关闭</button>
+    </div>
+    <div class="summary-grid" style="padding:10px 12px">${meta}</div>
+    ${node.goal ? `<div class="detail-goal">目标：${esc(node.goal)}</div>` : ''}
+    ${node.lastError ? `<div class="detail-goal" style="color:var(--fail)">错误：${esc(node.lastError)}</div>` : ''}
+    ${diffHtml}`;
+
+  $('detail-close').addEventListener('click', () => {
+    state.selectedNode = '';
+    paintDag();
+  });
+}
+
+/**
+ * 从 Coder 步骤的 Markdown 输出里抽出 ```diff 围栏块。
+ *
+ * 只解析 diff 围栏，不解析文件标题行：文件标题在 `diff --git` /
+ * `--- a/` 里已经有了，重复展示只会增加噪音。
+ *
+ * **step_id 必须做后缀匹配**，不能精确相等：真实数据的 step_id 形如
+ * `task_cea6348d2798:N1`（带 task 前缀），而节点 id 是 `N1`。
+ * 早期实现用 `s.step_id === nodeId` 精确比较，导致永远匹配不上，
+ * diff 面板恒为空 —— 一个「逻辑写对了但匹配规则错了」的典型缺陷。
+ * 回退重跑时同一节点的多个 step（attempt 1/2）都会被收进来，
+ * 这正合需要：读者想看到的是「改动最终演化成什么样」。
+ */
+function extractChanges(detail, nodeId) {
+  const steps = Array.isArray(detail?.steps) ? detail.steps : [];
+  const suffix = `:${nodeId}`;
+  const matches = (s) => {
+    const id = String(s.step_id || '');
+    return id === nodeId || id.endsWith(suffix);
+  };
+  const mine = steps.filter(matches);
+  const pool = mine.length ? mine : steps.filter((s) => s.agent === 'coder');
+
+  // 去重：回退重跑会让同一节点的多个 attempt 产出**几乎相同**的 diff
+  // （模型通常只改动了触发驳回的那一处）。全部列出会让面板里出现
+  // 三份 90% 重复的内容，读者反而找不到"到底改了什么"。
+  // 因此按 (文件名, 改动正文) 去重，保留**最后一次**尝试的版本 ——
+  // 那才是最终落地的代码。
+  const seen = new Map();
+  for (const step of [...pool].sort((a, b) => (a.attempt || 1) - (b.attempt || 1))) {
+    const text = String(step.output || '');
+    const re = /```diff\r?\n([\s\S]*?)```/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const body = m[1].replace(/\s+$/, '');
+      const file = guessFile(text, body, step);
+      seen.set(`${file}\u0000${body}`, {
+        file,
+        reason: guessReason(text, body),
+        diff: body,
+        attempt: step.attempt || 1,
+      });
+    }
+    // 没有 diff 围栏时，退化为展示概述，避免面板完全空白
+    if (!/```diff/.test(text) && text.trim()) {
+      seen.set(`step\u0000${step.step_id}`, {
+        file: `step ${step.step_id || ''}`.trim(),
+        reason: '',
+        diff: '',
+        note: text.slice(0, 400),
+        attempt: step.attempt || 1,
+      });
+    }
+  }
+  return [...seen.values()];
+}
+
+/**
+ * 推定改动涉及的文件名。三级回退，因为真实数据的 Coder 输出里
+ * diff 围栏**不含** `+++ b/path` 头（它给的是纯改动片段），
+ * 文件名只出现在上一行的 Markdown 标题 `## 1. src/users/pagination.py`。
+ *   1. diff 内的 `+++ b/path` / `--- a/path`（标准 unified diff）；
+ *   2. diff 之前最近的 `## n. <path>` Markdown 标题；
+ *   3. 退化为 step_id（宁可显示得难看，也不要显示成 `?`）。
+ */
+function guessFile(outputText, diffBody, step) {
+  const plus = /^\+\+\+ [ab]\/(.+)$/m.exec(diffBody);
+  if (plus) return plus[1].trim();
+  const minus = /^--- [ab]\/(.+)$/m.exec(diffBody);
+  if (minus) return minus[1].trim();
+
+  const idx = outputText.indexOf(diffBody);
+  if (idx >= 0) {
+    const headings = [...outputText.slice(0, idx).matchAll(/^##\s*\d+\.\s*(.+)$/gm)];
+    if (headings.length) return headings[headings.length - 1][1].trim();
+  }
+  return `step ${step.step_id || ''}`.trim();
+}
+
+/**
+ * 从 Markdown 里回捞该 diff 所属改动块的「理由：」行。
+ *
+ * 服务端的 `changes[].reason` 只存在于 Coder 的**内部**结构化输出里，
+ * API 层的 `StepView` 没有这个字段（它只保留了 output 文本）。因此前端
+ * 从 output 里反向提取：取该 diff 之前最近的「理由：」行。取不到返回
+ * 空串 —— 不编造内容。
+ */
+function guessReason(outputText, diffBody) {
+  const idx = outputText.indexOf(diffBody);
+  if (idx < 0) return '';
+  const reason = [...outputText.slice(0, idx).matchAll(/^理由：(.+)$/gm)].pop();
+  return reason ? reason[1].trim() : '';
+}
+
+/** 渲染单个文件的改动（标题 + 统计 + 逐行 diff）。 */
+function renderChange(change) {
+  const { add, del } = diffStats(change.diff);
+  const stat = change.diff
+    ? `<span><span class="diff-stat-add">+${add}</span> <span class="diff-stat-del">−${del}</span></span>`
+    : '';
+  const body = change.diff
+    ? `<div class="diff-body">${parseDiff(change.diff).map(diffLine).join('')}</div>`
+    : `<div class="diff-file-reason">${esc(change.note || '（无 diff 内容）')}</div>`;
+  return `
+    <div class="diff-file">
+      <div class="diff-file-head"><span>${esc(change.file)}</span>${stat}</div>
+      ${change.reason ? `<div class="diff-file-reason">${esc(change.reason)}</div>` : ''}
+      ${body}
+    </div>`;
+}
+
+/** 一行 diff：左侧双列行号（旧/新），右侧内容，行首标记用 CSS 着色区分。 */
+function diffLine(line) {
+  const prefix = { add: '+', del: '-', ctx: ' ' }[line.type] || '';
+  const oldNo = line.oldNo == null ? '' : String(line.oldNo);
+  const newNo = line.newNo == null ? '' : String(line.newNo);
+  return `<div class="diff-line ${line.type}">
+      <span class="ln">${esc(oldNo)}</span>
+      <span class="ln">${esc(newNo)}</span>
+      <span class="lt">${esc(prefix + line.text)}</span>
+    </div>`;
+}
+
+/* ------------------------------------------------------------------ *
  * SSE 订阅
  * ------------------------------------------------------------------ */
 
@@ -353,6 +628,11 @@ function subscribe(taskId) {
     state.stream = null;
   }
   resetTimeline();
+  // 切换任务时清空图与选中态，避免上一个任务的节点残留在新任务的图上
+  state.graph = new Map();
+  state.graphLayout = null;
+  state.taskDetail = null;
+  state.selectedNode = '';
 
   const es = new EventSource(url(`/tasks/${taskId}/events`));
   state.stream = es;
@@ -365,7 +645,16 @@ function subscribe(taskId) {
     } catch {
       payload = { raw: e.data };
     }
-    if (kind !== 'ping') appendTimeline({ kind, ...payload });
+    const ev = { kind, ...payload };
+
+    // 节点级事件立即反映到图上（乐观更新），时间线同步追加。
+    // 两条路径互不依赖：即使某条事件没被图上识别，时间线仍然完整。
+    if (kind !== 'ping') {
+      const changed = applyEvent(state.graph, ev);
+      if (changed) paintDag();
+      appendTimeline(ev);
+    }
+
     if (kind === 'task_finished' || kind === 'task_cancelled') {
       es.close();
       state.stream = null;
@@ -391,8 +680,13 @@ async function refreshTask(taskId) {
     state.tasks = list.items;
     renderTaskList();
   }
-  const detail = await fetch(url(`/tasks/${taskId}`)).then((r) => r.json()).catch(() => null);
-  if (detail) renderSummary(detail);
+  const detail = await api.getTask(taskId).catch(() => null);
+  if (detail) {
+    state.taskDetail = detail;
+    // 权威快照覆盖乐观状态：SSE 丢事件也能自愈
+    renderDagFromNodes(detail.nodes);
+    renderSummary(detail);
+  }
 
   const ctx = await api.getContext(taskId).catch(() => null);
   if (ctx) renderContextMetrics(ctx);
@@ -431,6 +725,9 @@ async function bootstrap() {
   const params = new URLSearchParams(location.search);
   apiBase = params.get('api') || '';
   $('api-base').value = apiBase;
+
+  renderDagLegend();
+  $('dag').style.display = 'none';
 
   $('api-base').addEventListener('change', (e) => {
     apiBase = e.target.value.trim().replace(/\/$/, '');
