@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import time
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,6 +36,7 @@ from devagent.models.providers import (
     QwenProvider,
     ZhipuProvider,
 )
+from devagent.models.vector_cache import VectorSemanticCache
 from devagent.observability import get_observability
 
 logger = get_logger(__name__)
@@ -91,10 +93,21 @@ class CostLedger:
 
 
 class SemanticCache:
-    """语义缓存（此处为精确匹配 + LRU 的实现）。
+    """精确匹配 + LRU 的响应缓存。
 
-    生产环境可替换为「embedding 相似度 + 向量检索」的语义匹配版本；
-    接口保持不变，便于灰度的替换与对照实验。
+    这是**默认实现**，零依赖、零额外调用。语义（向量）匹配版本见
+    ``devagent.models.vector_cache.VectorSemanticCache`` —— 它需要嵌入模型，
+    且每次未命中都要多一次嵌入调用。
+
+    两者都暴露 ``get`` / ``put`` / ``clear``，但向量版额外有 ``aget`` /
+    ``aput``（异步）。网关通过 ``_cache_get`` / ``_cache_put`` 适配差异。
+
+    **为什么保留这个实现而不是直接换掉**：
+
+    1. 嵌入调用本身有成本与延迟，"更聪明但更慢"不总是更优 —— 需要对照实验；
+    2. 它不依赖任何外部服务，是 `DEVAGENT_CACHE__SEMANTIC=false`（默认）时的路径，
+       保证 clone 下来即可零配置运行；
+    3. 向量版在嵌入失败时会降级到它，因此它是**必须存在**的兜底。
     """
 
     def __init__(self, max_entries: int = 512) -> None:
@@ -137,6 +150,9 @@ class SemanticCache:
         self._store.clear()
         self.hits = self.misses = 0
 
+    def __len__(self) -> int:
+        return len(self._store)
+
 
 class ModelGateway:
     """模型网关：路由 + 缓存 + 记账 + 降级。
@@ -153,14 +169,75 @@ class ModelGateway:
         settings: Settings,
         *,
         router: ComplexityRouter | None = None,
-        cache: SemanticCache | None = None,
+        cache: SemanticCache | VectorSemanticCache | None = None,
         providers: dict[str, ModelProvider] | None = None,
     ) -> None:
         self._settings = settings
         self._router = router or ComplexityRouter(settings.routing)
-        self._cache = cache if cache is not None else SemanticCache()
+        cache_cfg = getattr(settings, "cache", None)
+        self._cache_enabled = bool(cache_cfg.enabled) if cache_cfg is not None else True
+        if cache is not None:
+            self._cache: SemanticCache | VectorSemanticCache = cache
+        elif cache_cfg is not None and cache_cfg.semantic:
+            # 需要嵌入模型 → 用自身 embed 作为 embedder。
+            # 这里传 self.embed（而非 self.embed 的绑定结果前先判断可用性），
+            # 让缺失提供商的情形在**首次调用时**降级为精确匹配，
+            # 而不是在构造网关时就把服务起不来。
+            self._cache = VectorSemanticCache(
+                embedder=self.embed,
+                threshold=cache_cfg.similarity_threshold,
+                max_entries=cache_cfg.max_entries,
+                model_filter=cache_cfg.model_filter,
+            )
+        else:
+            self._cache = SemanticCache(max_entries=cache_cfg.max_entries if cache_cfg else 512)
         self._providers = providers if providers is not None else self._build_providers(settings)
         self.ledger = CostLedger()
+
+    # ------------------------------------------------------------------ #
+    # 缓存适配
+    # ------------------------------------------------------------------ #
+
+    async def _cache_get(
+        self, messages: list[ChatMessage], model: str, temperature: float
+    ) -> ChatResult | None:
+        """读缓存，兼容同步（精确匹配）与异步（向量检索）两种实现。
+
+        这里用 ``isinstance`` 而不是鸭子类型：两种实现的**语义不同**
+        （向量版会额外触发一次嵌入调用 + 计算，精确版是纯字典查找），
+        调用方需要知道自己在走哪条路径。显式判断比"看起来一样"更诚实。
+        """
+        if isinstance(self._cache, VectorSemanticCache):
+            return await self._cache.aget(messages, model, temperature)
+        return self._cache.get(messages, model, temperature)
+
+    async def _cache_put(
+        self,
+        messages: list[ChatMessage],
+        model: str,
+        temperature: float,
+        result: ChatResult,
+    ) -> None:
+        if isinstance(self._cache, VectorSemanticCache):
+            await self._cache.aput(messages, model, temperature, result)
+        else:
+            self._cache.put(messages, model, temperature, result)
+
+    @property
+    def cache(self) -> SemanticCache | VectorSemanticCache:
+        """当前缓存实现（供诊断与统计读取）。"""
+        return self._cache
+
+    def cache_stats(self) -> dict[str, Any]:
+        """缓存统计。向量版会多出 exact/semantic 的区分 —— 这是升级的度量依据。"""
+        if isinstance(self._cache, VectorSemanticCache):
+            return {"mode": "vector", **self._cache.stats.as_dict(), "size": self._cache.size}
+        return {
+            "mode": "exact",
+            "hits": self._cache.hits,
+            "misses": self._cache.misses,
+            "size": len(self._cache),
+        }
 
     # ------------------------------------------------------------------ #
     # 提供商装配
@@ -233,8 +310,8 @@ class ModelGateway:
         spec = self._router.model_for(chosen_tier)
 
         # 缓存查询（仅无工具调用时）
-        if use_cache and not tools:
-            cached = self._cache.get(messages, str(spec), temperature)
+        if use_cache and self._cache_enabled and not tools:
+            cached = await self._cache_get(messages, str(spec), temperature)
             if cached is not None:
                 self.ledger.add(
                     CallRecord(
@@ -322,8 +399,8 @@ class ModelGateway:
                 )
             )
 
-            if use_cache and not tools:
-                self._cache.put(messages, str(spec), temperature, result)
+            if use_cache and self._cache_enabled and not tools:
+                await self._cache_put(messages, str(spec), temperature, result)
 
             get_observability().record_llm_call(
                 model=result.model,
@@ -347,13 +424,20 @@ class ModelGateway:
             f"没有可用提供商处理档位 {chosen_tier.value}（检查 API Key 配置）"
         )
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
-        """生成文本向量（用于上下文装配的相关性计算）。"""
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        """生成文本向量（用于上下文装配的相关性计算与语义缓存）。
+
+        入参声明为 ``Sequence[str]`` 而非 ``list[str]``：``Callable`` 的参数是
+        **逆变**的，缓存侧的 ``Embedder`` 协议声明的是 ``Sequence[str]``，
+        若这里收窄成 ``list[str]`` 就无法作为 embedder 传入（mypy 会拒绝）。
+        放宽到 ``Sequence`` 既满足类型系统，也确实更宽容 —— 调用方不必先
+        把元组或生成器转成列表。
+        """
         spec = self._router.embedding_model()
         provider = self._providers.get(spec.provider)
         if provider is None:
             raise ModelError(f"嵌入模型提供商不可用：{spec.provider}")
-        return await provider.embed(texts, model=spec.model)
+        return await provider.embed(list(texts), model=spec.model)
 
     async def aclose(self) -> None:
         for provider in self._providers.values():
@@ -396,4 +480,5 @@ __all__ = [
     "CostLedger",
     "ModelGateway",
     "SemanticCache",
+    "VectorSemanticCache",
 ]

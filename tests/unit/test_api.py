@@ -465,6 +465,34 @@ class TestObservabilityEndpoints:
     def test_context_unknown_task_404(self, client: Any) -> None:
         assert client.get("/api/v1/tasks/nope/context").status_code == 404
 
+    def test_cache_stats_endpoint(self, client: Any) -> None:
+        """`/cache` 必须暴露 exact 与 semantic 的区分。
+
+        如果只给一个总命中数，就无法判断向量检索是否带来了增量 ——
+        而"能不能度量收益"正是这个升级是否值得保留的依据。
+        """
+        r = client.get("/api/v1/cache")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["mode"] in {"exact", "vector", "disabled"}
+
+    def test_cache_stats_without_gateway(self) -> None:
+        """没有网关时返回 disabled 而不是 500。
+
+        诊断端点应始终保持可用 —— 它常在服务异常时被用来排查问题。
+        """
+        from fastapi.testclient import TestClient
+
+        from devagent.api.app import create_app
+        from devagent.config import Settings
+
+        app = create_app(Settings())
+        with TestClient(app) as c:
+            app.state.gateway = None
+            r = c.get("/api/v1/cache")
+            assert r.status_code == 200
+            assert r.json()["mode"] == "disabled"
+
 
 class TestSseEventFormat:
     def test_event_payload_is_valid_json(self) -> None:

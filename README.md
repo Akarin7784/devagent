@@ -4,7 +4,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-353%20passing-brightgreen)](#测试)
+[![Tests](https://img.shields.io/badge/tests-398%20passing-brightgreen)](#测试)
 [![mypy](https://img.shields.io/badge/mypy-strict-blue)](https://mypy-lang.org/)
 [![Ruff](https://img.shields.io/badge/code%20style-ruff-000000)](https://github.com/astral-sh/ruff)
 
@@ -276,6 +276,8 @@ DEVAGENT_ORCHESTRATION__MAX_ATTEMPTS=3
 | `DEVAGENT_RELIABILITY__MAX_TASK_TOKENS` | `500_000` | 任务级 token 熔断阈值 |
 | `DEVAGENT_STORAGE__BACKEND` | `memory` | 任务存储后端：`memory` 或 `sql` |
 | `DEVAGENT_DATABASE__URL` | 本地 Postgres | `sql` 模式下的连接串；测试用 `sqlite+aiosqlite:///./devagent.db` |
+| `DEVAGENT_CACHE__SEMANTIC` | `false` | 开启向量检索语义缓存（需嵌入模型） |
+| `DEVAGENT_CACHE__SIMILARITY_THRESHOLD` | `0.92` | 语义命中的余弦相似度阈值 |
 
 ### 任务持久化（可选）
 
@@ -290,8 +292,28 @@ psql "$DEVAGENT_DATABASE__URL" -f scripts/init_db.sql   # 扩展与索引（Post
 ```
 
 `TaskStore` 是协议，内存与 SQL 两种实现**可直接互换**，上层零改动。
-事件落库后，SSE 的「历史回放」在进程重启后依然可靠（见
-[ADR-0002](docs/adr/0002-上下文装配使用硬去重作为保险.md) 同类取舍记录）。
+事件落库后，SSE 的「历史回放」在进程重启后依然可靠
+（见 [ADR-0006](docs/adr/0006-任务存储同步协议薄异步适配.md)）。
+
+### 语义缓存（可选）
+
+模型响应缓存默认是**精确匹配**：消息逐字节相同才命中，零依赖零额外调用。
+
+开启向量检索后，「用户列表加分页」与「给用户列表增加分页能力」这类
+**措辞不同但意图相同**的请求也能命中，省下的是一次完整的模型调用：
+
+```bash
+export DEVAGENT_CACHE__SEMANTIC=true
+export DEVAGENT_CACHE__SIMILARITY_THRESHOLD=0.92   # 可调
+curl localhost:8000/api/v1/cache                   # 命中统计
+```
+
+`/cache` 会分别报告 `exact_hits` 与 `semantic_hits` —— 后者就是升级
+带来的**增量**。若它长期接近 0，说明该场景下请求差异本就很大，
+应关掉语义检索以免白付嵌入成本。
+
+**嵌入模型不可用时自动降级为精确匹配**，功能不受影响（缓存是优化而非功能）。
+详见 [ADR-0007](docs/adr/0007-语义缓存向量检索而非精确匹配.md)。
 
 ---
 
@@ -334,7 +356,7 @@ curl -N http://localhost:8000/api/v1/tasks/<id>/events
 ## 测试
 
 ```bash
-make test            # 全量（353 个）
+make test            # 全量（398 个）
 make test-unit       # 仅单元测试
 make check           # ruff + mypy --strict
 ```
@@ -342,7 +364,7 @@ make check           # ruff + mypy --strict
 当前状态：
 
 ```
-353 passed in 21.3s
+398 passed in 21.5s
 ruff check .......... 通过
 ruff format --check . 通过
 mypy --strict ....... 52 个源文件，0 错误

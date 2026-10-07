@@ -84,6 +84,38 @@ class RoutingConfig(BaseModel):
         return provider, model
 
 
+class CacheConfig(BaseModel):
+    """模型响应缓存配置。
+
+    默认 **关闭语义检索**（``semantic=False``）：开启后每次未命中的请求
+    都要额外调用一次嵌入模型，一方面增加延迟与成本，另一方面要求
+    嵌入模型可用（默认是 qwen text-embedding-v3，需要 QWEN_API_KEY）。
+
+    关闭时行为与升级前完全一致（精确匹配），因此这个默认值是**安全的**：
+    打开它是一个显式决策，而不是一个隐式惊喜。
+    """
+
+    enabled: bool = True
+    """总开关。关闭则完全不做缓存（连精确匹配也不做）。"""
+
+    semantic: bool = False
+    """是否启用向量检索。需要 embedded 模型可用，且会产生额外调用。"""
+
+    similarity_threshold: float = Field(
+        default=0.92,
+        gt=0.0,
+        le=1.0,
+        description="向量命中的余弦相似度阈值。太低会混淆不同需求，太高则退化回精确匹配。",
+    )
+
+    max_entries: int = Field(default=512, gt=0, description="缓存条目上限（LRU）")
+
+    model_filter: bool = Field(
+        default=True,
+        description="按 (model, temperature) 分桶检索；关闭可跨模型命中，但可能返回别的模型的结果。",
+    )
+
+
 class ContextConfig(BaseModel):
     """上下文工程配置。"""
 
@@ -224,6 +256,7 @@ class Settings(BaseSettings):
     redis: RedisConfig = Field(default_factory=RedisConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
+    cache: CacheConfig = Field(default_factory=CacheConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
     reliability: ReliabilityConfig = Field(default_factory=ReliabilityConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)

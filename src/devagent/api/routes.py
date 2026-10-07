@@ -277,6 +277,24 @@ async def get_metrics_prometheus() -> Any:
     return PlainTextResponse(text, media_type="text/plain; version=0.0.4")
 
 
+@router.get("/cache", tags=["observability"])
+async def get_cache_stats(request: Request) -> dict[str, Any]:
+    """模型响应缓存的命中统计。
+
+    这是判断「语义缓存升级是否有效」的**唯一数据源**。关键在于区分
+    精确命中与语义命中：如果 ``semantic_hits`` 接近 0，说明向量检索
+    没有带来增量，开它只是白付嵌入调用的成本。
+
+    ``embed_failures`` 持续增长则意味着嵌入模型不可用或配置有误 ——
+    缓存会静默降级为精确匹配，功能不受影响但收益归零。
+    """
+    gateway = getattr(request.app.state, "gateway", None)
+    if gateway is None or not hasattr(gateway, "cache_stats"):
+        return {"mode": "disabled", "reason": "网关未启用缓存"}
+    stats: dict[str, Any] = gateway.cache_stats()
+    return stats
+
+
 @router.get("/traces", response_model=TracesResponse, tags=["observability"])
 async def get_traces(limit: int = Query(default=100, ge=1, le=1000)) -> TracesResponse:
     """返回最近的 span（需启用了内存导出器）。"""

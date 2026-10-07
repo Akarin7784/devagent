@@ -174,6 +174,90 @@ class TestCache:
         assert cache.get(m3, "m", 0.2) is not None
 
 
+class TestVectorCacheIntegration:
+    """网关 + 向量缓存的端到端接线。
+
+    这里验证的是**接线**而不是判定逻辑（后者在 test_vector_cache.py 中
+    用可控向量覆盖）。重点回答三个问题：
+
+    1. 启用 semantic 后，网关真的走异步路径吗？
+    2. 嵌入模型不可用时会不会把服务搞挂？
+    3. 保留 token 的目标达成了吗（第二次近似请求不调模型）？
+    """
+
+    def _gateway(self, settings: Settings, provider: FakeProvider) -> ModelGateway:
+
+        settings.cache.semantic = True
+        settings.cache.similarity_threshold = 0.8
+        return ModelGateway(settings, providers={"qwen": provider})
+
+    async def test_semantic_enabled_uses_vector_cache(self, settings: Settings) -> None:
+        from devagent.models.vector_cache import VectorSemanticCache
+
+        provider = FakeProvider()
+        gateway = self._gateway(settings, provider)
+        assert isinstance(gateway.cache, VectorSemanticCache)
+        assert gateway.cache_stats()["mode"] == "vector"
+
+    async def test_default_is_exact_cache(self, settings: Settings) -> None:
+        """默认不启用语义检索 —— 不该有隐藏的额外调用与依赖。"""
+        gateway = ModelGateway(settings, providers={"qwen": FakeProvider()})
+        assert isinstance(gateway.cache, SemanticCache)
+        assert gateway.cache_stats()["mode"] == "exact"
+
+    async def test_semantic_hit_avoids_second_model_call(self, settings: Settings) -> None:
+        """措辞略变的重复请求不应再调模型 —— 这就是省下的 token。
+
+        FakeProvider.embed 返回 ``[len(text), 1.0]``，因此长度接近的文本
+        余弦相似度很高，正好适合验证"近似命中"的接线。
+        """
+        provider = FakeProvider()
+        gateway = self._gateway(settings, provider)
+
+        await gateway.chat([ChatMessage(role="user", content="用户分页")])
+        await gateway.chat([ChatMessage(role="user", content="用户分页列表")])
+
+        assert len(provider.calls) == 1, "近似请求应命中缓存"
+        stats = gateway.cache_stats()
+        assert stats["semantic_hits"] == 1
+
+    async def test_semantic_enabled_without_embed_provider_degrades(
+        self, settings: Settings
+    ) -> None:
+        """嵌入提供商不可用时必须降级，不能让模型调用失败。
+
+        缓存是优化不是功能 —— 这个不变量在网关层面也必须成立。
+        这里只注册 deepseek，而嵌入模型默认是 qwen → embed 会抛 ModelError。
+        """
+        provider = FakeProvider()
+        settings.cache.semantic = True
+        gateway = ModelGateway(settings, providers={"deepseek": provider})
+
+        first = await gateway.chat(_msgs())
+        second = await gateway.chat(_msgs())
+
+        assert first.content == "ok"
+        assert second.content == "ok"
+        # 嵌入失败 → 退化为精确匹配；同一条消息仍能精确命中
+        assert len(provider.calls) == 1, "精确匹配的兜底仍然生效"
+        assert gateway.cache_stats()["embed_failures"] >= 1
+
+    async def test_cache_can_be_disabled_entirely(self, settings: Settings) -> None:
+        settings.cache.enabled = False
+        provider = FakeProvider()
+        gateway = ModelGateway(settings, providers={"qwen": provider})
+        await gateway.chat(_msgs())
+        await gateway.chat(_msgs())
+        assert len(provider.calls) == 2, "总开关关闭时不应缓存"
+
+    async def test_custom_cache_injection_still_works(self, settings: Settings) -> None:
+        """显式注入的 cache 必须优先于配置 —— 保持可测试性。"""
+        custom = SemanticCache(max_entries=8)
+        settings.cache.semantic = True  # 即使配了 semantic 也用注入的
+        gateway = ModelGateway(settings, cache=custom, providers={"qwen": FakeProvider()})
+        assert gateway.cache is custom
+
+
 class TestFallback:
     async def test_falls_back_to_other_provider(self, settings: Settings) -> None:
         primary = FakeProvider(fail_times=1)  # 首次失败

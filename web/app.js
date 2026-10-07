@@ -74,6 +74,12 @@ const api = {
     if (!r.ok) throw new Error(`metrics ${r.status}`);
     return r.json();
   },
+
+  async cacheStats() {
+    const r = await fetch(url('/cache'));
+    if (!r.ok) throw new Error(`cache ${r.status}`);
+    return r.json();
+  },
 };
 
 /* ------------------------------------------------------------------ *
@@ -257,6 +263,76 @@ function renderContextMetrics(payload) {
   container.innerHTML = rows.join('') + hint;
 }
 
+/**
+ * 模型缓存看板。
+ *
+ * 数据来自 `GET /cache`，两种模式结构不同：
+ *   exact : { mode:'exact', hits, misses, size }
+ *   vector: { mode:'vector', exact_hits, semantic_hits, misses,
+ *             embed_failures, hits, hit_rate, semantic_share, size }
+ *
+ * 关键指标是 **semantic_share**（语义命中占全部命中的比例）：
+ * 它直接回答「向量检索到底贡献了多少」。接近 0 就说明这次升级
+ * 只带来了嵌入调用的成本而没有收益 —— 这正是需要被看见的事实，
+ * 而不是一个漂亮的 hit_rate 就能掩盖的。
+ */
+function renderCacheStats(stats) {
+  const container = $('cache-stats');
+  if (!container) return;
+
+  if (!stats || stats.mode === 'disabled') {
+    container.innerHTML = '<p class="empty">缓存未启用或无统计数据。</p>';
+    return;
+  }
+
+  const rows = [];
+  const pct = (v) => `${((v ?? 0) * 100).toFixed(1)}%`;
+
+  if (stats.mode === 'vector') {
+    rows.push(metricRow('模式', '向量检索（exact + semantic）', null));
+    rows.push(metricRow('精确命中', String(stats.exact_hits ?? 0), null));
+    rows.push(metricRow('语义命中', String(stats.semantic_hits ?? 0), null));
+    rows.push(metricRow('总命中率', pct(stats.hit_rate), stats.hit_rate ?? 0));
+    rows.push(metricRow(
+      '语义命中占比',
+      `${pct(stats.semantic_share)}（升级带来的增量）`,
+      stats.semantic_share ?? 0,
+    ));
+    if (stats.embed_failures) {
+      rows.push(metricRow(
+        '嵌入失败',
+        `${stats.embed_failures} 次（已降级为精确匹配）`,
+        null,
+      ));
+    }
+  } else {
+    rows.push(metricRow('模式', '精确匹配', null));
+    rows.push(metricRow('命中', String(stats.hits ?? 0), null));
+  }
+
+  rows.push(metricRow('缓存条目数', String(stats.size ?? 0), null));
+
+  const hints = [];
+  if (stats.mode === 'exact') {
+    hints.push('当前是精确匹配：措辞略有不同即视为未命中。'
+      + '开启语义检索见 <code>DEVAGENT_CACHE__SEMANTIC=true</code>。');
+  }
+  if (stats.mode === 'vector' && (stats.semantic_hits ?? 0) === 0 && (stats.hits ?? 0) > 0) {
+    hints.push('语义命中为 0 —— 说明请求之间差异较大，'
+      + '此时开启向量检索只增加了嵌入成本而没有收益，可考虑关闭。');
+  }
+  if (stats.embed_failures) {
+    hints.push('嵌入调用失败会让缓存静默降级：功能不受影响，但收益归零。'
+      + '请检查嵌入模型的 API Key 与可用性。');
+  }
+  if (hints.length) {
+    container.innerHTML = rows.join('')
+      + hints.map((h) => `<p class="hint">${h}</p>`).join('');
+    return;
+  }
+  container.innerHTML = rows.join('') + '<p class="hint">数值为服务进程内的累计值。</p>';
+}
+
 function metricRow(name, value, ratio) {
   const bar = ratio == null
     ? ''
@@ -323,6 +399,9 @@ async function refreshTask(taskId) {
 
   const m = await api.metrics().catch(() => null);
   if (m) $('raw-metrics').textContent = JSON.stringify(m, null, 2);
+
+  const cache = await api.cacheStats().catch(() => null);
+  if (cache) renderCacheStats(cache);
 }
 
 async function selectTask(taskId) {
@@ -339,6 +418,8 @@ async function selectTask(taskId) {
 async function refreshMetrics() {
   const m = await api.metrics().catch(() => null);
   if (m) $('raw-metrics').textContent = JSON.stringify(m, null, 2);
+  const cache = await api.cacheStats().catch(() => null);
+  if (cache) renderCacheStats(cache);
   if (state.activeTaskId) {
     const ctx = await api.getContext(state.activeTaskId).catch(() => null);
     if (ctx) renderContextMetrics(ctx);
