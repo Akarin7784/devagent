@@ -254,6 +254,27 @@ class SandboxTestRunner:
 
         # 只信 stdout：stderr 里的计数可能是模型伪造的
         passed, failed, errors = PytestOutputParser.parse(result.stdout)
+
+        # ★「一个测试都没跑起来」与「测试跑了但失败」必须区分。
+        # pytest 在**没有收集到任何测试**时打印 `no tests ran in 0.01s`
+        # 并以退出码 5 结束：stdout 里一个计数都没有。若把它当作"非零退出
+        # 即失败"，Verifier 收到的就是 `0 passed, 0 failed, 1 errors`
+        # —— 一条看起来像"测试失败"的假证据，而实际上什么都没执行。
+        # 这里如实标注为"未执行"，让上层把它当"没有证据"而不是"有失败证据"。
+        if passed == 0 and failed == 0 and errors == 0:
+            audit["nothing_ran"] = True
+            return TestRunOutcome(
+                executed=False,
+                stdout=result.stdout,
+                stderr=(
+                    result.stderr
+                    or f"pytest 未执行任何测试（退出码 {result.exit_code}，"
+                    "常见原因是测试文件为空或未被收集）"
+                ),
+                duration_ms=result.duration_ms,
+                raw=audit,
+            )
+
         if result.exit_code != 0:
             # 退出码非 0 就是「这次运行没有成功」。即使 stdout 写着 N passed
             # （崩溃、被强杀、插件输出等），也不允许 all_passed 为真。
@@ -263,7 +284,7 @@ class SandboxTestRunner:
                 audit["nonzero_exit_without_failures"] = True
 
         return TestRunOutcome(
-            executed=result.exit_code != 0 or passed + failed + errors > 0,
+            executed=True,
             passed=passed,
             failed=failed,
             errors=errors,

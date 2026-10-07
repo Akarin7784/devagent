@@ -142,13 +142,30 @@ class BaseAgent(ABC):
             use_cache=self.cache_enabled,
         )
 
-        output = self.parse_output(result.content, invocation)
+        # 成本在解析**之前**算好：解析失败时这次调用同样已经计费，
+        # 需要随异常一起回传给编排器（见下面的 except）。
+        provider = self._gateway._providers.get(result.provider)
+        cost = (
+            self._gateway._estimate_cost(provider, result.usage, result.model)
+            if provider is not None
+            else 0.0
+        )
+
+        try:
+            output = self.parse_output(result.content, invocation)
+        except Exception as exc:
+            # ★ 解析失败时，模型调用**已经发生并已计费**。
+            # 若就这么把异常抛上去，这次调用的 token 既不会进 total_tokens
+            # 也不会进熔断器 —— 越是"模型输出格式不对"这种高频失败，
+            # 预算就越不准（实测漏记 200/400 token）。把用量挂在异常上，
+            # 由编排器在失败分支补记。
+            exc.usage = result.usage  # type: ignore[attr-defined]
+            exc.cost_usd = cost  # type: ignore[attr-defined]
+            raise
         output.tokens_used = result.usage.total_tokens
         output.model = f"{result.provider}:{result.model}"
         if output.cost_usd == 0.0:
-            provider = self._gateway._providers.get(result.provider)
-            if provider is not None:
-                output.cost_usd = self._gateway._estimate_cost(provider, result.usage, result.model)
+            output.cost_usd = cost
 
         logger.info(
             "agent_executed",

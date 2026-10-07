@@ -88,7 +88,14 @@ class EventBus:
         """
         self._history: OrderedDict[str, deque[TaskEvent]] = OrderedDict()
         self._subscribers: dict[str, list[asyncio.Queue[TaskEvent]]] = {}
-        self._closed: set[str] = set()
+        self._closed: OrderedDict[str, None] = OrderedDict()
+        """已关闭的任务事件流。
+
+        用 OrderedDict 而不是 set：``close()`` 可能被调用在一个从未
+        ``publish()`` 过的 id 上（例如任务在启动前就被取消），那种情况下
+        历史淘汰逻辑永远碰不到它，集合会随请求数无限增长。
+        这里给它同样的 LRU 上限。
+        """
         self._history_size = history_size
         self._queue_size = queue_size
         self._max_tasks = max_tasks
@@ -106,7 +113,7 @@ class EventBus:
                 # 全部仍有订阅者：宁可暂时超限，也不能清掉用户正在看的流。
                 return
             self._history.pop(victim, None)
-            self._closed.discard(victim)
+            self._closed.pop(victim, None)
             self._dropped.pop(victim, None)
 
     def publish(self, event: TaskEvent) -> None:
@@ -156,7 +163,10 @@ class EventBus:
 
     def close(self, task_id: str) -> None:
         """标记任务事件流结束（订阅者收到此标记后应停止等待）。"""
-        self._closed.add(task_id)
+        self._closed[task_id] = None
+        self._closed.move_to_end(task_id)
+        while len(self._closed) > self._max_tasks:
+            self._closed.popitem(last=False)
 
     def is_closed(self, task_id: str) -> bool:
         return task_id in self._closed
@@ -170,7 +180,7 @@ class EventBus:
     def clear(self, task_id: str) -> None:
         self._history.pop(task_id, None)
         self._subscribers.pop(task_id, None)
-        self._closed.discard(task_id)
+        self._closed.pop(task_id, None)
         self._dropped.pop(task_id, None)
 
 

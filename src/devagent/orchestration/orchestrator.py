@@ -311,7 +311,10 @@ class Orchestrator:
         # with 语句，因为下面有多个 return 分支（提前失败返回），用 with 会
         # 让「返回」与「关闭 span」两个语义耦合在缩进里，容易漏掉某个分支。
         obs = get_observability()
-        task_span = obs.start_span("task.run", task_id=tid, goal=goal[:200])
+        # root=True：任务 span 必须是根节点，不能继承"最近一个未结束的 span"。
+        # 并发时那个启发式会选到**别的任务**的 span，把两个任务折叠进同一条
+        # trace（实测 B 的 task.run 成了 A 的子节点）。
+        task_span = obs.start_span("task.run", root=True, task_id=tid, goal=goal[:200])
         state.task_span = task_span
         self._task_span = task_span
 
@@ -394,6 +397,7 @@ class Orchestrator:
             message = await agent.run(invocation)
         except Exception as exc:
             logger.error("requirement_failed", task_id=task_id, error=str(exc))
+            self._charge_failed_call(state, result, exc)
             return None
 
         # ★ 记账修复：需求阶段此前 charge(tokens=0) 且不计步数，导致两个
@@ -458,6 +462,7 @@ class Orchestrator:
             # 早先写的是 ``except (AgentContextError, Exception)``：元组里前一项
             # 被后一项完全覆盖，属于误导性死写法，只会让人以为这里区分了两类错误。
             logger.error("architect_failed", task_id=task_id, error=str(exc))
+            self._charge_failed_call(state, result, exc)
             return None
 
         # 与需求阶段对称：按实际用量记账并计入任务总账。
@@ -468,20 +473,30 @@ class Orchestrator:
         result.total_cost_usd += used_cost
         state.breaker.charge(tokens=used_tokens, steps=1)
 
-        raw_nodes = message.payload.get("nodes")
+        # ★ 取架构产出的节点列表。
+        #
+        # 这里曾经只读 `payload["nodes"]`，而 `BaseAgent._to_message` 构造的
+        # payload 只有 content/model/tokens_used/cost_usd/raw 五个键 ——
+        # Architect 是把 nodes 放在 `output.raw` 里的。于是 `payload["nodes"]`
+        # **永远是 None**，每一次任务都静默退回单节点方案：
+        # DAG 并行调度、依赖拓扑、失败传播、子图回退、节点级验证全部不生效，
+        # 而日志与结果看上去完全正常（状态 success、节点 N1）。
+        # 这是最隐蔽的一类缺陷：实现与测试都在，只有"接线"是断的。
+        raw = message.payload.get("raw")
+        raw_nodes = (raw or {}).get("nodes") if isinstance(raw, dict) else None
         if not raw_nodes:
-            # AgentMessage.payload 未携带 nodes 时，退回单节点方案
-            dag = DAG.build(
-                [
-                    _single_node(handoff),
-                ]
-            )
+            # 兼容自定义 Agent：仍接受直接放在 payload 顶层的 nodes
+            raw_nodes = message.payload.get("nodes")
+        if not raw_nodes:
+            logger.warning("architect_produced_no_nodes", task_id=task_id, fallback="single_node")
+            dag = DAG.build([_single_node(handoff)])
         else:
             try:
                 dag = build_dag_from_architect_output(list(raw_nodes))
             except DAGError as exc:
                 logger.error("dag_build_failed", task_id=task_id, error=str(exc))
                 return None
+        logger.info("dag_built", task_id=task_id, nodes=len(dag.nodes))
 
         self._record_step(
             result,
@@ -663,7 +678,15 @@ class Orchestrator:
         )
         if checkpoint is not None and checkpoint.completed:
             dag.mark(node_id, StepStatus.SUCCESS)
-            logger.info("node_resumed_from_checkpoint", task_id=task_id, node=node_id)
+            # 跨运行恢复是**设计意图**（检查点只在通过验证后写入），
+            # 但"是不是同一次运行"必须可观测：同一次运行内被检查点短路
+            # 意味着回退机制失效，那是 bug；跨运行短路才是断点续跑。
+            logger.info(
+                "node_resumed_from_checkpoint",
+                task_id=task_id,
+                node=node_id,
+                same_run=checkpoint.matches_run(run_state.run_id),
+            )
             return
 
         # 历史教训注入（Reflexion）
@@ -706,6 +729,9 @@ class Orchestrator:
             dag.mark(node_id, StepStatus.FAILED, last_error=str(exc))
             # 失败也要计一步，避免「失败不消耗预算」导致无限重试
             run_state.breaker.charge(tokens=0, steps=1)
+            # 若这次失败发生在模型调用**之后**（例如输出格式解析失败），
+            # 补记那次真实用量（见 base.py 把 usage 挂在异常上）。
+            self._charge_failed_call(run_state, result, exc)
             return
 
         # 记账：先把产出计入结果，再触发熔断检查。
@@ -823,6 +849,27 @@ class Orchestrator:
             )
         logger.info("node_rejected_retrying", task_id=task_id, node=node_id, attempt=attempt)
 
+    def _charge_failed_call(
+        self, state: _RunState, result: TaskRunResult, exc: BaseException
+    ) -> None:
+        """补记「模型调用发生了、但后续步骤失败」的用量。
+
+        ``BaseAgent.run`` 在 ``parse_output`` 抛错时会把 usage/cost_usd 挂在
+        异常对象上（见 agents/base.py）。不补记的话，**越是高频的失败路径，
+        预算越不准** —— 模型输出格式不对是很常见的失败，而它每次都真实计费。
+        """
+        usage = getattr(exc, "usage", None)
+        if usage is None:
+            return
+        tokens = int(getattr(usage, "total_tokens", 0) or 0)
+        cost = float(getattr(exc, "cost_usd", 0.0) or 0.0)
+        if tokens <= 0:
+            return
+        result.total_tokens += tokens
+        result.total_cost_usd += cost
+        state.breaker.charge(tokens=tokens, steps=0)
+        logger.warning("failed_call_charged", tokens=tokens, cost_usd=cost)
+
     def _save_checkpoint(
         self, task_id: str, step_id: str, node_id: str, attempt: int, tokens: int
     ) -> None:
@@ -864,7 +911,7 @@ class Orchestrator:
         # Tester 参与：先跑测试产出客观证据
         evidence = _TestEvidence()
         if self._config.enable_tester:
-            evidence = await self._collect_test_evidence(task_id, node_id, handoff)
+            evidence = await self._collect_test_evidence(task_id, node_id, handoff, result)
             # ★ 记账：Tester 的模型调用此前完全游离于账本之外 ——
             # 每个成功节点实际有 3 次模型调用（coder + tester + verifier），
             # 而熔断器和 total_tokens 只看到 1 次，实际可用预算约为配置值的 3 倍。
@@ -984,14 +1031,22 @@ class Orchestrator:
                 agent=AgentType.VERIFIER,
                 output=str(message.payload.get("content", "")),
                 feedback=feedback,
-                tokens_used=used_tokens,
-                cost_usd=used_cost,
+                # ★ 把 Tester 的用量并入本步骤。
+                # 验证阶段实际有两次模型调用（Tester 生成测试 + Verifier 判定），
+                # 若只记 Verifier 的用量，steps[] 之和会比 total_tokens 少一截，
+                # 前端「每步花了多少」与总账自相矛盾（实测 800 vs 1000）。
+                tokens_used=used_tokens + evidence.tokens,
+                cost_usd=used_cost + evidence.cost,
             ),
         )
         return verdict, feedback
 
     async def _collect_test_evidence(
-        self, task_id: str, node_id: str, handoff: AgentHandoff
+        self,
+        task_id: str,
+        node_id: str,
+        handoff: AgentHandoff,
+        result: TaskRunResult,
     ) -> _TestEvidence:
         """运行 Tester 生成并执行测试，返回（证据文本, token, 成本）。
 
@@ -1025,6 +1080,7 @@ class Orchestrator:
             output, outcome = await tester.generate_and_run(invocation)
         except Exception as exc:
             logger.warning("tester_error", task_id=task_id, node=node_id, error=str(exc))
+            self._charge_failed_call(run_state, result, exc)
             return _TestEvidence()
         text = self._describe_evidence(output, outcome)
         return _TestEvidence(text=text, tokens=output.tokens_used, cost=output.cost_usd)

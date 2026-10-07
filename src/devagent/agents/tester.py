@@ -17,7 +17,7 @@ from typing import Any, Protocol, runtime_checkable
 from devagent.agents.base import AgentContextError, AgentInvocation, AgentOutput, BaseAgent
 from devagent.enums import AgentType, MessageType
 from devagent.models.domain import ArtifactRef
-from devagent.models.provider import ChatMessage
+from devagent.models.provider import ChatMessage, TokenUsage
 
 SYSTEM_PROMPT = """\
 你是一名资深测试工程师，负责为代码改动设计并执行测试。
@@ -144,7 +144,14 @@ class TesterAgent(BaseAgent):
         避免出现「写了测试但从未运行」的假证据。
         """
         raw_content, tokens_used, cost_usd, model_name = await self._generate(invocation)
-        output = self.parse_output(raw_content, invocation)
+        try:
+            output = self.parse_output(raw_content, invocation)
+        except Exception as exc:
+            # 与 BaseAgent.run 同一处理：解析失败时模型调用已经发生，
+            # 把用量挂在异常上，避免失败路径漏记（见 orchestra 的补记逻辑）。
+            exc.usage = TokenUsage(prompt_tokens=0, completion_tokens=0, total_tokens=tokens_used)  # type: ignore[attr-defined]
+            exc.cost_usd = cost_usd  # type: ignore[attr-defined]
+            raise
         output.tokens_used = tokens_used
         output.cost_usd = cost_usd
         output.model = model_name

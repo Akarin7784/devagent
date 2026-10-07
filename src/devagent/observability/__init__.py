@@ -58,12 +58,26 @@ class Observability:
     # ------------------------------------------------------------------ #
 
     @contextlib.contextmanager
-    def span(self, name: str, *, parent: Span | None = None, **attributes: Any) -> Iterator[Span]:
-        with self.tracer.span(name, parent=parent, **attributes) as span:
+    def span(
+        self,
+        name: str,
+        *,
+        parent: Span | None = None,
+        root: bool = False,
+        **attributes: Any,
+    ) -> Iterator[Span]:
+        with self.tracer.span(name, parent=parent, root=root, **attributes) as span:
             yield span
 
-    def start_span(self, name: str, *, parent: Span | None = None, **attributes: Any) -> Span:
-        return self.tracer.start_span(name, parent=parent, **attributes)
+    def start_span(
+        self,
+        name: str,
+        *,
+        parent: Span | None = None,
+        root: bool = False,
+        **attributes: Any,
+    ) -> Span:
+        return self.tracer.start_span(name, parent=parent, root=root, **attributes)
 
     def end_span(self, span: Span, *, error: str = "") -> None:
         self.tracer.end_span(span, error=error)

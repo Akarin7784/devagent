@@ -4,7 +4,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-653%20passing-brightgreen)](#测试)
+[![Tests](https://img.shields.io/badge/tests-659%20passing-brightgreen)](#测试)
 [![mypy](https://img.shields.io/badge/mypy-strict-blue)](https://mypy-lang.org/)
 [![Ruff](https://img.shields.io/badge/code%20style-ruff-000000)](https://github.com/astral-sh/ruff)
 
@@ -133,19 +133,27 @@ devagent run "为用户列表接口增加分页能力"
 
 ```
 任务 task_1791360851430_a3f1  状态=succeeded
-模型调用次数 : 8
-DAG 节点     : {"N1": "success"}
-执行步骤     : requirement:ok -> architect:ok -> coder:ok -> verifier:reject -> coder:ok -> verifier:pass
-token 总量   : 4808
+模型调用次数 : 14
+DAG 节点     : {"N1": "success", "N2": "success", "N3": "success"}
+执行步骤     : requirement:ok -> architect:ok -> coder:ok -> verifier:reject -> coder:ok -> verifier:pass -> coder:ok -> verifier:pass -> tester:ok -> verifier:pass
+token 总量   : 8679
 SMOKE OK
 ```
 
+> `DAG 节点` 应该有三项：脚本给出的架构方案是 `N1(coder) → N2(coder) → N3(tester)`
+> 的依赖链。**如果只看到 `{"N1": "success"}`，说明架构产出的节点没有真正进入
+> DAG** —— 曾经就是如此：编排器读 `payload["nodes"]`，而节点实际放在
+> `payload["raw"]["nodes"]`，取得永远是 `None`，于是每次都静默退回单节点方案，
+> 并行调度、依赖拓扑、失败传播、子图回退、节点级验证全部空转，而任务状态照样
+> 是 succeeded。这条链路的守卫是端到端的节点数断言，不是"实现存在"。
+>
 > 注意其中 `verifier:reject → coder:ok` 这一段：脚本故意让验证器第一次驳回，
 > 用来覆盖**回退重试**路径。真实运行时这条路径由模型自行触发。
 >
 > `token 总量` 计入**全部**模型调用（需求 / 架构 / Coder / Tester / Verifier），
 > 而不是只算主链路 —— 漏记 Tester 与 Verifier 会让熔断器看到的用量只有真实的
-> 三分之一，可用预算悄悄变成配置值的三倍。
+> 三分之一，可用预算悄悄变成配置值的三倍。缓存命中的响应也计入 token
+> （那是"服务出去的上下文量"），但它们的成本记为 0。
 
 ### 启动控制台
 
@@ -530,7 +538,7 @@ make web-check   # 语法检查 + 模块图完整性 + 73 个纯逻辑断言（�
 ## 测试
 
 ```bash
-make test            # 全量（653 个）
+make test            # 全量（659 个）
 make test-unit       # 仅单元测试
 make check           # ruff + mypy --strict
 make web-check       # 前端语法 + 模块图 + 逻辑测试（178 个，零依赖）
@@ -539,7 +547,7 @@ make web-check       # 前端语法 + 模块图 + 逻辑测试（178 个，零�
 当前状态：
 
 ```
-653 passed, 1 skipped in 19.9s
+659 passed, 1 skipped in 19.8s
 46 passed (web/graph.test.js)
 17 passed (web/eventstream.test.js)
 37 passed (web/status.test.js)

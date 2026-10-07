@@ -65,10 +65,12 @@ class ScriptedProvider:
         verifier_sequence: list[bool] | None = None,
         verifier_raises: bool = False,
         delay: float = 0.0,
+        nodes: list[dict[str, Any]] | None = None,
     ) -> None:
         self.verifier_sequence = verifier_sequence or [True]
         self.verifier_raises = verifier_raises
         self.delay = delay
+        self.nodes = nodes
         self.verifier_calls = 0
         self.calls = 0
         self.seen_prompts: list[tuple[AgentType, str]] = []
@@ -122,7 +124,9 @@ class ScriptedProvider:
             reply = _json_block(
                 {
                     "approach": "直接实现",
-                    "nodes": [
+                    "nodes": self.nodes
+                    if self.nodes is not None
+                    else [
                         {
                             "id": "N1",
                             "goal": "实现该需求",
@@ -699,6 +703,184 @@ class TestApiKeyGate:
 
         with TestClient(create_app(Settings())) as client:
             assert client.get("/api/v1/tasks").status_code == 200
+
+
+class TestAdversarialFollowups:
+    """对抗性复核查出的缺陷 —— 前一轮修复与**原有整套测试**都没发现它们。
+
+    尤其是 D1：它让「DAG 驱动编排」这条核心能力在生产环境完全空转，
+    而所有既有测试都是绿的（架构回复只给 1 个节点、DAG 构建器单独测过、
+    集成测试只断言 `result.dag` 存在）。这类"接线断了但实现完好"的缺陷
+    只能靠**端到端的节点数断言**兜住。
+    """
+
+    @staticmethod
+    def _three_node_plan() -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "N1",
+                "goal": "第一步",
+                "agent_type": "coder",
+                "deps": [],
+                "acceptance_criteria": ["c1"],
+            },
+            {
+                "id": "N2",
+                "goal": "第二步",
+                "agent_type": "coder",
+                "deps": ["N1"],
+                "acceptance_criteria": ["c2"],
+            },
+            {
+                "id": "N3",
+                "goal": "第三步",
+                "agent_type": "coder",
+                "deps": ["N2"],
+                "acceptance_criteria": ["c3"],
+            },
+        ]
+
+    async def test_architect_nodes_actually_reach_the_dag(self) -> None:
+        """架构产出 3 个节点，就必须真的跑 3 个节点。
+
+        缺陷形态：编排器读 ``payload["nodes"]``，而 ``_to_message`` 只把
+        nodes 放在 ``payload["raw"]["nodes"]`` —— 取的键永远不存在，
+        于是每次都静默退回单节点方案。并行调度、依赖拓扑、失败传播、
+        子图回退、节点级验证全部不生效，而任务状态照样是 succeeded。
+        """
+        provider = ScriptedProvider(nodes=self._three_node_plan())
+        orch = _orchestrator(provider)
+        result = await orch.run("需求", task_id="t")
+
+        assert result.dag is not None
+        assert set(result.dag.nodes) == {"N1", "N2", "N3"}, (
+            f"架构产出的节点没有全部进入 DAG：{sorted(result.dag.nodes)}"
+        )
+        assert all(result.dag.states[n].status is StepStatus.SUCCESS for n in result.dag.nodes)
+
+        # 依赖必须被真正执行（串行链：N1 → N2 → N3）
+        node_ids = [
+            s.step_id.split(":", 1)[1]
+            for s in result.steps
+            if s.agent is AgentType.CODER and s.step_id.split(":")[-1] in {"N1", "N2", "N3"}
+        ]
+        assert node_ids == ["N1", "N2", "N3"], f"节点执行顺序错误：{node_ids}"
+
+    async def test_node_started_events_cover_every_node(self) -> None:
+        provider = ScriptedProvider(nodes=self._three_node_plan())
+        orch = _orchestrator(provider)
+        events: list[tuple[str, dict[str, Any]]] = []
+        orch._on_event = lambda kind, payload: events.append((kind, payload))
+        await orch.run("需求", task_id="t")
+
+        started = [p["node_id"] for k, p in events if k == "node_started"]
+        assert started == ["N1", "N2", "N3"], f"node_started 未覆盖全部节点：{started}"
+
+    async def test_step_tokens_include_tester(self) -> None:
+        """步级 token 之和必须等于总账 —— 开着 Tester 时也要成立。
+
+        缺陷形态：``_verify_node`` 只记 Verifier 的用量，Tester 的用量进了
+        总账却没进步级账，前端「每步花了多少」与总计自相矛盾（800 vs 1000）。
+        """
+        provider = ScriptedProvider()
+        orch = _orchestrator(
+            provider, config=OrchestratorConfig(enable_tester=True, enable_reviewer=False)
+        )
+        result = await orch.run("需求", task_id="t")
+
+        assert result.total_tokens == provider.calls * ScriptedProvider.TOKENS_PER_CALL * 2
+        assert sum(s.tokens_used for s in result.steps) == result.total_tokens
+
+    async def test_nothing_ran_is_not_reported_as_failure(self) -> None:
+        """pytest「没跑到任何测试」（退出码 5）必须标为未执行，而不是失败。
+
+        缺陷形态：非零退出码一律被强制成 ``errors=1``，于是
+        ``no tests ran`` 变成 ``0 passed, 0 failed, 1 errors`` ——
+        Verifier 收到一条看起来像"测试失败"的证据，而实际上什么都没执行。
+        """
+        from devagent.tools.sandbox import ExecutionResult
+        from devagent.tools.test_runner import SandboxTestRunner
+
+        class StubSandbox:
+            def __init__(self, result: ExecutionResult) -> None:
+                self._result = result
+                self.commands: list[list[str]] = []
+
+            async def run(self, command: list[str], **kwargs: Any) -> ExecutionResult:
+                self.commands.append(command)
+                return self._result
+
+            async def aclose(self) -> None:
+                return None
+
+        # pytest 在"没有收集到任何测试"时的真实输出与退出码
+        sandbox = StubSandbox(
+            ExecutionResult(
+                exit_code=5, stdout="no tests ran in 0.01s\n", stderr="", command="pytest"
+            )
+        )
+        runner = SandboxTestRunner(sandbox, workspace_root="")  # type: ignore[arg-type]
+        outcome = await runner.run_tests([{"path": "test_x.py", "content": "x = 1"}])
+
+        assert outcome.executed is False, "没跑到测试时不能声称'执行过'"
+        assert outcome.raw.get("nothing_ran") is True
+        assert outcome.failed == 0 and outcome.errors == 0, "不得把'没执行'渲染成失败"
+        assert "未执行" in outcome.stderr
+
+        # 对照组：真的失败了，必须是失败
+        sandbox2 = StubSandbox(
+            ExecutionResult(exit_code=1, stdout="1 failed in 0.09s\n", stderr="", command="pytest")
+        )
+        runner2 = SandboxTestRunner(sandbox2, workspace_root="")  # type: ignore[arg-type]
+        outcome2 = await runner2.run_tests([{"path": "test_x.py", "content": "x = 1"}])
+        assert outcome2.executed is True
+        assert outcome2.failed == 1
+
+    async def test_failed_call_still_counted(self) -> None:
+        """ "调用成功但解析失败"时，那次调用的 token 也必须入账。
+
+        缺陷形态：``BaseAgent.run`` 在 parse_output 抛错时直接上抛，
+        用量既不入 total_tokens 也不入熔断器 —— 越是"模型输出格式不对"
+        这种高频失败，预算越不准（实测漏记 200 甚至一半）。
+        这里让 Architect 返回**空 nodes**，它在解析阶段就会抛
+        AgentContextError，但模型调用已经真实发生。
+        """
+        provider = ScriptedProvider(nodes=[])  # 空 nodes → Architect 解析即报错
+        orch = _orchestrator(provider)
+        result = await orch.run("需求", task_id="t")
+
+        assert result.status.value == "failed"
+        # 需求 + 架构两次调用都发生了，账目必须都记上
+        assert provider.calls >= 2
+        assert result.total_tokens == provider.calls * ScriptedProvider.TOKENS_PER_CALL * 2, (
+            f"失败路径漏记：total={result.total_tokens} 实际调用={provider.calls}"
+        )
+
+    async def test_concurrent_runs_get_separate_traces(self) -> None:
+        """并发任务必须各自成一条 trace（不能折叠成父子链）。"""
+        from devagent.observability import get_observability
+        from devagent.observability.tracing import NoopExporter
+
+        reset_observability()
+        configure_observability(enabled=True)
+        obs = get_observability()
+        exporter = obs.tracer.exporter
+        if not isinstance(exporter, NoopExporter):  # pragma: no cover - 环境相关
+            pytest.skip("未启用内存导出器")
+        exporter.spans.clear()
+
+        provider = ScriptedProvider(delay=0.02)
+        orch = _orchestrator(provider)
+        await asyncio.gather(
+            orch.run("A", task_id="ta"),
+            orch.run("B", task_id="tb"),
+        )
+
+        task_spans = [s for s in exporter.spans if s.name == "task.run"]
+        assert len(task_spans) == 2
+        trace_ids = {s.trace_id for s in task_spans}
+        assert len(trace_ids) == 2, "两个并发任务被折叠进同一条 trace"
+        assert all(s.parent_id is None for s in task_spans), "任务根 span 不应有父节点"
 
 
 class TestCompressionHonesty:

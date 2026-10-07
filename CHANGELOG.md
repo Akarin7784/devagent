@@ -7,6 +7,41 @@
 
 ### 修复
 
+**对抗性复核查出的 8 项缺陷（含一项 P0：DAG 从未真正执行）**
+
+第一轮修复完成后，又做了一轮**对抗性复核**（独立重写探针、以证伪为目标），
+其中一条 P0 是第一轮与**原有整套测试**都没发现的：
+
+- **P0：架构产出的节点从未进入 DAG** —— 编排器读 `payload["nodes"]`，而
+  `BaseAgent._to_message` 构造的 payload 只有 content/model/tokens_used/
+  cost_usd/raw，Architect 把节点放在 `output.raw["nodes"]`。取的键永远不存在，
+  于是**每次任务都静默退回单节点方案**：DAG 并行调度、依赖拓扑、失败传播、
+  子图回退、节点级验证全部空转，而任务状态、日志、节点事件看上去都正常。
+  最直接的证据是 `scripts/demo_smoke.py`：脚本给出的方案是
+  `N1(coder) → N2(coder) → N3(tester)`，修复前它只跑 N1 —— README 甚至把
+  这份被截断的输出当成了预期结果（"模型调用 8 次 / token 2011"），
+  修复后是 14 次调用 / 8679 token / 三个节点。
+  既有测试全绿的原此很典型：架构假回复只给 1 个节点、
+  `build_dag_from_architect_output` 是单独测的、集成测试只断言 `result.dag` 存在。
+  现补上端到端的节点数与执行顺序断言。
+- **P1：步级 token 不含 Tester** —— 开着 Tester 时 `steps[]` 之和比
+  `total_tokens` 少一截（实测 800 vs 1000），前端「每步花了多少」与总计矛盾。
+- **P1：「没跑到任何测试」被当成测试失败** —— pytest 未收集到测试时打印
+  `no tests ran` 并以退出码 5 结束，而非零退出码一律被强制成 `errors=1`，
+  于是 Verifier 收到 `0 passed, 0 failed, 1 errors` 这条**看起来像失败**的假证据。
+  现在如实标为"未执行"（`raw["nothing_ran"]`）。
+- **P2：失败路径漏记模型用量** —— `BaseAgent.run` 在 `parse_output` 抛错时直接
+  上抛，那次真实调用既不入 `total_tokens` 也不入熔断器；越是"输出格式不对"
+  这种高频失败，预算越不准。现把 usage/cost 挂在异常上，由编排器补记。
+- **P2：并发任务被折叠进同一条 trace** —— `Tracer.start_span` 的隐式父节点是
+  "最近一个未结束的 span"，并发时会选到别的任务的 span。任务根 span 现在
+  显式 `root=True`。
+- **P3**：`StepCheckpoint.matches_run` 是死代码（现用于区分"同运行短路"与
+  "跨运行续跑"的日志）；`EventBus._closed` 对"只关不发"的 id 无上限
+  （现同样 LRU 有界）。
+- 缓存命中的 token 计入 `total_tokens` 是有意为之（表示"服务出去的上下文量"），
+  成本仍记 0 —— 口径已写进 README，避免被误读为漏记。
+
 **代码审查发现的正确性缺陷（P0/P1）—— 一批"文档承诺了、但实际没生效"的能力**
 
 一次全量审查（含 6 个运行时探针复现）发现：多项被文档当作核心卖点的机制，
@@ -52,7 +87,7 @@
 - **Tester / Verifier 调用不计账**：每个成功节点实际有 3 次模型调用，
   而账本与熔断器只看到 1 次 —— 可用预算悄悄变成配置值的约 3 倍。
   现已全部计入 `total_tokens`、成本与熔断器（`build_smoke` 的 token 总量
-  因此从 2011 变为 4808，这是修复而非回归）
+  此此从 2011 变为 4808，这是修复而非回归）
 - **需求/架构步骤的 `steps[].tokens_used` 恒为 0**，与 `total_tokens` 自相矛盾
 - **检查点写在验证之前**：被驳回、重试耗尽的节点也会留下 `completed=True`，
   同一个 `task_id` 再跑一次会被短路，一步不执行却报成功。现只在**验证通过后**
@@ -72,12 +107,12 @@
 - **按 README 操作无法启动**：`.env.example` 的三个路由值缺 `provider:` 前缀，
   `Settings()` 直接抛 `ValidationError`；`docker-compose.yml` 的 `DEVAGENT_ENV: docker`
   非法；`init_db.sql` 的 `tasks` 表与 ORM 不一致（首次写入即
-  `no such column: tasks.succeeded`）；镜像未安装 `[db]` extra 因而跑不了 SQL 模式
+  `no such column: tasks.succeeded`）；镜像未安装 `[db]` extra 此而跑不了 SQL 模式
 
 *P2/P3 —— 资源、并发与静默失效*
 
 - 沙箱用 UTF-8 硬解码子进程输出，而 Windows 子进程按 GBK 输出 —— 中文证据被
-  静默替换为 U+FFFD（这也是仓库自带测试在中文路径下失败的原因）
+  静默替换为 U+FFFD（这也是仓库自带测试在中文路径下失败的原此）
 - 沙箱输出上限在**完全缓冲之后**才生效（200 MiB 输出 → 宿主堆峰值 400 MiB）
 - 超时"强杀"杀不掉容器与孙进程；Docker 工作区此前是读写挂载且缺 `--user`
 - 模型可控的"测试文件路径"可覆写仓库任意既有文件；`_is_safe_relative_path`
@@ -121,7 +156,7 @@
   `security.api_key`（非空时 `/api/v1/**` 要求 `X-API-Key`）、
   `evaluation.dataset_dir`（限定评测接口可读的数据集根目录）
 - 新增指标：`context_hard_overflow`、`verification_unavailable`、`llm_unpriced_calls`；
-  上下文工程指标统一带 `task_id`，前端"本任务收益"终于可归因
+  上下文工程指标统一带 `task_id`，前端"本任务收益"终于可归此
 - 跨语言词表新增 `task_status`（后端加枚举 → 前端契约测试立即变红）
 
 ### 新增
@@ -130,7 +165,7 @@
 
 - **设计令牌三层架构**（`web/css/tokens.css`）：`palette`（原始色值）→
   `semantic`（按用途命名，如 `--surface-base` / `--text-primary` /
-  `--status-danger`）→ 组件令牌。组件只引用语义层，因此明暗切换时
+  `--status-danger`）→ 组件令牌。组件只引用语义层，此此明暗切换时
   组件 CSS **零改动**。共 187 个令牌，无悬空引用（`make web-check` 校验）
 - **明暗双主题**：跟随系统 / 手动三态切换，`prefers-color-scheme` 实时监听；
   `index.html` 内置防 FOUC 的主题预置脚本

@@ -229,6 +229,7 @@ class Tracer:
         *,
         trace_id: str | None = None,
         parent: Span | None = None,
+        root: bool = False,
         **attributes: Any,
     ) -> Iterator[Span]:
         """创建一个 span 并保证异常时正确收尾。
@@ -240,7 +241,7 @@ class Tracer:
             yield _NULL_SPAN
             return
 
-        active_parent = parent or self._current_span()
+        active_parent = None if root else (parent or self._current_span())
         span = Span(
             name=name,
             trace_id=trace_id or (active_parent.trace_id if active_parent else uuid.uuid4().hex),
@@ -272,10 +273,20 @@ class Tracer:
         *,
         trace_id: str | None = None,
         parent: Span | None = None,
+        root: bool = False,
         **attributes: Any,
     ) -> Span:
-        """非上下文管理器版本，用于跨协程手工管理生命周期。"""
-        active_parent = parent or self._current_span()
+        """非上下文管理器版本，用于跨协程手工管理生命周期。
+
+        Args:
+            root: 强制作为**根 span**（不继承任何隐式父节点）。
+
+        为什么需要 ``root``：``_current_span()`` 是一个"最近开始且未结束"的
+        启发式，并发运行时它会把另一个任务的 span 误认为父节点 ——
+        实测两个并发任务的 ``task.run`` 共用一个 trace_id，B 成了 A 的子节点，
+        在 Jaeger 里两个任务被折叠成一条链。任务根 span 必须显式声明"我是根"。
+        """
+        active_parent = None if root else (parent or self._current_span())
         span = Span(
             name=name,
             trace_id=trace_id or (active_parent.trace_id if active_parent else uuid.uuid4().hex),
