@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from devagent.config import get_settings
+from devagent.console import force_utf8_stdio
 from devagent.logging_config import configure_logging, get_logger
 from devagent.observability import configure_observability, get_observability
 
@@ -306,6 +307,9 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    # CLI 的输出全是中文：在不支持中文的控制台上（英文 Windows 的 cp1252）
+    # 直接打印会抛 UnicodeEncodeError 并以非零码退出，看起来像"程序崩了"。
+    force_utf8_stdio()
     _setup(args)
 
     if args.command == "run":

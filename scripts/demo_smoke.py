@@ -290,6 +290,13 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="以 JSON 输出")
     args = parser.parse_args()
 
+    # 输出里有中文：英文 Windows 控制台（cp1252）直接打印会抛
+    # UnicodeEncodeError 并以非零码退出 —— 在 CI 的 windows-latest 上
+    # ubuntu/macOS 全绿、Windows 必红，原因却只是"打印不出来"。
+    from devagent.console import force_utf8_stdio
+
+    force_utf8_stdio()
+
     from devagent.orchestration import Orchestrator
 
     settings = get_settings()

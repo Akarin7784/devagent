@@ -15,6 +15,9 @@ concurrency:
 env:
   PYTHONUNBUFFERED: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # Python UTF-8 模式：Windows runner 默认用 cp1252，含中文的输出（smoke 脚本、
+  # 测试断言信息）会抛 UnicodeEncodeError，让 Windows 任务无故变红。
+  PYTHONUTF8: "1"
 
 jobs:
   # ------------------------------------------------------------------ #
