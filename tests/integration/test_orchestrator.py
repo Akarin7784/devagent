@@ -475,3 +475,274 @@ class TestInjectionGuardEndToEnd:
         open_idx = ctx.rindex("EXTERNAL_NONCE_", 0, evidence_idx)
         notice = ctx[max(0, open_idx - 200) : open_idx]
         assert "可信度低" in notice
+
+
+# ---------------------------------------------------------------------- #
+# 节点事件契约（SSE 的 node.* 事件）
+# ---------------------------------------------------------------------- #
+
+
+class _EventRecorder:
+    """收集 `EventHook` 发出的事件，用于断言 SSE 契约。"""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+
+    def __call__(self, kind: str, payload: dict[str, Any]) -> None:
+        self.events.append((kind, dict(payload)))
+
+    def kinds(self) -> list[str]:
+        return [k for k, _ in self.events]
+
+    def of(self, kind: str) -> list[dict[str, Any]]:
+        return [p for k, p in self.events if k == kind]
+
+    def for_node(self, kind: str, node_id: str) -> list[dict[str, Any]]:
+        return [p for p in self.of(kind) if p.get("node_id") == node_id]
+
+
+class TestNodeEventContract:
+    """`Orchestrator._emit` → `EventHook` 的 payload 契约。
+
+    前端 `web/graph.js` 的 `applyEvent()` 直接消费这些字段。
+    这是**跨语言**契约（Python 产出 → JS 消费），没有类型系统兜底，
+    所以必须用精确的键集合把它钉住。
+
+    历史教训：前端的 `step_id` 匹配规则（精确相等 vs 后缀匹配）就是
+    因为没有契约测试而写错，导致 diff 面板恒为空。事件层同理 ——
+    字段改名不会有任何测试失败，只会在界面上表现为「节点不动了」。
+    """
+
+    async def test_node_started_payload_shape(self) -> None:
+        provider = RoutedFakeProvider(verifier_sequence=[True])
+        recorder = _EventRecorder()
+        orch = _build_orchestrator(provider)
+        orch._on_event = recorder
+        await orch.run("需求")
+
+        started = recorder.of("node_started")
+        assert started, "应至少发出一次 node_started"
+        expected = {"node_id", "goal", "agent_type", "deps", "attempt", "total_nodes"}
+        for payload in started:
+            assert set(payload) == expected, f"node_started 键变了：{set(payload) ^ expected}"
+
+    async def test_node_finished_payload_shape(self) -> None:
+        provider = RoutedFakeProvider(verifier_sequence=[True])
+        recorder = _EventRecorder()
+        orch = _build_orchestrator(provider)
+        orch._on_event = recorder
+        await orch.run("需求")
+
+        finished = recorder.of("node_finished")
+        assert finished, "应至少发出一次 node_finished"
+        expected = {
+            "node_id",
+            "agent_type",
+            "status",
+            "attempt",
+            "duration_ms",
+            "tokens_used",
+            "last_error",
+        }
+        for payload in finished:
+            assert set(payload) == expected, f"node_finished 键变了：{set(payload) ^ expected}"
+
+    async def test_node_verdict_payload_shape(self) -> None:
+        provider = RoutedFakeProvider(verifier_sequence=[True])
+        recorder = _EventRecorder()
+        orch = _build_orchestrator(provider)
+        orch._on_event = recorder
+        await orch.run("需求")
+
+        verdicts = recorder.of("node_verdict")
+        assert verdicts, "应至少发出一次 node_verdict"
+        expected = {
+            "node_id",
+            "agent_type",
+            "verdict",
+            "attempt",
+            "failed_criteria",
+            "suggestions",
+            "lesson",
+        }
+        for payload in verdicts:
+            assert set(payload) == expected, f"node_verdict 键变了：{set(payload) ^ expected}"
+
+    async def test_agent_type_is_plain_string_in_events(self) -> None:
+        """事件里的 agent_type 必须是字符串，不是枚举对象。
+
+        `_emit` 里写的是 `node.agent_type.value`。如果哪天改成直接传枚举，
+        `json.dumps` 会抛 `TypeError: Object of type AgentType is not
+        JSON serializable` —— 但那是**运行时**才炸，且发生在 SSE 推送路径上
+        （异常被 `_emit` 吞掉降级为日志），界面上表现为「事件静默消失」。
+        所以在契约层拦一道。
+        """
+        provider = RoutedFakeProvider(verifier_sequence=[True])
+        recorder = _EventRecorder()
+        orch = _build_orchestrator(provider)
+        orch._on_event = recorder
+        await orch.run("需求")
+
+        for payload in recorder.of("node_started") + recorder.of("node_finished"):
+            assert isinstance(payload["agent_type"], str)
+
+    async def test_events_are_json_serializable(self) -> None:
+        """所有事件 payload 必须能 `json.dumps`。
+
+        这是 SSE 的实际要求（`routes.py` 里 `json.dumps(event.to_sse_data())`）。
+        在测试里直接序列化一次，比让它在生产路径上静默失败好得多。
+        """
+        provider = RoutedFakeProvider(verifier_sequence=[False, True])
+        recorder = _EventRecorder()
+        orch = _build_orchestrator(provider)
+        orch._on_event = recorder
+        await orch.run("需求")
+
+        for kind, payload in recorder.events:
+            json.dumps({"kind": kind, **payload}, ensure_ascii=False)
+
+    async def test_attempt_increments_across_retry(self) -> None:
+        """回退重跑：同一节点先 attempt=1 被驳回，再 attempt=2 通过。
+
+        这是前端 `×N` 徽标的数据来源，也是「回退路径可见」的全部依据。
+        断言序列而非只看最终值 —— 只看最终值会漏掉「attempt 没有回退到 1」
+        这类错误。
+        """
+        provider = RoutedFakeProvider(verifier_sequence=[False, True])
+        recorder = _EventRecorder()
+        orch = _build_orchestrator(provider)
+        orch._on_event = recorder
+        result = await orch.run("需求")
+
+        assert result.succeeded
+        started_attempts = [p["attempt"] for p in recorder.of("node_started")]
+        assert started_attempts == [1, 2], f"重跑应产生 attempt 1 → 2，实际 {started_attempts}"
+
+    async def test_backtracked_status_is_emitted_on_reject(self) -> None:
+        """被驳回时 `node_finished` 的 status 必须是 `backtracked`，不是 `pending`。
+
+        orchestrator 在驳回后会把节点重置为 PENDING。如果直接透出
+        `pending`，前端会渲染成「待执行」—— 读者看到的是「这个节点还没跑」，
+        而事实是「跑了、被打回了、马上要重跑」。语义完全相反。
+        因此 orchestrator 显式覆盖为 `backtracked`，本测试锁住这个覆盖。
+        """
+        provider = RoutedFakeProvider(verifier_sequence=[False, True])
+        recorder = _EventRecorder()
+        orch = _build_orchestrator(provider)
+        orch._on_event = recorder
+        await orch.run("需求")
+
+        statuses = [p["status"] for p in recorder.of("node_finished")]
+        assert "backtracked" in statuses, f"应出现 backtracked，实际 {statuses}"
+        assert "pending" not in statuses, "不能让回退被误报为 pending"
+
+    async def test_verdict_reject_then_pass(self) -> None:
+        """`node_verdict` 的 verdict 序列应为 reject → pass。"""
+        provider = RoutedFakeProvider(verifier_sequence=[False, True])
+        recorder = _EventRecorder()
+        orch = _build_orchestrator(provider)
+        orch._on_event = recorder
+        await orch.run("需求")
+
+        verdicts = [p["verdict"] for p in recorder.of("node_verdict")]
+        assert verdicts == ["reject", "pass"], f"实际 {verdicts}"
+
+    async def test_reject_carries_failed_criteria(self) -> None:
+        """驳回事件必须带上未通过的验收标准 —— 它是 UI 上「为什么被打回」的唯一来源。"""
+        provider = RoutedFakeProvider(verifier_sequence=[False, True])
+        recorder = _EventRecorder()
+        orch = _build_orchestrator(provider)
+        orch._on_event = recorder
+        await orch.run("需求")
+
+        rejected = [p for p in recorder.of("node_verdict") if p["verdict"] == "reject"]
+        assert rejected
+        assert rejected[0]["failed_criteria"], "驳回必须带未通过标准"
+        assert isinstance(rejected[0]["failed_criteria"], list)
+        assert rejected[0]["lesson"], "驳回应带 reflexion 教训"
+
+    async def test_passed_verdict_has_empty_failure_fields(self) -> None:
+        """通过时失败字段应为空列表/空串，而不是 None。
+
+        前端会直接渲染这些字段（`v.join('；')`）。若是 None，
+        `timelineItem` 里的空值过滤能兜住，但 `renderNodeDetail` 会崩。
+        契约层定为「总是 list / 总是 str」最省心。
+        """
+        provider = RoutedFakeProvider(verifier_sequence=[True])
+        recorder = _EventRecorder()
+        orch = _build_orchestrator(provider)
+        orch._on_event = recorder
+        await orch.run("需求")
+
+        passed = [p for p in recorder.of("node_verdict") if p["verdict"] == "pass"]
+        assert passed
+        assert passed[0]["failed_criteria"] == []
+        assert passed[0]["suggestions"] == []
+        assert passed[0]["lesson"] == ""
+
+    async def test_node_ids_in_events_match_dag_nodes(self) -> None:
+        """事件里的 node_id 必须都能在最终 DAG 里找到。
+
+        前端靠 node_id 做图节点的 upsert（`state.get(ev.node_id)`），
+        对不上就会「事件到了但节点不动」。这条断言把
+        「事件源」与「快照源」钉成同一个 id 空间。
+        """
+        provider = RoutedFakeProvider(verifier_sequence=[True])
+        recorder = _EventRecorder()
+        orch = _build_orchestrator(provider)
+        orch._on_event = recorder
+        result = await orch.run("需求")
+
+        assert result.dag is not None
+        known = set(result.dag.nodes)
+        emitted = {p["node_id"] for p in recorder.of("node_started")}
+        assert emitted, "应有节点事件"
+        assert emitted <= known, f"事件里的未知节点：{emitted - known}"
+
+    async def test_event_order_is_start_then_finish_per_attempt(self) -> None:
+        """每个节点的生命周期必须「先 started 后 finished」。
+
+        顺序错乱会让前端把图状态推错（先 finished 再 started 会把
+        成功覆盖成运行中）。由于 `_emit` 吞异常，顺序问题极难在生产里发现。
+        """
+        provider = RoutedFakeProvider(verifier_sequence=[True])
+        recorder = _EventRecorder()
+        orch = _build_orchestrator(provider)
+        orch._on_event = recorder
+        await orch.run("需求")
+
+        open_nodes: set[str] = set()
+        for kind, payload in recorder.events:
+            nid = payload.get("node_id")
+            if kind == "node_started" and nid:
+                assert nid not in open_nodes, f"{nid} 重复 started 但未 finished"
+                open_nodes.add(nid)
+            elif kind == "node_finished" and nid:
+                assert nid in open_nodes, f"{nid} 在 started 之前就 finished"
+                open_nodes.discard(nid)
+
+    async def test_event_hook_exception_does_not_break_orchestration(self) -> None:
+        """事件回调抛异常绝不能影响任务执行。
+
+        这是 `_emit` 的核心承诺：订阅方（SSE 推送）可能因为客户端断连、
+        队列满而抛异常，但任务必须跑完。「观测失败导致业务失败」
+        是最不该出现的耦合。
+        """
+
+        def exploding(kind: str, payload: dict[str, Any]) -> None:
+            raise RuntimeError("订阅方炸了")
+
+        provider = RoutedFakeProvider(verifier_sequence=[True])
+        orch = _build_orchestrator(provider)
+        orch._on_event = exploding
+        result = await orch.run("需求")
+
+        assert result.succeeded, "回调异常不应影响任务成功"
+
+    async def test_no_hook_configured_is_silent(self) -> None:
+        """未配置 `EventHook` 时不应报错（事件是可选能力）。"""
+        provider = RoutedFakeProvider(verifier_sequence=[True])
+        orch = _build_orchestrator(provider)
+        assert orch._on_event is None
+        result = await orch.run("需求")
+        assert result.succeeded

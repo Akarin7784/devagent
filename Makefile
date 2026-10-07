@@ -4,7 +4,7 @@
 .PHONY: help install install-dev lint format typecheck test test-unit test-integration \
         test-cov test-fast check check-fix clean smoke run cli-eval index \
         pre-commit prepare-release docker-up docker-down docker-logs docker-build \
-        sandbox-build docs-links web-check web-serve
+        sandbox-build docs-links web-check web-words web-serve
 
 PYTHON := python
 SRC := src/devagent
@@ -80,7 +80,19 @@ migrate:  ## 执行数据库迁移
 # 注：web/ 为零构建前端，无需 npm install，直接打开 web/index.html 即可。
 # 只有需要本地静态服务器（避免 file:// 的 CORS 限制）时才用下面这条。
 
-web-check:  ## 校验前端（语法检查 + 纯逻辑测试，零依赖）
+web-words:  ## 导出跨语言词表（从 devagent/enums.py 生成前端可读的 fixture）
+	@$(PYTHON) -c "import sys; sys.path.insert(0, 'src'); \
+	from devagent.enums import AgentType, StepStatus; \
+	import json, pathlib; \
+	pathlib.Path('web').mkdir(exist_ok=True); \
+	pathlib.Path('web/test_contract_words.json').write_text( \
+	    json.dumps({'_generated_by': 'Makefile::web-words', \
+	                'step_status': [s.value for s in StepStatus], \
+	                'agent_type': [a.value for a in AgentType]}, \
+	               ensure_ascii=False, indent=2) + '\n', encoding='utf-8')"
+	@echo "[web-words] web/test_contract_words.json 已更新"
+
+web-check: web-words  ## 校验前端（语法检查 + 纯逻辑测试，零依赖）
 	$(NODE) --check web/graph.js
 	$(NODE) --check web/app.js
 	$(NODE) web/graph.test.js

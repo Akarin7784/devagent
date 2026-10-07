@@ -4,7 +4,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-526%20passing-brightgreen)](#测试)
+[![Tests](https://img.shields.io/badge/tests-565%20passing-brightgreen)](#测试)
 [![mypy](https://img.shields.io/badge/mypy-strict-blue)](https://mypy-lang.org/)
 [![Ruff](https://img.shields.io/badge/code%20style-ruff-000000)](https://github.com/astral-sh/ruff)
 
@@ -480,7 +480,7 @@ make web-serve          # http://localhost:5173
 前端逻辑（布局、事件叠加、diff 解析）可在无浏览器环境下测试：
 
 ```bash
-make web-check          # node --check + 40 个纯逻辑断言
+make web-check          # node --check + 46 个纯逻辑断言（先自动导出跨语言词表）
 ```
 
 ---
@@ -488,17 +488,17 @@ make web-check          # node --check + 40 个纯逻辑断言
 ## 测试
 
 ```bash
-make test            # 全量（526 个）
+make test            # 全量（565 个）
 make test-unit       # 仅单元测试
 make check           # ruff + mypy --strict
-make web-check       # 前端语法 + 逻辑测试（40 个）
+make web-check       # 前端语法 + 逻辑测试（46 个，零依赖）
 ```
 
 当前状态：
 
 ```
-526 passed in 23.2s
-40 passed (web/graph.test.js)
+565 passed in 21.1s
+46 passed (web/graph.test.js)
 ruff check .......... 通过
 ruff format --check . 通过
 mypy --strict ....... 60 个源文件，0 错误
@@ -511,6 +511,12 @@ mypy --strict ....... 60 个源文件，0 错误
 - DAG 失败传播只传一层，下游下游悬挂在 `PENDING`
 - 检查点短路回退：驳回后重试读到自己的旧检查点直接成功
 - `MetricsResponse.histograms` schema 层级不匹配（一有数据就 500）
+- 前端 `step_id` 精确匹配失效（真实值形如 `task_xxx:N1`），diff 面板恒为空
+- 前端状态映射漏登记 `ready/verifying/rejected`，静默降级为「待执行」
+
+最后两条的发现方式值得单独说：它们都不是靠"看代码"发现的，而是
+**用真实数据跑一遍**（前一条）和**用契约测试锁住后端词表全集**
+（后一条）之后才暴露的。假对象/手抄词表能让测试长期全绿地掩盖缺陷。
 
 这些不是构造的测试用例，是开发过程中真的踩到的坑。
 
@@ -581,6 +587,19 @@ mypy --strict ....... 60 个源文件，0 错误
 因为方向相反：mermaid 是**声明式**的（给它文本、它渲染静态图），
 而这里需要**实时更新**（节点状态随 SSE 事件逐秒变化）。用 mermaid
 意味着每次事件都重建整图，既慢又会丢失用户的选中状态。
+
+**为什么要为「枚举映射」写跨语言契约测试？**
+
+因为这是全项目唯一一处**无类型系统兜底**的接口：Python 枚举 `StepStatus`
+产出的字符串，被 JS 的映射表消费。漏登记一个成员的后果**不是报错**，
+而是静默降级 —— `rejected`（验证未通过）会被渲染成「待执行」，
+`orchestrator` 会退成灰色。这类缺陷不会被任何单个模块的测试发现，
+只能靠「让 Python 当唯一真相源、前端逐成员断言」来兜住。
+
+具体做法是 pytest 把枚举导出成 `web/test_contract_words.json`，
+`web/graph.test.js` 读它逐个断言覆盖。任何一端新增成员而另一端没跟上，
+测试立即变红并指出是哪个成员、后果是什么。详见
+[架构说明 §8](docs/06-架构说明.md)。
 
 **支持哪些模型？**
 

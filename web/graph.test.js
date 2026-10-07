@@ -16,10 +16,11 @@
  */
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import {
-  applyEvent, buildGraphState, computeLayers, diffStats, layoutDag,
-  parseDiff, statusGroup, statusLabel,
+  LEGEND_ITEMS, STATUS_GROUP, agentColor, applyEvent, buildGraphState,
+  computeLayers, diffStats, layoutDag, parseDiff, statusGroup, statusLabel,
 } from './graph.js';
 
 let passed = 0;
@@ -207,6 +208,8 @@ test('状态映射到视觉分组', () => {
 });
 
 test('未知状态降级为 pending 而不是 undefined', () => {
+  // 降级是为了不崩，但这只应发生在**真正未知**的字面量上。
+  // 后端枚举里的每个成员都必须在上面登记，由下面的契约测试保证。
   assert.equal(statusGroup('who-knows'), 'pending');
   assert.equal(statusGroup(undefined), 'pending');
 });
@@ -217,9 +220,107 @@ test('backtracked 与 failed 是不同的分组', () => {
   assert.notEqual(statusGroup('backtracked'), statusGroup('failed'));
 });
 
-test('状态标签覆盖全部已知状态', () => {
-  for (const s of ['pending', 'running', 'success', 'backtracked', 'failed', 'skipped']) {
-    assert.ok(statusLabel(s) && statusLabel(s) !== s, `${s} 应有中文标签`);
+test('rejected 与 failed 也是不同的分组', () => {
+  // rejected 是「被驳回、会带着反馈回退重跑」，failed 是「重试耗尽」。
+  // 二者在快照里都是终态字面量，混为一谈会让读者以为任务已经结束。
+  assert.equal(statusGroup('rejected'), 'backtrack');
+  assert.notEqual(statusGroup('rejected'), statusGroup('failed'));
+});
+
+/* ------------------------------------------------------------------ *
+ * 跨语言契约：后端枚举 → 前端映射表
+ *
+ * 这是本项目唯一一处「Python 产出字符串、JS 消费」的接口，中间没有类型
+ * 系统兜底。漏登记一个枚举成员的后果不是报错，而是**静默降级**：
+ * 状态显示成"待执行"、角色退成灰色——比不显示更误导。
+ *
+ * 因此这里不手抄词表，而是读 `test_contract_words.json`（由 Python 端
+ * `tests/conftest.py` 的 session fixture 从 enums.py 导出、并由
+ * `tests/unit/test_node_contract.py` 断言其新鲜度）。这样 Python 侧新增
+ * 枚举成员 -> fixture 更新 -> 这里立刻变红。
+ * ------------------------------------------------------------------ */
+
+const WORDS = (() => {
+  const url = new URL('./test_contract_words.json', import.meta.url);
+  let raw;
+  try {
+    raw = readFileSync(url, 'utf8');
+  } catch {
+    // 这个词表由 pytest 的 session fixture 从 devagent/enums.py 导出。
+    // 直接跑 `node web/graph.test.js` 而没跑过 pytest 时会缺文件——
+    // 给出可执行的补救命令，而不是抛一个看不懂的 ENOENT。
+    throw new Error(
+      '缺少 web/test_contract_words.json（跨语言词表）。\n'
+      + '它由 Python 侧从 devagent/enums.py 导出，请先跑一次：\n'
+      + '  PYTHONPATH=src ./.venv/Scripts/python.exe -m pytest tests/unit/test_node_contract.py\n'
+      + '或者直接跑 `make check`（会先 pytest 再 web-check）。',
+    );
+  }
+  return JSON.parse(raw);
+})();
+
+test('fixture 非空且结构正确（防止 fixture 缺失导致契约测试空跑）', () => {
+  assert.ok(Array.isArray(WORDS.step_status) && WORDS.step_status.length >= 8);
+  assert.ok(Array.isArray(WORDS.agent_type) && WORDS.agent_type.length >= 7);
+});
+
+test('StepStatus 的每个成员都有明确的视觉分组', () => {
+  for (const s of WORDS.step_status) {
+    const group = statusGroup(s);
+    // 未登记会落回 'pending'；pending 本身是合法分组，所以对
+    // 'pending' 之外的成员，只要结果仍是 'pending' 就说明漏登记了。
+    if (s !== 'pending') {
+      assert.notEqual(
+        group, 'pending',
+        `StepStatus.${s} 未在前端 STATUS_GROUP 登记，静默降级为"待执行"`,
+      );
+    }
+    assert.ok(group && typeof group === 'string');
+  }
+});
+
+test('StepStatus 的每个成员都有中文标签（不回显英文枚举名）', () => {
+  for (const s of WORDS.step_status) {
+    const label = statusLabel(s);
+    assert.notEqual(
+      label, s,
+      `StepStatus.${s} 未在前端 STATUS_LABEL 登记，界面会回显英文`,
+    );
+    assert.ok(label.length > 0);
+  }
+});
+
+test('AgentType 的每个成员都有专属配色（不共用灰色兜底）', () => {
+  const FALLBACK = agentColor('__no_such_agent__');
+  const used = new Map();
+  for (const a of WORDS.agent_type) {
+    const c = agentColor(a);
+    assert.notEqual(
+      c, FALLBACK,
+      `AgentType.${a} 未在前端 AGENT_COLOR 登记，退为兜底灰`,
+    );
+    // 两个不同角色用同一颜色 -> 图例失去区分能力
+    assert.equal(
+      used.get(c), undefined,
+      `AgentType.${a} 与 ${used.get(c)} 配色相同（${c}），无法区分`,
+    );
+    used.set(c, a);
+  }
+});
+
+test('LEGEND_ITEMS 覆盖 STATUS_GROUP 用到的全部分组', () => {
+  // 读者看到某个颜色，必须能在图例里查到它的含义。
+  const used = new Set(Object.values(STATUS_GROUP));
+  const documented = new Set(LEGEND_ITEMS.map((i) => i.group));
+  for (const g of used) {
+    assert.ok(documented.has(g), `分组 ${g} 被状态使用但图例未解释`);
+  }
+});
+
+test('LEGEND_ITEMS 的 group 可用于拼 CSS 类名（无空格/大写）', () => {
+  for (const item of LEGEND_ITEMS) {
+    assert.match(item.group, /^[a-z][a-z0-9-]*$/, `非法分组名：${item.group}`);
+    assert.ok(item.label && item.label.length > 0);
   }
 });
 

@@ -7,6 +7,60 @@
 
 ### 新增
 
+**节点级契约回归测试（跨语言边界）**
+
+- `tests/unit/test_node_contract.py`（25 个用例）：用**真实的 `DAG` 对象**
+  锁住前端依赖的两层接口
+  - `_to_view()` 产出的 `NodeView` 字典（`/tasks/{id}` 的 `nodes`）：
+    断言**精确键集合**而非 `in` 逐个检查（多字段同样是契约变更）
+  - `Orchestrator` 经 `EventHook` 发出的节点事件 payload（SSE 的 `node_*`）
+  - 覆盖 `deps` 是 `list` 非 `tuple`、`agent_type` 是普通 `str`、
+    `last_error` 的 `None → ""` 归一化、每条路径 attempt 均 `>= 1`
+- `tests/integration/test_orchestrator.py::TestNodeEventContract`（14 个用例）：
+  `_EventRecorder` 逐字段校验三类事件的键集合与取值，含
+  「钩子抛异常不得中断编排」与「未注册钩子时静默」
+- `tests/conftest.py`：新增 `contract_words_path` fixture，把
+  `devagent/enums.py` 导出为 `web/test_contract_words.json`
+- `web/graph.test.js` 新增 6 个**跨语言契约测试**：逐成员断言
+  `StepStatus` / `AgentType` 全集都被前端映射表覆盖，且
+  `LEGEND_ITEMS` 解释了每一个用到的视觉分组
+- `make web-words`：单独重新导出词表（`web-check` 会自动先跑）
+
+### 修复
+
+**前端状态映射缺口（由契约测试反向查出）**
+
+新增的跨语言契约测试一落地就暴露出 `web/graph.js` 的真实缺陷：
+`STATUS_GROUP` 只登记了 6 个状态，而 `StepStatus` 有 8 个成员。
+漏登记的后果**不是报错而是静默降级**，比不显示更误导：
+
+- `rejected` → 显示成「待执行」。这是最严重的一个：它正是快照层
+  「验证未通过」的唯一表示，却被渲染成"还没开始跑"
+- `verifying` → 显示成「待执行」（实际上验证器正在占用资源）
+- `ready` → 显示成「待执行」（实际上依赖已满足、马上要调度）
+- `AGENT_COLOR` 的键名写成 `coordinator`，而枚举里是 `orchestrator` ——
+  编排器是 DAG 图上唯一必然存在的节点，它没有颜色意味着第一眼就是错的；
+  `requirement` / `reviewer` 同样缺失
+
+修复：三张映射表补全至覆盖枚举全集，`ready` 新增独立视觉分组
+（虚线边框，与「还没轮到」的灰色区分），图例从 5 项扩到 7 项，
+并把「未知状态降级为 pending」那条**锁死错误行为的旧测试**重写为
+契约驱动（词表来自 Python，而非手抄）。
+
+**测试断言的自我修正**
+
+- `test_backtracked_is_not_a_step_status` 在编写过程中发现：
+  `backtracked` 根本不是 `StepStatus` 成员（枚举里是 `rejected`），
+  它只是事件层的派生态。原先一条「断言 `pending → pending`」的测试
+  与自己的 docstring 无关，属于白写，已替换为三条有意义的断言
+- `_FakeState.last_error` 默认 `""` 而真实 `StepState` 默认 `None`，
+  被 `_to_view` 的 `str(... or "")` 掩盖 —— 这类假对象与真实类的
+  分歧不会让任何测试变红，已用真实类测试锁住
+
+### 变更
+
+- 测试总数 526 → **565**（Python），前端 40 → **46**
+
 **前端 DAG 可视化与 diff 查看器**
 
 - `web/graph.js`：自研层次布局引擎（零依赖，约 200 行），布局与 DOM 解耦
