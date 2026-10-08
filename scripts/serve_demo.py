@@ -34,7 +34,7 @@ sys.path.insert(0, str(_ROOT / "src"))
 sys.path.insert(0, str(_ROOT / "scripts"))
 
 
-def build_app(port: int = 8812, web_dir: str | None = "web"):
+def build_app(port: int = 8812, web_dir: str | None = "web", live_reload: bool = True):
     """构造注入了 DemoProvider 的 FastAPI 应用。
 
     关键点一：**orchestrator 必须用新网关重建**。
@@ -46,8 +46,14 @@ def build_app(port: int = 8812, web_dir: str | None = "web"):
     分端口运行时前端必须靠 `?api=` 才知道后端在哪，这个参数一旦丢失
     （直接敲 5173、或从收藏夹打开）界面就报「无法连接到服务端」。
     同源后基址恒为空，问题从根上消失。传 `web_dir=None` 可关闭。
+
+    关键点三：**前端热更新**（见 `dev_reload.py`）。零构建的原生 ES 模块没有
+    HMR，而 `StaticFiles` 不发 `Cache-Control`，浏览器会按启发式规则缓存 ——
+    改完刷新还是旧的是常态。这里换成 `DevStaticFiles`（no-store）并挂一条
+    `/__dev/events` 的 SSE 流，改 `web/` 下任何文件浏览器自动整页重载。
     """
     from demo_smoke import DemoProvider
+    from dev_reload import LiveReload, install_dev_frontend
 
     from devagent.api.app import create_app
     from devagent.api.service import TaskService
@@ -60,6 +66,14 @@ def build_app(port: int = 8812, web_dir: str | None = "web"):
     if web_dir is not None:
         settings.web_dir = web_dir
     app = create_app(settings)
+
+    live: LiveReload | None = install_dev_frontend(app) if live_reload else None
+    if live_reload and live is None:
+        print(
+            "[serve_demo] 未挂载前端静态目录，热更新不可用（--web-dir 为空？）",
+            flush=True,
+        )
+
     # `app.router.lifespan_context` 已经是 `@asynccontextmanager` 包装后的
     # **可调用对象**（Starlette 在 `Router.__init__` 里替原始 lifespan 包好了）。
     # 两个必须同时满足的约束：
@@ -93,7 +107,18 @@ def build_app(port: int = 8812, web_dir: str | None = "web"):
                 f"[serve_demo] 界面与接口同源，直接打开：http://127.0.0.1:{port}/",
                 flush=True,
             )
-            yield
+            if live is not None:
+                await live.start()
+                print(
+                    "[serve_demo] 前端热更新已开启：改 web/ 下任何文件，浏览器自动刷新"
+                    "（--no-reload 可关闭）",
+                    flush=True,
+                )
+            try:
+                yield
+            finally:
+                if live is not None:
+                    await live.stop()
 
     app.router.lifespan_context = lifespan
     return app
@@ -108,11 +133,16 @@ def main() -> int:
         default="web",
         help="前端静态目录（相对项目根）；传空字符串则仅提供 API",
     )
+    parser.add_argument(
+        "--no-reload",
+        action="store_true",
+        help="关闭前端热更新（默认开启：改 web/ 自动刷新浏览器）",
+    )
     args = parser.parse_args()
 
     import uvicorn
 
-    app = build_app(args.port, web_dir=args.web_dir or None)
+    app = build_app(args.port, web_dir=args.web_dir or None, live_reload=not args.no_reload)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 

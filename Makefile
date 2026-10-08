@@ -2,7 +2,7 @@
 # 常用开发命令入口
 
 .PHONY: help install install-dev lint format typecheck test test-unit test-integration \
-        test-cov test-fast check check-fix clean smoke run cli-eval index \
+        test-cov test-fast check check-fix clean smoke run serve-demo cli-eval index \
         pre-commit prepare-release docker-up docker-down docker-logs docker-build \
         sandbox-build docs-links web-check web-words web-serve
 
@@ -66,6 +66,9 @@ smoke:  ## 端到端冒烟（无需 API Key）
 
 run:  ## 启动开发服务器
 	uvicorn devagent.api.app:create_app --factory --reload --port 8000
+
+serve-demo:  ## 演示服务器：脚本化假模型 + 前端热更新，界面与接口同源
+	PYTHONPATH=src $(PYTHON) scripts/serve_demo.py --port 8812
 
 cli-eval:  ## 运行评测（golden set）
 	$(PYTHON) scripts/run_eval.py

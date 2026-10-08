@@ -521,11 +521,24 @@ web/
 
 ```bash
 # 启动注入了脚本化假模型的 API（真实路由 + 真实 SSE，仅模型被替换）
-PYTHONPATH=src python scripts/serve_demo.py --port 8812
-# 另开一个终端托管前端
-make web-serve          # http://localhost:5173
-# 浏览器打开：http://localhost:5173/?api=http://127.0.0.1:8812
+# 前端与接口同源，直接打开 http://127.0.0.1:8812/ 即可，不需要另起静态服务器
+make serve-demo          # 等价于 PYTHONPATH=src python scripts/serve_demo.py --port 8812
 ```
+
+**开发时前端是热更新的**：改 `web/` 下任何文件（新增、修改、删除都算），
+浏览器自动整页重载，无需手动刷新。原因很具体 —— 零构建的原生 ES 模块没有 HMR，
+而 Starlette 的 `StaticFiles` **不发 `Cache-Control`**，浏览器会按启发式规则自行
+决定缓存多久，"刚改完 + F5"经常还是旧内容。因此开发服务器改用
+`DevStaticFiles`（`no-store`，手动刷新也必定拿到最新文件）并挂一条
+`/__dev/events` 的 SSE 流推送变更。客户端脚本由服务端注入 `index.html`，
+`web/` 目录里不残留任何开发代码。`--no-reload` 可关闭。
+
+> 需要页面别自动刷新时（比如用无头浏览器截图 —— 那条 SSE 永不结束，
+> `networkidle` 与 `--virtual-time-budget` 会一直等下去），在 URL 上加
+> `?no-reload=1`。
+>
+> 只监听前端目录。改 `src/devagent/**` 需要重启进程才生效 —— 浏览器重载救不了
+> Python 代码，那属于 `devagent serve --reload` 的职责。
 
 前端逻辑可在无浏览器环境下测试：
 
