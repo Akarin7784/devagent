@@ -530,7 +530,7 @@ make web-serve          # http://localhost:5173
 前端逻辑可在无浏览器环境下测试：
 
 ```bash
-make web-check   # 语法检查 + 模块图完整性 + 73 个纯逻辑断言（零依赖）
+make web-check   # 语法检查 + 模块图完整性 + 175 个纯逻辑断言（零依赖）
 ```
 
 ---
@@ -542,7 +542,7 @@ pip install -e ".[dev,db]"   # [dev] 是测试工具；[db] 供持久化层用�
 make test            # 全量（659 个）
 make test-unit       # 仅单元测试
 make check           # ruff + mypy --strict
-make web-check       # 前端语法 + 模块图 + 逻辑测试（178 个，零依赖）
+make web-check       # 前端语法 + 模块图 + 逻辑测试（175 个，零依赖）
 ```
 
 > `[db]` 不是可选项：`tests/unit/test_db.py`（15 个用例，覆盖真实 SQL 方言、

@@ -812,6 +812,272 @@ test('回填值是字符串，可直接作为 input 的 value（不出现 "undef
 });
 
 /* ================================================================== *
+ * 8. 设置页分区：四个模块不得再挤在一页，且 ?tab= 必须被归一
+ * ================================================================== *
+ * 现场：设置页把「后端连接 / 外观 / 数据 / 关于」四张卡片堆在同一页 ——
+ * 想切个主题，也要先滚过一整块连接表单。
+ *
+ * 改成 Tab 分区后引入了三个新的**静默失败模式**，这一节守住它们：
+ *   1. `?tab=` 来自 URL，是不可信输入。拼错、旧书签、手改给出的分区 id
+ *      若直接拿去匹配面板，结果是**空白面板且没有任何报错** ——
+ *      看起来就像"设置页坏了"，而不是"链接错了"；
+ *   2. "分区"若只是视觉折叠（四张卡片都建出来再 CSS 隐藏），
+ *      用户看到的那一屏仍然把四个表单都付掉了。这里直接数 tabpanel 的个数，
+ *      并断言另一个分区的标志文本不在场；
+ *   3. 标签上的连接状态点若"渲染时读一次"，页面在健康探测返回前渲染完成时
+ *      就会一直标红 —— 顶栏写着「服务正常」而标签是红的，同屏两个相反结论。
+ */
+
+/**
+ * 可交互 DOM stub：在 `installDomStub` 之上补几条真实 DOM 语义。
+ *
+ *   - 造出来的节点 `instanceof Node`：否则 `el()` 的 children 分支会把嵌套
+ *     元素压成纯文本，"数一数有几个 tab / 几个 panel"这类结构断言无从谈起；
+ *   - `firstChild` + `removeChild`：让 `util.clear()` 真的能清空 ——
+ *     这样"切换分区后只剩一个面板"才是可断言的事实，而不是测试自己的假设；
+ *   - HTML 元素的 `tagName` 大写：页面靠它判断"焦点是不是在输入框里"；
+ *   - `contains` + `className`/`setAttribute('class')` 同步：前者是输入框判断
+ *     用到的入口，后者让"改没改到 class"不取决于走的是哪条赋值路径；
+ *   - `addEventListener` 真的记录，使"点击标签"可以被模拟。
+ */
+function installInteractiveDomStub() {
+  globalThis.Node = class Node {};
+  const doc = installDomStub();
+  const rawElement = doc.createElement;
+  const rawText = doc.createTextNode;
+
+  doc.createElement = (tag) => {
+    const node = Object.setPrototypeOf(rawElement(tag), globalThis.Node.prototype);
+    // 真实 DOM 里 HTML 元素的 tagName 是**大写**的（'INPUT' 而非 'input'）。
+    // 页面靠它判断"焦点是不是在输入框里"，小写会让那条分支在测试里永远不成立。
+    node.tagName = String(tag).toUpperCase();
+    Object.defineProperty(node, 'firstChild', { get: () => node.children[0] || null });
+    node.removeChild = (child) => {
+      const i = node.children.indexOf(child);
+      if (i >= 0) node.children.splice(i, 1);
+      child.parent = null;
+      return child;
+    };
+    // 页面用 container.contains(activeElement) 判断"用户是否正在输入"，
+    // 少了它这条分支在测试里会直接抛错（而真实 DOM 一切正常）。
+    node.contains = (other) => {
+      for (let p = other; p; p = p.parent) if (p === node) return true;
+      return false;
+    };
+    // `el()` 用 className 赋值，而页面更新状态点时用 setAttribute('class') ——
+    // 真实 DOM 里这是同一条属性，stub 必须保持一致，否则"改没改到 class"
+    // 会取决于用的是哪条路径，断言就变成假的。
+    let cls = '';
+    Object.defineProperty(node, 'className', {
+      get: () => cls,
+      set: (v) => {
+        cls = String(v ?? '');
+        node.attrs.class = cls;
+        node.classList = new Set(cls.split(/\s+/).filter(Boolean));
+      },
+    });
+    const rawSetAttribute = node.setAttribute.bind(node);
+    node.setAttribute = (k, v) => {
+      rawSetAttribute(k, v);
+      if (k === 'class') cls = String(v ?? '');
+    };
+    const listeners = {};
+    node.addEventListener = (type, fn) => { (listeners[type] ||= []).push(fn); };
+    node.fire = (type, event = {}) => { (listeners[type] || []).forEach((fn) => fn(event)); };
+    return node;
+  };
+  doc.createTextNode = (text) => Object.setPrototypeOf(rawText(text), globalThis.Node.prototype);
+  return doc;
+}
+
+installInteractiveDomStub();
+
+const { icon } = await import('./js/icons.js');
+const {
+  SETTINGS_TABS,
+  resolveSettingsTab,
+  default: renderSettings,
+} = await import('./js/pages/settings.js');
+
+/** 按 ARIA role 收集节点。 */
+function byRole(root, role) {
+  return walkStub(root).filter((n) => n.attrs && n.attrs.role === role);
+}
+
+/**
+ * 已渲染 fixture 的清理函数。
+ *
+ * 设置页会 `subscribe('connected', ...)`，而本节的 fixture 是"渲染完就不管"
+ * 的 —— 若不回收，一次 `store.set({connected: …})` 会让所有历史页面一起重绘，
+ * 断言就失去了观察对象。需要触发订阅的用例先只留下自己那一份。
+ */
+const SETTINGS_DISPOSERS = [];
+
+/** 渲染设置页；`tab` 为 null 表示 URL 上不带 ?tab=。 */
+async function renderSettingsAt(tab) {
+  const root = stubNode('div');
+  const params = new URLSearchParams(tab == null ? '' : `tab=${tab}`);
+  const dispose = await renderSettings(root, { params, navigate: () => {} });
+  if (typeof dispose === 'function') SETTINGS_DISPOSERS.push(dispose);
+  return root;
+}
+
+/**
+ * 每个分区的"标志文本"：只出现在该分区里，用来断言另一个分区没有被渲染。
+ * 注意不能用 tab 标签本身（它永远在），也不能用跨分区重复的词
+ * （如「主题」同时出现在外观区与关于区的 kv 里）。
+ */
+const SETTINGS_MARKS = {
+  connection: '后端 API 地址',
+  appearance: '减少动态效果',
+  data: '清除本地偏好',
+  about: '前端形态',
+};
+
+/**
+ * 预渲染各分区。
+ *
+ * 渲染函数是异步的，而本文件的 `test()` 只接同步断言（不为它引入异步运行器），
+ * 所以把"渲染"作为 fixture 在这里一次做完，断言本身保持纯的、同步的。
+ */
+const RENDERED_SETTINGS = new Map();
+for (const tab of SETTINGS_TABS) {
+  RENDERED_SETTINGS.set(tab.id, await renderSettingsAt(tab.id));
+}
+
+/** 点击断言专用的 fixture：它会被"点击"改写，与只读断言共用会互相污染。 */
+const CLICK_ROOT = await renderSettingsAt('connection');
+
+/** 订阅断言专用的 fixture：它会被 store 事件改写，必须与只读 fixture 隔离。 */
+const LIVE_ROOT = await renderSettingsAt('connection');
+
+test('设置页的四个分区都在，id 唯一，图标真实存在', () => {
+  const ids = SETTINGS_TABS.map((t) => t.id);
+  assert.equal(new Set(ids).size, ids.length, `分区 id 重复：${ids.join(', ')}`);
+  for (const want of ['connection', 'appearance', 'data', 'about']) {
+    assert.ok(ids.includes(want), `缺少分区「${want}」`);
+  }
+  for (const t of SETTINGS_TABS) {
+    // icon() 遇到未定义名字只返回空串并告警，界面不会报错 —— 只能靠断言守
+    assert.ok(icon(t.icon, 15).length > 0,
+      `分区「${t.label}」的图标 "${t.icon}" 在 icons.js 里不存在（界面会静默少一个图标）`);
+  }
+});
+
+test('未知/空的 ?tab= 一律回落到第一个分区（否则渲染出空白面板）', () => {
+  const fallback = SETTINGS_TABS[0].id;
+  for (const bad of ['', '   ', 'nope', 'SETTINGS', '../etc', 'connection ', null, undefined, 42, {}, []]) {
+    assert.equal(resolveSettingsTab(bad), fallback,
+      `?tab=${JSON.stringify(bad)} 没有被归一 —— 会渲染出一个空白面板且没有任何报错`);
+  }
+});
+
+test('合法 ?tab= 原样保留，并容忍复制链接常见的首尾空白', () => {
+  for (const t of SETTINGS_TABS) {
+    assert.equal(resolveSettingsTab(t.id), t.id);
+    assert.equal(resolveSettingsTab(` ${t.id} `), t.id, '首尾空白应被裁掉，而不是当成非法值');
+  }
+});
+
+test('任一时刻只渲染一个分区面板，其余分区的标志内容不出现', () => {
+  for (const tab of SETTINGS_TABS) {
+    const root = RENDERED_SETTINGS.get(tab.id);
+    const panels = byRole(root, 'tabpanel');
+    assert.equal(panels.length, 1,
+      `?tab=${tab.id} 渲染了 ${panels.length} 个面板 —— 分区没有真正生效，模块又挤在一页了`);
+    assert.equal(panels[0].attrs.id, `panel-${tab.id}`, '面板 id 与当前分区不一致');
+
+    const text = textsOf(root).join(' | ');
+    assert.ok(text.includes(SETTINGS_MARKS[tab.id]),
+      `?tab=${tab.id} 时当前分区的内容没有渲染出来：${text}`);
+    for (const other of SETTINGS_TABS) {
+      if (other.id === tab.id) continue;
+      assert.ok(!text.includes(SETTINGS_MARKS[other.id]),
+        `?tab=${tab.id} 时仍渲染了「${other.label}」区的内容（${SETTINGS_MARKS[other.id]}）—— 还是挤在一页`);
+    }
+  }
+});
+
+test('标签栏是标准 ARIA tablist：恰好一个选中，且与面板互指', () => {
+  const root = RENDERED_SETTINGS.get('appearance');
+  const tabs = byRole(root, 'tab');
+  assert.equal(tabs.length, SETTINGS_TABS.length, '标签数量与分区定义不一致');
+
+  const selected = tabs.filter((t) => t.attrs['aria-selected'] === 'true');
+  assert.equal(selected.length, 1, '必须有且只有一个选中标签（多选会让 aria 语义失效）');
+  assert.equal(selected[0].attrs.id, 'tab-appearance');
+
+  const panel = byRole(root, 'tabpanel')[0];
+  assert.equal(panel.attrs['aria-labelledby'], selected[0].attrs.id);
+  assert.equal(selected[0].attrs['aria-controls'], panel.attrs.id);
+
+  // 悬空 IDREF 是"看不见的错"：面板只渲染当前分区，若给未选中的标签
+  // 也挂 aria-controls，就会指向不存在的元素（aria-valid-attr-value 会报错）
+  const ids = new Set(walkStub(root).map((n) => n.attrs?.id).filter(Boolean));
+  for (const t of tabs) {
+    const ref = t.attrs['aria-controls'];
+    if (ref == null) continue;
+    assert.ok(ids.has(ref), `aria-controls="${ref}" 指向一个不存在的元素`);
+  }
+
+  assert.equal(selected[0].attrs.tabindex, '0', '选中的标签必须能被 Tab 聚焦');
+  for (const t of tabs.filter((x) => x !== selected[0])) {
+    assert.equal(t.attrs.tabindex, '-1', 'roving tabindex：未选中的标签不应各占一个 Tab 停留点');
+  }
+});
+
+test('点击分区只改 URL、不派发 hashchange，切换后仍只剩一个面板', () => {
+  // 先把 hash 摆到"当前就是 connection"，才能观察 replace 的跨分区行为
+  setHashOnly('#/settings?tab=connection');
+  const root = CLICK_ROOT;
+  assert.equal(byRole(root, 'tabpanel').length, 1);
+
+  const target = byRole(root, 'tab').find((t) => t.attrs.id === 'tab-data');
+  assert.ok(target, '标签栏里没有「数据」分区');
+
+  const types = dispatchedTypes(() => target.fire('click'));
+  assert.deepEqual(types, [],
+    '切分区派发了 hashchange —— shell 会 dispose 掉当前页面再重建（切线不该打断页面）');
+  assert.equal(WINSTUB.win.location.hash, '#/settings?tab=data',
+    'URL 没跟着分区走：刷新与分享都会回到错误的分区');
+
+  const panels = byRole(root, 'tabpanel');
+  assert.equal(panels.length, 1, `切换后出现了 ${panels.length} 个面板 —— 旧分区的面板没有被替换掉`);
+  assert.equal(panels[0].attrs.id, 'panel-data');
+});
+
+test('后端连接状态变化会让标签上的状态点跟着变，且不冲掉正在输入的地址', () => {
+  // 只保留本用例自己的订阅：其它 fixture 已经断言完毕，不该再跟着重绘
+  const live = SETTINGS_DISPOSERS.pop();
+  while (SETTINGS_DISPOSERS.length) SETTINGS_DISPOSERS.pop()();
+
+  /** 标签上的状态点（面板内的状态区也有一个 dot，取 DOM 顺序里的第一个）。 */
+  const firstDot = () => walkStub(LIVE_ROOT)
+    .find((n) => typeof n.attrs?.class === 'string' && /(^|\s)dot(\s|$)/.test(n.attrs.class));
+
+  assert.ok(firstDot(), '标签上没有状态点');
+  assert.match(firstDot().attrs.class, /dot-danger/, '未连接时状态点应为警示色');
+
+  // 场景：设置页在健康探测返回**之前**就渲染完成（connected=false），
+  // 随后探测成功。若状态点是"渲染时读一次"，就会出现
+  // 「顶栏写着服务正常、标签仍然标红」这种自相矛盾的界面。
+  globalThis.document.activeElement = walkStub(LIVE_ROOT).find((n) => n.tagName === 'INPUT');
+  assert.ok(globalThis.document.activeElement, '连接区没有地址输入框');
+
+  store.set({ connected: true });
+
+  assert.match(firstDot().attrs.class, /dot-success/,
+    '状态点没有随 store 更新 —— 顶栏显示「服务正常」而标签仍是红的');
+  assert.ok(walkStub(LIVE_ROOT).includes(globalThis.document.activeElement),
+    '正在输入的输入框被整体重绘冲掉了（光标与半截地址一起丢）');
+
+  // 收尾：恢复焦点并回收订阅，避免影响后续用例
+  globalThis.document.activeElement = null;
+  live();
+  store.set({ connected: false });
+});
+
+/* ================================================================== *
  * 结果
  * ================================================================== */
 

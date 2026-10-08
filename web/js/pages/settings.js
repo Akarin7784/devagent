@@ -1,7 +1,23 @@
 /**
  * 设置页。
  *
- * 三组配置：后端连接（含连通性测试）、外观偏好、数据刷新策略。
+ * 四个分区：后端连接（含连通性测试）、外观、数据、关于。
+ *
+ * ## 为什么分区展示，而不是一页堆叠
+ *
+ * 四个分区的内容量差异极大：连接区有输入框、实时状态与可达性告警，
+ * 关于区只有静态信息。堆在一页里的后果是首屏被**最不常改**的内容占满 ——
+ * 只想切个主题，也要先滚过一整块连接表单。分区后每屏只呈现一个主题。
+ *
+ * ## 当前分区记在 URL 上（`#/settings?tab=appearance`）
+ *
+ * 刷新、分享、前进后退都能回到同一个分区，而不是"切了分区一刷新就回到第一个"。
+ * 复用工作台 `?task=` 的同一套机制：同路由 replace **不触发**外壳拆页重建
+ * （见 store.js 中 `navigate` 的注释），所以切分区不会打断页面状态。
+ *
+ * `?tab=` 是不可信输入（手改、旧书签、拼错的链接），必须经
+ * `resolveSettingsTab` 归一 —— 否则一个不存在的分区 id 会渲染出
+ * **空白面板且没有任何报错**，看起来就像"设置页坏了"。
  *
  * 设计原则：**每一项都必须有明确的作用说明与生效时机**。
  * 设置项不说清「改了什么、什么时候生效」，用户就只能靠试错 ——
@@ -19,30 +35,208 @@ import {
   toast,
 } from '../components.js';
 import { icon } from '../icons.js';
-import { getState, navigate, resetState } from '../store.js';
+import { getState, navigate, resetState, subscribe } from '../store.js';
 import { clear, el, mount, storage } from '../util.js';
+
+/**
+ * 分区定义。
+ *
+ * 顺序即标签顺序；`icon` 必须是 icons.js 里真实存在的名字 ——
+ * `icon()` 遇到未定义图标只返回空串并打印告警，界面不会报错，
+ * 所以这里由测试守着（见 pages.test.js 第 8 节）。
+ */
+export const SETTINGS_TABS = [
+  { id: 'connection', label: '后端连接', icon: 'link' },
+  { id: 'appearance', label: '外观', icon: 'sun' },
+  { id: 'data', label: '数据', icon: 'database' },
+  { id: 'about', label: '关于', icon: 'info' },
+];
+
+/**
+ * 把任意来源的分区 id 归一为**真实存在**的分区。
+ *
+ * 未知值回落到第一个分区，而不是返回空串：一个拼错的 `?tab=` 应该安静地
+ * 回到默认分区，而不是给用户一个空白面板。
+ *
+ * @param {unknown} raw
+ * @returns {string} 一定存在于 `SETTINGS_TABS` 中的 id
+ */
+export function resolveSettingsTab(raw) {
+  const id = typeof raw === 'string' ? raw.trim() : '';
+  return SETTINGS_TABS.some((t) => t.id === id) ? id : SETTINGS_TABS[0].id;
+}
+
+/**
+ * 当前分区。
+ *
+ * 放在模块级而不是渲染函数内：改主题、重测连接都会触发 `paint()` 重建整页，
+ * 若分区状态跟着重建，用户会被莫名弹回第一个分区。
+ */
+let activeTab = SETTINGS_TABS[0].id;
 
 export default async function renderSettings(root, ctx) {
   const container = el('div');
   root.append(container);
   let disposed = false;
 
+  // URL 优先（深链 / 刷新 / 前进后退）；没有参数时沿用本次会话内停留的分区。
+  const fromUrl = ctx?.params?.get?.('tab');
+  if (fromUrl != null) {
+    const resolved = resolveSettingsTab(fromUrl);
+    // 非法值就地纠正 URL：否则地址栏写着 ?tab=xyz 而界面显示"后端连接"，
+    // 复制出去又是一个坏链接。
+    if (resolved !== fromUrl) navigate('settings', { tab: resolved }, true);
+    activeTab = resolved;
+  }
+
   function paint() {
     if (disposed) return;
     clear(container);
-    mount(container, ...buildSections());
+    mount(container, ...buildLayout());
   }
 
-  /* ---------- 分区 ---------- */
+  /**
+   * 标签上的连接状态点及其屏幕阅读器文本（由 `buildTabs` 在渲染时登记）。
+   *
+   * 为什么必须订阅而不是"渲染时读一次"：设置页可能在健康探测返回**之前**
+   * 就渲染完成 —— 那一刻 `connected` 还是 false，点会一直红着，而顶栏稍后
+   * 显示「服务正常」。同一个屏幕上两个相反的结论，比不显示状态更糟。
+   */
+  let statusDot = null;
+  let statusText = null;
 
-  function buildSections() {
-    return [
-      buildHead(),
-      buildConnectionCard(),
-      buildAppearanceCard(),
-      buildDataCard(),
-      buildAboutCard(),
-    ];
+  /** 焦点是否落在本页的文本输入控件里。 */
+  function isTypingInPage() {
+    const active = document.activeElement;
+    if (!active || !container.contains(active)) return false;
+    const tag = active.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || active.isContentEditable === true;
+  }
+
+  /**
+   * 连接状态变化的应变。
+   *
+   * - 正在输入：只就地更新状态点。整页重绘会把连接区输入框里刚敲的地址
+   *   连同光标一起冲掉（observability 页踩过同一个坑）；
+   * - 否则整页重绘：卡片里的「已连接/未连接」与「后端不可达」告警一并刷新。
+   */
+  function onConnectionChange() {
+    if (!isTypingInPage()) {
+      paint();
+      return;
+    }
+    if (!statusDot) return;
+    const ok = getState('connected');
+    statusDot.setAttribute('class', `dot ${ok ? 'dot-success' : 'dot-danger'}`);
+    if (statusText) statusText.textContent = ok ? '已连接' : '未连接';
+  }
+
+  // 订阅必须回收，否则每次进入设置页都会多一个永久订阅者（往已分离的 DOM 里写）
+  const unsubscribe = subscribe('connected', onConnectionChange);
+
+  /* ---------- 分区切换 ---------- */
+
+  function selectTab(id) {
+    const next = resolveSettingsTab(id);
+    if (next === activeTab) return;
+    activeTab = next;
+    // 只改 URL（replace）：不写历史记录、不派发 hashchange，
+    // 因此外壳不会拆掉当前页面再重建（切线不该打断页面）。
+    navigate('settings', { tab: activeTab }, true);
+    paint();
+  }
+
+  function onTabKeydown(event, index) {
+    // WAI-ARIA tablist 的标准键盘交互：左右切换，Home/End 到首尾。
+    const step = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
+    let nextIndex = null;
+    if (step) nextIndex = (index + step + SETTINGS_TABS.length) % SETTINGS_TABS.length;
+    else if (event.key === 'Home') nextIndex = 0;
+    else if (event.key === 'End') nextIndex = SETTINGS_TABS.length - 1;
+    if (nextIndex == null) return;
+    event.preventDefault();
+    selectTab(SETTINGS_TABS[nextIndex].id);
+    // paint() 重造了 DOM，焦点必须重新落到当前标签上，否则键盘用户会掉出 tablist
+    document.getElementById(`tab-${activeTab}`)?.focus();
+  }
+
+  /* ---------- 布局 ---------- */
+
+  function buildLayout() {
+    return [buildHead(), buildTabs(), buildPanel()];
+  }
+
+  /** 标签栏。ARIA tabs 模式：tablist / tab / aria-selected / aria-controls。 */
+  function buildTabs() {
+    const list = el('div', {
+      class: 'tabs',
+      attrs: { role: 'tablist', 'aria-label': '设置分区' },
+    });
+
+    SETTINGS_TABS.forEach((tab, index) => {
+      const selected = tab.id === activeTab;
+      const btn = el('button', {
+        class: 'tab',
+        attrs: {
+          type: 'button',
+          role: 'tab',
+          id: `tab-${tab.id}`,
+          'aria-selected': String(selected),
+          // 只给选中的标签挂 aria-controls：面板是"只渲染当前分区"，
+          // 给未选中的标签也挂上会留下悬空 IDREF（aria-valid-attr-value 会报错）
+          ...(selected ? { 'aria-controls': `panel-${tab.id}` } : {}),
+          // roving tabindex：tablist 整体只占一个 Tab 停留点
+          tabindex: selected ? '0' : '-1',
+        },
+        on: {
+          click: () => selectTab(tab.id),
+          keydown: (event) => onTabKeydown(event, index),
+        },
+      });
+      if (tab.icon) btn.append(el('span', { html: icon(tab.icon, 15) }));
+      btn.append(el('span', { text: tab.label }));
+      // 连接状态直接标在标签上：否则"后端通不通"必须先切到该分区才知道。
+      // 颜色不是唯一载体 —— 屏幕阅读器读的是 sr-only 文本。
+      if (tab.id === 'connection') {
+        const ok = getState('connected');
+        statusDot = el('span', {
+          class: `dot ${ok ? 'dot-success' : 'dot-danger'}`,
+          attrs: { 'aria-hidden': 'true' },
+        });
+        statusText = el('span', { class: 'sr-only', text: ok ? '已连接' : '未连接' });
+        btn.append(statusDot, statusText);
+      }
+      list.append(btn);
+    });
+
+    return list;
+  }
+
+  /** 面板容器：`id` 与当前 tab 的 `aria-controls` 对应。 */
+  function buildPanel() {
+    return el('div', {
+      attrs: {
+        role: 'tabpanel',
+        id: `panel-${activeTab}`,
+        'aria-labelledby': `tab-${activeTab}`,
+      },
+      style: { 'margin-top': 'var(--space-4)' },
+    }, [buildActiveCard()]);
+  }
+
+  /** 只构建当前分区的卡片 —— 这是"不再挤在一页"的实质。 */
+  function buildActiveCard() {
+    switch (activeTab) {
+      case 'appearance':
+        return buildAppearanceCard();
+      case 'data':
+        return buildDataCard();
+      case 'about':
+        return buildAboutCard();
+      case 'connection':
+      default:
+        return buildConnectionCard();
+    }
   }
 
   function buildHead() {
@@ -51,7 +245,7 @@ export default async function renderSettings(root, ctx) {
         el('h1', { text: '设置' }),
         el('p', {
           class: 'page-head-desc',
-          text: '后端连接、外观偏好与数据刷新策略。所有偏好保存在浏览器本地，不会上传到服务端。',
+          text: '后端连接、外观、数据与关于，按分区查看。所有偏好保存在浏览器本地，不会上传到服务端。',
         }),
       ]),
     ]);
@@ -380,9 +574,8 @@ export default async function renderSettings(root, ctx) {
 
   paint();
 
-  void ctx;
-
   return () => {
     disposed = true;
+    unsubscribe();
   };
 }
