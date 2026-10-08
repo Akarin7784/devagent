@@ -66,6 +66,7 @@ def build_app(port: int = 8812, web_dir: str | None = "web", live_reload: bool =
     if web_dir is not None:
         settings.web_dir = web_dir
     app = create_app(settings)
+    app.state.demo_mode = True
 
     live: LiveReload | None = install_dev_frontend(app) if live_reload else None
     if live_reload and live is None:

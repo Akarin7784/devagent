@@ -11,9 +11,9 @@
  * 页面模块只负责往 `#page-root` 里渲染内容，不需要感知外壳。
  */
 
-import { api, getApiBase, requestEvent, setApiBase } from './api.js';
-import { button, iconEl, openModal, toast } from './components.js';
-import { icon } from './icons.js';
+import { api, getApiBase, requestEvent, setApiBase } from './api.js?v=20261008-live';
+import { button, iconButton, iconEl, openModal, toast } from './components.js?v=20261008-live';
+import { icon } from './icons.js?v=20261008-live';
 import {
   NAV_GROUPS,
   ROUTES,
@@ -24,8 +24,8 @@ import {
   routeById,
   set,
   subscribe,
-} from './store.js';
-import { $, clear, el, fromHTML, mount, storage } from './util.js';
+} from './store.js?v=20261008-live';
+import { $, activateModal, clear, el, fromHTML, mount, storage } from './util.js?v=20261008-live';
 
 /* ------------------------------------------------------------------ *
  * 主题
@@ -118,7 +118,7 @@ export async function probeHealth() {
       version: h?.version || '',
       healthDetail: providers.length
         ? `${providers.join(' / ')} · 指标${h?.observability_enabled ? '开' : '关'}`
-        : '已连接 · 未配置模型（仅离线冒烟）',
+        : '已连接 · 未配置模型',
     });
     return { ok: true, providers, observability: !!h?.observability_enabled };
   } catch (err) {
@@ -282,6 +282,13 @@ function buildNav() {
           href: `#/${r.id}`,
           ...(active ? { 'aria-current': 'page' } : {}),
         },
+        on: { click: (event) => {
+          if (event.button > 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+          // 先导航再收起抽屉，避免设置 inert 中断链接的默认激活行为。
+          event.preventDefault();
+          navigate(r.id);
+          toggleMobileNav(false);
+        } },
       });
       item.append(fromHTML(icon(r.icon, 17)));
       item.append(el('span', { text: r.label }));
@@ -371,11 +378,11 @@ function buildTopbar() {
   toggle.append(fromHTML(icon('menu', 18)));
 
   const title = el('div', { class: 'topbar-title' }, [
-    el('h1', { id: 'page-title', text: route.title }),
-    el('div', { class: 'subtitle', id: 'page-desc', text: route.desc }),
+    el('h1', { attrs: { id: 'page-title' }, text: route.title }),
+    el('div', { class: 'subtitle', attrs: { id: 'page-desc' }, text: route.desc }),
   ]);
 
-  statusBadge = el('span', { class: 'badge badge-neutral' });
+  statusBadge = el('span', { class: 'badge badge-neutral', attrs: { id: 'topbar-status' } });
 
   themeBtn = el('button', {
     class: 'btn btn-ghost btn-icon theme-toggle',
@@ -400,6 +407,7 @@ function buildTopbar() {
  * ------------------------------------------------------------------ */
 
 let navOverlay = null;
+let releaseMobileNav = null;
 
 function toggleMobileNav(force) {
   const sidebar = $('app-sidebar');
@@ -407,6 +415,8 @@ function toggleMobileNav(force) {
   const open = force ?? !sidebar.dataset.open;
 
   if (open) {
+    if (sidebar.dataset.open) return;
+    sidebar.inert = false;
     sidebar.dataset.open = 'true';
     sidebar.style.transform = 'translateX(0)';
     navOverlay = el('div', {
@@ -414,12 +424,12 @@ function toggleMobileNav(force) {
       on: { click: () => toggleMobileNav(false) },
     });
     document.body.append(navOverlay);
+    releaseMobileNav = activateModal(sidebar, { onEscape: () => toggleMobileNav(false) });
     document.querySelector('.nav-toggle')?.setAttribute('aria-expanded', 'true');
-    // 点导航后自动收起 —— 移动端没有「同时看菜单和内容」的空间
-    sidebar.querySelectorAll('.nav-item').forEach((a) => {
-      a.addEventListener('click', () => toggleMobileNav(false), { once: true });
-    });
   } else {
+    releaseMobileNav?.();
+    releaseMobileNav = null;
+    sidebar.inert = !window.matchMedia('(min-width: 1024px)').matches;
     delete sidebar.dataset.open;
     sidebar.style.transform = '';
     navOverlay?.remove();
@@ -428,9 +438,9 @@ function toggleMobileNav(force) {
   }
 }
 
-// 视口变宽时强制收起移动导航，否则会留下一个残留的遮罩
-window.matchMedia('(min-width: 1024px)').addEventListener('change', (e) => {
-  if (e.matches) toggleMobileNav(false);
+// 跨越桌面断点时收起抽屉，并同步隐藏侧栏的键盘可达性。
+window.matchMedia('(min-width: 1024px)').addEventListener('change', () => {
+  toggleMobileNav(false);
 });
 
 /* ------------------------------------------------------------------ *
@@ -494,6 +504,7 @@ async function renderRoute() {
   const route = routeById(parseHash().id);
   const root = $('page-root');
   if (!root) return;
+  root.dataset.page = route.id;
 
   if (typeof disposeCurrent === 'function') {
     try {
@@ -566,6 +577,10 @@ function errorPage(err, route) {
  * 构建外壳并启动。
  * @param {object} [opts]
  */
+function badgeWorkspace() {
+  return el('span', { class: 'workspace-local', text: '本地' });
+}
+
 export async function mountShell() {
   // 主题尽早就位，减少首屏闪色（FOUC）
   applyTheme(storage.get(THEME_KEY, 'system'));
@@ -583,10 +598,10 @@ export async function mountShell() {
   const app = $('app');
 
   const brand = el('div', { class: 'brand' }, [
-    el('div', { class: 'brand-mark', text: 'DA' }),
+    el('div', { class: 'brand-mark', html: icon('terminal', 19) }),
     el('div', { class: 'brand-text' }, [
       el('div', { class: 'brand-name', text: 'DevAgent' }),
-      el('div', { class: 'brand-tagline', text: '多 Agent 协作 · 上下文工程' }),
+      el('div', { class: 'brand-tagline', text: '你的研发协作空间' }),
     ]),
   ]);
 
@@ -606,10 +621,12 @@ export async function mountShell() {
   docsLink.append(fromHTML(icon('book', 17)));
   docsLink.append(el('span', { text: 'API 文档' }));
 
+  const closeNav = iconButton('close', { label: '关闭导航菜单', onClick: () => toggleMobileNav(false) });
+  closeNav.classList.add('mobile-nav-close');
   const sidebar = el(
     'aside',
     { class: 'app-sidebar', attrs: { id: 'app-sidebar' } },
-    [brand, nav, el('div', { class: 'sidebar-foot' }, [connIndicator(), docsLink])]
+    [closeNav, brand, el('div', { class: 'workspace-label' }, [fromHTML(icon('folder', 14)), el('span', { text: '当前工作区' }), badgeWorkspace()]), nav, el('div', { class: 'sidebar-foot' }, [connIndicator(), docsLink])]
   );
 
   const main = el('div', { class: 'app-main' }, [
@@ -627,6 +644,7 @@ export async function mountShell() {
 
   clear(app);
   app.append(sidebar, main);
+  sidebar.inert = !window.matchMedia('(min-width: 1024px)').matches;
 
   initProgress();
 

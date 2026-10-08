@@ -28,9 +28,9 @@ import { readFileSync } from 'node:fs';
 
 // 静态导入（而非动态 import）：让「真源唯一性」的断言保持同步，
 // 不必给测试运行器加 async 支持。
-import * as components from './js/components.js';
-import * as graphReexports from './graph.js';
-import * as status from './js/status.js';
+import * as components from './js/components.js?v=20261008-live';
+import * as graphReexports from './graph.js?v=20261008-live';
+import * as status from './js/status.js?v=20261008-live';
 import {
   AGENT_COLOR,
   AGENT_FALLBACK_COLOR,
@@ -49,7 +49,7 @@ import {
   statusTone,
   taskStatusBadge,
   taskStatusLabel,
-} from './js/status.js';
+} from './js/status.js?v=20261008-live';
 
 let passed = 0;
 const failures = [];

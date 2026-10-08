@@ -29,6 +29,12 @@ class ProviderConfig(BaseModel):
     base_url: str = ""
     timeout_seconds: float = Field(default=120.0, gt=0)
     max_retries: int = Field(default=3, ge=0)
+    protocol: Literal["openai", "anthropic"] = "openai"
+    auth_mode: Literal["bearer", "api-key", "none"] = "bearer"
+    send_temperature: bool = True
+    max_tokens_field: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
+    input_price_per_million: float = Field(default=0.0, ge=0)
+    output_price_per_million: float = Field(default=0.0, ge=0)
 
     @property
     def enabled(self) -> bool:
@@ -39,9 +45,26 @@ class ProviderConfig(BaseModel):
         而 ``SecretStr("")`` 是"有值"的 —— 早先的实现据此把 provider 判为
         enabled，于是运行时报的是上游 401，而不是一句清楚的"未配置"。
         """
-        if self.api_key is None or not self.api_key.get_secret_value().strip():
+        if (self.auth_mode != "none" or self.protocol == "anthropic") and (
+            self.api_key is None or not self.api_key.get_secret_value().strip()
+        ):
             return False
         return bool(self.base_url.strip())
+
+    @field_validator("base_url")
+    @classmethod
+    def _validate_base_url(cls, value: str) -> str:
+        from urllib.parse import urlsplit
+
+        value = value.strip().rstrip("/")
+        if not value:
+            return value
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("供应商地址必须是 http(s) URL")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("供应商地址不能包含凭据、查询参数或片段")
+        return value
 
 
 class ModelsConfig(BaseModel):
@@ -50,12 +73,31 @@ class ModelsConfig(BaseModel):
     deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
     qwen: ProviderConfig = Field(default_factory=ProviderConfig)
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
+    providers: dict[str, ProviderConfig] = Field(default_factory=dict)
+
+    @field_validator("providers")
+    @classmethod
+    def _validate_provider_ids(cls, value: dict[str, ProviderConfig]) -> dict[str, ProviderConfig]:
+        import re
+
+        for name in value:
+            if not re.fullmatch(r"[a-z][a-z0-9_-]{0,47}", name) or name in {
+                "deepseek",
+                "qwen",
+                "zhipu",
+                "providers",
+                "prototype",
+                "constructor",
+            }:
+                raise ValueError("供应商 ID 须为小写字母开头，不能与内置供应商重名")
+        return value
 
     def enabled_providers(self) -> dict[str, ProviderConfig]:
         candidates = {
             "deepseek": self.deepseek,
             "qwen": self.qwen,
             "zhipu": self.zhipu,
+            **self.providers,
         }
         return {name: cfg for name, cfg in candidates.items() if cfg.enabled}
 
@@ -193,11 +235,7 @@ class SandboxConfig(BaseModel):
     network_disabled: bool = True
     read_only_root: bool = True
     workspace_mount: str = ""
-    """测试工作区目录。留空则每次启动使用一个临时目录。
-
-    为什么默认不是仓库目录：模型生成的"测试代码"会先落盘再执行，
-    把仓库当工作区等于让不受信内容直接覆写源码（含 .git/hooks）。
-    """
+    """测试基线目录。留空则启动时建空临时基线；每次测试在独立快照中执行。"""
 
     allow_local_fallback: bool = Field(
         default=True,
@@ -326,7 +364,7 @@ class Settings(BaseSettings):
     debug: bool = False
     log_level: str = "INFO"
 
-    api_host: str = "0.0.0.0"
+    api_host: str = "127.0.0.1"
     api_port: int = Field(default=8000, gt=0, le=65535)
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
 
@@ -364,7 +402,9 @@ def get_settings() -> Settings:
 
     使用 ``lru_cache`` 缓存；测试中如需重置，调用 ``get_settings.cache_clear()``。
     """
-    return Settings()
+    from devagent.settings_store import load_saved_settings
+
+    return load_saved_settings(Settings())
 
 
 def reset_settings_cache() -> None:

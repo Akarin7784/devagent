@@ -246,14 +246,19 @@ class TestTaskService:
         assert data["status"] == "failed"
         assert "模拟编排崩溃" in data["error"]
 
-    async def test_cancel(self) -> None:
+    @pytest.mark.parametrize("start_first", [False, True], ids=["before-start", "running"])
+    async def test_cancel(self, start_first: bool) -> None:
         service = TaskService(_FakeOrchestrator(delay=5.0), store=InMemoryTaskStore())
         tid = await service.submit("g")
-        await asyncio.sleep(0.05)
+        if start_first:
+            await asyncio.sleep(0.05)
         assert service.cancel(tid) is True
         data = await service.wait(tid, timeout=2)
         assert data is not None
         assert data["status"] == "cancelled"
+        assert tid not in service._running
+        assert service.bus.is_closed(tid)
+        assert [e.kind for e in service.bus.history(tid)].count("task_cancelled") == 1
 
     async def test_cancel_unknown_returns_false(self) -> None:
         service = TaskService(_FakeOrchestrator(), store=InMemoryTaskStore())
@@ -271,12 +276,17 @@ class TestTaskService:
         records = await asyncio.gather(*(service.get(t) for t in tids))
         assert all(r is not None and r["status"] == "succeeded" for r in records)
 
-    async def test_shutdown_cancels_running(self) -> None:
+    @pytest.mark.parametrize("start_first", [False, True], ids=["before-start", "running"])
+    async def test_shutdown_cancels_running(self, start_first: bool) -> None:
         service = TaskService(_FakeOrchestrator(delay=5.0), store=InMemoryTaskStore())
-        await service.submit("g")
-        await asyncio.sleep(0.05)
+        tid = await service.submit("g")
+        if start_first:
+            await asyncio.sleep(0.05)
         await service.shutdown()
         assert service._running == {}
+        data = await service.get(tid)
+        assert data is not None and data["status"] == "cancelled"
+        assert service.bus.is_closed(tid)
 
     async def test_metadata_preserved(self) -> None:
         service = TaskService(_FakeOrchestrator(), store=InMemoryTaskStore())

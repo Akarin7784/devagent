@@ -21,7 +21,7 @@ import assert from 'node:assert/strict';
 import {
   metric, metricKey, sumLabels, histMean, histOverallMean, histMaxQuantile,
   fmtInt, fmtPct, esc,
-} from './js/util.js';
+} from './js/util.js?v=20261008-live';
 
 let passed = 0;
 const failures = [];
@@ -154,7 +154,7 @@ const fakeWindow = { location: { hash: '#/' } };
 globalThis.window = fakeWindow;
 globalThis.addEventListener = () => {};
 globalThis.removeEventListener = () => {};
-const { parseHash, ROUTES } = await import('./js/store.js');
+const { parseHash, ROUTES } = await import('./js/store.js?v=20261008-live');
 
 const withHash = (h, fn) => { fakeWindow.location.hash = h; fn(parseHash()); };
 

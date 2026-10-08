@@ -230,7 +230,7 @@ class OpenAICompatibleProvider:
         url = f"{self._base_url}{path}"
         last_error: Exception | None = None
 
-        for attempt in range(1, self._max_retries + 1):
+        for attempt in range(1, self._max_retries + 2):
             try:
                 resp = await client.post(url, headers=self._headers(), json=payload)
                 if resp.status_code == 429:
@@ -248,10 +248,10 @@ class OpenAICompatibleProvider:
                 last_error = ModelTimeoutError(str(exc))
             except (ModelRateLimitError, ModelError) as exc:
                 last_error = exc
-                # 非重试类错误立即抛出
-                if isinstance(exc, ModelError) and not isinstance(exc, ModelRateLimitError):
+                # 5xx / 429 可重试；其它客户端错误立即抛出。
+                if not isinstance(exc, ModelRateLimitError) and resp.status_code < 500:
                     raise
-            if attempt < self._max_retries:
+            if attempt <= self._max_retries:
                 # ★ 退避必须带抖动。
                 # 纯指数退避会让**所有**并发调用在同一时刻重试：编排器默认
                 # 并行 4 个节点，遇到 429 时它们会在 1s / 2s / 4s 同时打回来，

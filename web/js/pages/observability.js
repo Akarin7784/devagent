@@ -12,7 +12,7 @@
  * 把它们统一渲染会直接导致 histogram 显示成 [object Object]。
  */
 
-import { api } from '../api.js';
+import { api } from '../api.js?v=20261008-live';
 import {
   alert,
   button,
@@ -24,13 +24,13 @@ import {
   skeletonTable,
   statCard,
   toast,
-} from '../components.js';
-import { icon } from '../icons.js';
-import { getState, set } from '../store.js';
+} from '../components.js?v=20261008-live';
+import { icon } from '../icons.js?v=20261008-live';
+import { getState, set } from '../store.js?v=20261008-live';
 import {
   clear, copyText, el, fmtInt, fromHTML, histOverallMean, metric, mount,
   prefersReducedMotion, sumLabels,
-} from '../util.js';
+} from '../util.js?v=20261008-live';
 
 const LOAD_KEY = 'observability';
 const AUTO_REFRESH_MS = 10_000;
@@ -114,7 +114,7 @@ export default async function renderObservability(root, ctx) {
   /* ---------- 布局 ---------- */
 
   function buildLayout() {
-    const wrap = el('div');
+    const wrap = el('div', { class: 'page-stack observability-page' });
     const metrics = getState('metrics');
     const observability = getState('observability');
 
@@ -122,10 +122,6 @@ export default async function renderObservability(root, ctx) {
       el('div', { class: 'page-head' }, [
         el('div', { class: 'page-head-text' }, [
           el('h1', { text: '可观测性' }),
-          el('p', {
-            class: 'page-head-desc',
-            text: '指标快照、调用链追踪与 Prometheus 导出。这里的数据同时服务于「排障」与「证明系统可靠性」。',
-          }),
         ]),
         el('div', { class: 'page-head-actions' }, [
           buildAutoRefreshToggle(),
@@ -140,8 +136,7 @@ export default async function renderObservability(root, ctx) {
           alert({
             tone: 'info',
             title: '可观测性未开启',
-            body: '启动时加 --trace，或设置 DEVAGENT_OBSERVABILITY__METRICS_ENABLED=true。'
-              + '未开启时指标为空，追踪列表也不会有数据。',
+            body: '在设置中启用指标采集。',
           }),
         ])
       );
@@ -196,8 +191,8 @@ export default async function renderObservability(root, ctx) {
     wrap.append(tabs);
 
     const panel = el('div', {
+      class: 'page-stack',
       attrs: { role: 'tabpanel', id: `panel-${activeTab}`, 'aria-labelledby': `tab-${activeTab}` },
-      style: { 'margin-top': 'var(--space-4)' },
     });
 
     if (activeTab === 'metrics') panel.append(...buildMetricsTab(metrics));
@@ -238,8 +233,7 @@ export default async function renderObservability(root, ctx) {
 
     const row = el('div', {
       class: 'grid grid-cols-4',
-      style: { 'margin-bottom': 'var(--space-5)' },
-    });
+      });
 
     row.append(
       statCard({ label: '计数器指标', value: fmtInt(totalCounters), icon: 'hash', foot: '只增不减的累计量' }),
@@ -341,7 +335,6 @@ export default async function renderObservability(root, ctx) {
 
     const tableCard = card({
       title: '指标明细',
-      subtitle: 'counters / gauges 为两层结构，histograms 为三层（最内层是统计量）',
       actions: button('复制全部 JSON', {
         icon: 'copy',
         variant: 'ghost',
@@ -449,8 +442,7 @@ export default async function renderObservability(root, ctx) {
           body: emptyState({
             icon: 'route',
             title: '暂无 trace 记录',
-            desc: '追踪数据来自内存导出器。启用 --trace 后，执行任务即可产生 span。'
-              + '生产环境建议改为 OTLP 导出到 Jaeger/Tempo，内存导出器只适用于开发调试。',
+            desc: '开启追踪并运行任务后查看。',
           }),
         }),
       ];
@@ -621,8 +613,8 @@ export default async function renderObservability(root, ctx) {
   /* ---------- 骨架 ---------- */
 
   function buildSkeleton() {
-    const wrap = el('div');
-    const grid = el('div', { class: 'grid grid-cols-4', style: { 'margin-bottom': 'var(--space-5)' } });
+    const wrap = el('div', { class: 'page-stack observability-page' });
+    const grid = el('div', { class: 'grid grid-cols-4' });
     for (let i = 0; i < 4; i += 1) {
       grid.append(el('div', { class: 'stat-card' }, [
         el('div', { class: 'skeleton skeleton-text', style: { width: '50%' } }),

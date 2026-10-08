@@ -13,15 +13,15 @@
 
 import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
-import * as store from './js/store.js';
-import { taskStatusBadge } from './js/status.js';
+import * as store from './js/store.js?v=20261008-live';
+import { taskStatusBadge } from './js/status.js?v=20261008-live';
 // STATUS_GROUP 从 graph.js 取（它再导出的就是 status.js 的同一对象，
 // status.test.js 有引用相等的断言守着），避免同一个名字在文件里出现两次。
-import { LEGEND_ITEMS, STATUS_GROUP, dagBounds, edgePath, layoutDag, renderDag } from './graph.js';
-import { renderKpiRow } from './js/pages/overview.js';
+import { LEGEND_ITEMS, STATUS_GROUP, dagBounds, edgePath, layoutDag, renderDag } from './graph.js?v=20261008-live';
+import { renderKpiRow } from './js/pages/overview.js?v=20261008-live';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..');
@@ -207,7 +207,7 @@ function loadedStylesheets() {
     .filter(Boolean)
     .map((m) => m[1]);
   assert.ok(hrefs.length >= 3, `index.html 只加载了 ${hrefs.length} 张样式表，解析可能出错`);
-  return hrefs.map((h) => join(HERE, h.replace(/^\.\//, '')));
+  return hrefs.map((h) => fileURLToPath(new URL(h, pathToFileURL(join(HERE, 'index.html')))));
 }
 
 /**
@@ -530,7 +530,7 @@ test('subscriberCount 对未知字段返回 0 而不是抛错', () => {
  * 旁边的 "N / M 条" 提示也永远不变。
  */
 
-const { filterMetrics } = await import('./js/pages/observability.js');
+const { filterMetrics } = await import('./js/pages/observability.js?v=20261008-live');
 
 const METRIC_ROWS = [
   { type: 'counter', name: 'llm_tokens_total', labels: [{ label: 'direction="input"', value: '120' }] },
@@ -671,7 +671,7 @@ test('没有任何已结束任务时显示「—」且不显示 0%', () => {
  *     混进了 A 的节点事件 —— 一张"两个任务叠在一起"的图，且没有报错。
  */
 
-const { StreamSlot } = await import('./js/stream.js');
+const { StreamSlot } = await import('./js/stream.js?v=20261008-live');
 
 test('开第二条流会关闭第一条，且只关一次', () => {
   const slot = new StreamSlot();
@@ -744,7 +744,7 @@ test('warned 标记随流创建而复位（切任务后应能重新提示断线�
  * 断言"重建 N 次后活跃订阅仍是 1 个"。原实现每重建一次就永久多一个。
  */
 
-const { createNavForTest } = await import('./js/shell.js');
+const { createNavForTest } = await import('./js/shell.js?v=20261008-live');
 
 test('shell 每次重建导航都会回收上一批订阅（不是累积）', () => {
   const base = store.subscriberCount('tasks');
@@ -767,7 +767,7 @@ test('shell 每次重建导航都会回收上一批订阅（不是累积）', ()
  * 用户以为放开了全量，实际只跑了一小部分样本，且结果看起来"很正常"。
  */
 
-const { snapshotFormState } = await import('./js/pages/eval.js');
+const { snapshotFormState } = await import('./js/pages/eval.js?v=20261008-live');
 
 const EVAL_FORM = {
   dataset: ' datasets/golden_set.jsonl ',
@@ -892,12 +892,12 @@ function installInteractiveDomStub() {
 
 installInteractiveDomStub();
 
-const { icon } = await import('./js/icons.js');
+const { icon } = await import('./js/icons.js?v=20261008-live');
 const {
   SETTINGS_TABS,
   resolveSettingsTab,
   default: renderSettings,
-} = await import('./js/pages/settings.js');
+} = await import('./js/pages/settings.js?v=20261008-live');
 
 /** 按 ARIA role 收集节点。 */
 function byRole(root, role) {
@@ -929,6 +929,8 @@ async function renderSettingsAt(tab) {
  */
 const SETTINGS_MARKS = {
   connection: '后端 API 地址',
+  models: '模型接入与供应商预设',
+  backend: '服务运行配置',
   appearance: '减少动态效果',
   data: '清除本地偏好',
   about: '前端形态',
@@ -951,10 +953,10 @@ const CLICK_ROOT = await renderSettingsAt('connection');
 /** 订阅断言专用的 fixture：它会被 store 事件改写，必须与只读 fixture 隔离。 */
 const LIVE_ROOT = await renderSettingsAt('connection');
 
-test('设置页的四个分区都在，id 唯一，图标真实存在', () => {
+test('设置页分区齐全，id 唯一，图标真实存在', () => {
   const ids = SETTINGS_TABS.map((t) => t.id);
   assert.equal(new Set(ids).size, ids.length, `分区 id 重复：${ids.join(', ')}`);
-  for (const want of ['connection', 'appearance', 'data', 'about']) {
+  for (const want of ['connection', 'models', 'backend', 'appearance', 'data', 'about']) {
     assert.ok(ids.includes(want), `缺少分区「${want}」`);
   }
   for (const t of SETTINGS_TABS) {
@@ -987,7 +989,7 @@ test('任一时刻只渲染一个分区面板，其余分区的标志内容不�
       `?tab=${tab.id} 渲染了 ${panels.length} 个面板 —— 分区没有真正生效，模块又挤在一页了`);
     assert.equal(panels[0].attrs.id, `panel-${tab.id}`, '面板 id 与当前分区不一致');
 
-    const text = textsOf(root).join(' | ');
+    const text = textsOf(panels[0]).join(' | ');
     assert.ok(text.includes(SETTINGS_MARKS[tab.id]),
       `?tab=${tab.id} 时当前分区的内容没有渲染出来：${text}`);
     for (const other of SETTINGS_TABS) {

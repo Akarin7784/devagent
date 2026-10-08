@@ -3,10 +3,10 @@
  *
  * 这是产品的核心页面：提交需求 → 观察编排 → 查看产出。
  *
- * 布局（≥1280 三区并排，1024–1279 两区 + 详情下沉为整行，<1024 单列）：
- *   左：任务队列 + 提交表单
- *   中：DAG 画布 + 执行时间线
- *   右：节点详情 / 执行摘要
+ * 布局由 workspace.css 管理：任务记录 + 主工作区，宽屏按需展示步骤详情。
+ *   左：可筛选的任务记录
+ *   中：创建任务 / 执行过程 / 代码改动 / 验证结果
+ *   按需展开：依赖图与步骤详情
  *
  * 数据流向（关键设计）：
  *   SSE 事件 → 乐观更新图状态（立即反馈）
@@ -16,9 +16,10 @@
  * 只靠 SSE 会因丢事件而永久停留在错误状态；只靠轮询则失去实时感。
  */
 
-import { api, subscribeTaskEvents } from '../api.js';
+import { api, subscribeTaskEvents } from '../api.js?v=20261008-live';
 import {
   agentTag,
+  agentLabel,
   alert,
   badge,
   button,
@@ -28,12 +29,11 @@ import {
   errorState,
   iconButton,
   kvItem,
-  skeletonBlock,
   statusBadge,
   statusDotClass,
   toast,
-} from '../components.js';
-import { icon } from '../icons.js';
+} from '../components.js?v=20261008-live';
+import { icon } from '../icons.js?v=20261008-live';
 import {
   applyEvent,
   buildGraphState,
@@ -42,14 +42,15 @@ import {
   layoutDag,
   parseDiff,
   renderDag,
-} from '../../graph.js';
-import { getState, navigate, set } from '../store.js';
-import { StreamSlot } from '../stream.js';
-import { taskStatusLabel } from '../status.js';
+} from '../../graph.js?v=20261008-live';
+import { getState, navigate, set } from '../store.js?v=20261008-live';
+import { StreamSlot } from '../stream.js?v=20261008-live';
+import { statusLabel, taskStatusLabel } from '../status.js?v=20261008-live';
+import { filterTasks, latestSteps, runHeadline, TASK_FILTERS, verificationChecks } from '../task-view.js?v=20261008-live';
 import {
-  $, clear, copyText, debounce, el, esc, fmtCost, fmtDuration, fmtInt,
-  fmtRelative, fmtTime, fromHTML, mount, prefersReducedMotion,
-} from '../util.js';
+  clear, copyText, debounce, el, esc, fmtCost, fmtDuration, fmtInt,
+  fmtRelative, fmtTime, fromHTML, mount, prefersReducedMotion, storage,
+} from '../util.js?v=20261008-live';
 
 const MAX_GOAL_LEN = 10_000;
 const MAX_TIMELINE = 400;
@@ -59,10 +60,12 @@ const MAX_TIMELINE = 400;
  * @returns {() => void} 清理函数（关闭 SSE、移除订阅）
  */
 export default async function renderWorkbench(root, ctx) {
-  const disposers = [];
   let autoScroll = true;
   let timelineFilter = 'all';
   let countLabel = null;
+  let listFilter = 'all';
+  let activeTab = 'activity';
+  let submitting = false;
   const events = [];
 
   /** 图状态（与 store 分离，因为 Map 需要就地变更才能高效 applyEvent）。 */
@@ -75,24 +78,23 @@ export default async function renderWorkbench(root, ctx) {
 
   const taskListEl = el('div', { class: 'task-list', attrs: { role: 'list' } });
   const goalInput = el('textarea', {
-    class: 'textarea',
+    class: 'textarea agent-goal-input',
     attrs: {
       id: 'goal-input',
       rows: '5',
-      placeholder: '例如：为 /users 接口增加分页参数，非法参数返回 400',
+      placeholder: '描述你希望完成的工作，包含目标、约束和验收标准…',
       'aria-label': '需求描述',
       maxlength: String(MAX_GOAL_LEN),
     },
   });
   const charCount = el('span', { class: 'field-counter', text: `0 / ${fmtInt(MAX_GOAL_LEN)}` });
-  const submitBtn = button('开始执行', { icon: 'play', variant: 'primary', type: 'submit' });
+  const submitBtn = button('开始任务', { icon: 'arrow-up', variant: 'primary', type: 'submit' });
   const submitForm = el('form', { class: 'field' });
 
   const dagSvg = el('svg', {
     class: 'dag',
     attrs: { xmlns: 'http://www.w3.org/2000/svg', role: 'img', 'aria-label': '任务依赖图' },
   });
-  const dagEmpty = el('div');
   const dagCanvas = el('div', { class: 'dag-canvas' });
   const dagLegend = el('div', { class: 'legend' });
   const dagToolbar = el('div', { class: 'dag-toolbar' });
@@ -103,102 +105,177 @@ export default async function renderWorkbench(root, ctx) {
 
   const detailBody = el('div');
 
-  /* ---------- 顶部：页面级操作 ---------- */
-
   const refreshBtn = iconButton('refresh', {
-    label: '刷新当前任务',
-    onClick: () => refreshCurrent({ manual: true }),
+    label: '刷新当前任务', onClick: () => refreshCurrent({ manual: true }),
   });
+  const searchInput = el('input', {
+    class: 'input task-search', attrs: { type: 'search', placeholder: '搜索任务…', 'aria-label': '搜索任务' },
+    on: { input: () => paintTaskList() },
+  });
+  const filterBar = el('div', { class: 'task-filters', attrs: { role: 'group', 'aria-label': '任务筛选' } });
+  const queueCount = el('span', { class: 'task-count', text: '0' });
+  const queueHead = el('div', { class: 'queue-heading' }, [
+    el('h2', { text: '任务记录' }), queueCount,
+    iconButton('refresh', { label: '刷新任务列表', small: true, onClick: () => loadTasks() }),
+  ]);
+  const newTaskBtn = button('新建任务', { icon: 'plus', variant: 'primary', onClick: () => startNewTask() });
+  const asideCol = el('aside', { class: 'workbench-aside task-rail', attrs: { 'aria-label': '任务记录' } }, [
+    newTaskBtn, queueHead, searchInput, filterBar, taskListEl,
+  ]);
+  for (const filter of TASK_FILTERS) {
+    const btn = el('button', {
+      class: 'task-filter', text: filter.label,
+      attrs: { type: 'button', 'aria-pressed': String(listFilter === filter.id) },
+      dataset: { filter: filter.id },
+      on: { click: () => {
+        listFilter = filter.id;
+        for (const item of filterBar.children) item.setAttribute('aria-pressed', String(item.dataset.filter === listFilter));
+        paintTaskList();
+      } },
+    });
+    filterBar.append(btn);
+  }
 
-  const head = el('div', { class: 'page-head' }, [
-    el('div', { class: 'page-head-text' }, [
-      el('h1', { text: '任务工作台' }),
-      el('p', {
-        class: 'page-head-desc',
-        text: '提交自然语言需求，观察多 Agent 如何拆解、编排与互相验证。点击 DAG 节点可查看该步骤的代码改动。',
-      }),
+  const composer = buildSubmitCard();
+  const starter = el('section', { class: 'agent-starter', attrs: { 'aria-label': '创建研发任务' } }, [
+    el('div', { class: 'starter-mark', html: icon('terminal', 27) }),
+    el('p', { class: 'eyebrow', text: 'DEVAGENT / WORKSPACE' }),
+    el('h1', { text: '下一件事，交给 Agent。' }),
+    el('p', { class: 'starter-description', text: '描述目标。Agent 负责拆解、执行与验证，你来审阅最终产物。' }),
+    composer,
+    buildSuggestions(),
+    el('div', { class: 'starter-footnote' }, [fromHTML(icon('shield', 13)), '产出代码改动与验证记录，交付前由你审阅。']),
+  ]);
+
+  const runHeader = el('div', { class: 'run-header', attrs: { 'aria-live': 'polite' } });
+  const phaseList = el('div', { class: 'run-phases', attrs: { 'aria-label': '执行计划' } });
+  const artifacts = el('section', { class: 'artifact-panel' });
+  const verification = el('section', { class: 'verification-panel' });
+  const tabsBar = el('div', { class: 'workspace-tabs', attrs: { role: 'tablist', 'aria-label': '任务内容' } });
+  const activity = el('section', { class: 'activity-panel' }, [
+    card({ title: '执行动态', actions: timelineTools, body: timelineEl }),
+    el('details', { class: 'plan-disclosure' }, [
+      el('summary', {}, [fromHTML(icon('git-branch', 15)), '依赖关系图', dagLegend]),
+      el('div', { class: 'plan-body' }, [dagCanvas, dagToolbar]),
     ]),
-    el('div', { class: 'page-head-actions' }, [refreshBtn]),
   ]);
-
-  /* ---------- 组装 ---------- */
-
-  const asideCol = el('div', { class: 'workbench-aside' }, [
-    buildSubmitCard(),
-    card({
-      title: '任务队列',
-      body: taskListEl,
-      flush: true,
-      actions: iconButton('refresh', {
-        label: '刷新任务列表',
-        small: true,
-        onClick: () => loadTasks(),
-      }),
-    }),
+  const tabPanels = { activity, artifacts, verification };
+  const tabs = [
+    { id: 'activity', label: '执行过程', icon: 'activity' },
+    { id: 'artifacts', label: '代码改动', icon: 'code' },
+    { id: 'verification', label: '验证结果', icon: 'shield' },
+  ];
+  for (const [index, tab] of tabs.entries()) {
+    const tabBtn = el('button', {
+      class: 'workspace-tab',
+      attrs: { id: `tab-${tab.id}`, role: 'tab', type: 'button', 'aria-controls': `panel-${tab.id}` },
+      dataset: { tab: tab.id },
+      on: {
+        click: () => selectTab(tab.id),
+        keydown: (event) => {
+          let next;
+          if (event.key === 'ArrowRight') next = (index + 1) % tabs.length;
+          if (event.key === 'ArrowLeft') next = (index + tabs.length - 1) % tabs.length;
+          if (event.key === 'Home') next = 0;
+          if (event.key === 'End') next = tabs.length - 1;
+          if (next == null) return;
+          event.preventDefault(); selectTab(tabs[next].id); tabsBar.children[next].focus();
+        },
+      },
+    }, [fromHTML(icon(tab.icon, 15)), el('span', { text: tab.label })]);
+    tabsBar.append(tabBtn);
+    Object.assign(tabPanels[tab.id], { id: `panel-${tab.id}` });
+    tabPanels[tab.id].setAttribute('role', 'tabpanel');
+    tabPanels[tab.id].setAttribute('aria-labelledby', `tab-${tab.id}`);
+    tabPanels[tab.id].setAttribute('tabindex', '0');
+  }
+  const session = el('section', { class: 'agent-session', attrs: { 'aria-label': '当前任务' } }, [
+    runHeader, phaseList, summaryEl, tabsBar, ...Object.values(tabPanels),
   ]);
-
-  const mainCol = el('div', { class: 'workbench-main' }, [
-    card({
-      title: '任务 DAG',
-      subtitle: '节点依赖与实时执行状态',
-      actions: dagLegend,
-      body: el('div', {}, [dagCanvas, dagToolbar]),
-    }),
-    card({
-      title: '执行时间线',
-      actions: timelineTools,
-      body: timelineEl,
-      flush: false,
-    }),
-    summaryEl,
+  const mainCol = el('div', { class: 'workbench-main' }, [starter, session]);
+  const detailCol = el('aside', { class: 'workbench-detail', attrs: { 'aria-label': '步骤详情' } }, [
+    card({ title: '步骤详情', actions: iconButton('close', {
+      label: '关闭步骤详情', small: true,
+      onClick: () => { selectedNode = ''; paintDag(); paintDetail(); },
+    }), body: detailBody }),
   ]);
+  const bench = el('div', { class: 'workbench agent-workspace' }, [asideCol, mainCol, detailCol]);
+  root.append(bench);
+  detailCol.hidden = true;
+  session.hidden = true;
+  selectTab('activity');
 
-  // 右栏：节点详情。用 workbench-detail（而非 workbench-aside）——
-  // 两者视觉一致，但只有它能在 ≤1279px 时跨满整行下沉到主区下方。
-  // 若复用 workbench-aside，CSS 无法区分左右两栏，下沉规则会同时命中左栏。
-  const detailCol = el('div', { class: 'workbench-detail' }, [
-    card({ title: '节点详情', body: detailBody }),
-  ]);
-
-  root.append(head, el('div', { class: 'workbench' }, [asideCol, mainCol, detailCol]));
-
-  /* ---------- 渲染函数 ---------- */
+  function selectTab(id) {
+    activeTab = id;
+    for (const item of tabsBar.children) {
+      const selected = item.dataset.tab === activeTab;
+      item.setAttribute('aria-selected', String(selected));
+      item.setAttribute('tabindex', selected ? '0' : '-1');
+    }
+    for (const [name, panel] of Object.entries(tabPanels)) panel.hidden = name !== activeTab;
+  }
 
   function buildSubmitCard() {
-    const form = submitForm;
-    form.append(
-      el('div', { class: 'field' }, [
-        el('div', {
-          style: { display: 'flex', 'align-items': 'center', 'justify-content': 'space-between' },
-        }, [
-          el('label', { class: 'label', attrs: { for: 'goal-input' }, text: '需求描述' }),
-          charCount,
-        ]),
-        goalInput,
+    goalInput.value = storage.get('devagent.taskDraft', '');
+    charCount.textContent = `${fmtInt(goalInput.value.length)} / ${fmtInt(MAX_GOAL_LEN)}`;
+    submitForm.className = 'agent-composer';
+    submitForm.append(
+      el('label', { class: 'sr-only', attrs: { for: 'goal-input' }, text: '需求描述' }),
+      goalInput,
+      el('div', { class: 'composer-toolbar' }, [
+        el('span', { class: 'composer-mode' }, [fromHTML(icon('git-branch', 14)), '协作研发']),
+        charCount, submitBtn,
       ]),
-      el('div', { class: 'hint-text' }, [
-        fromHTML(icon('info', 12)),
-        ' 越具体越好：包含接口路径、边界条件与期望行为，需求 Agent 会据此生成可验收的标准。',
-      ]),
-      el('div', { style: { display: 'flex', 'gap': 'var(--space-2)', 'margin-top': 'var(--space-1)' } }, [
-        submitBtn,
-      ])
+      el('div', { class: 'composer-hint', text: 'Ctrl / ⌘ + Enter 开始任务 · 草稿自动保存在本机' }),
     );
-    form.addEventListener('submit', onSubmit);
-
+    submitForm.addEventListener('submit', onSubmit);
     goalInput.addEventListener('input', () => {
       const len = goalInput.value.length;
       charCount.textContent = `${fmtInt(len)} / ${fmtInt(MAX_GOAL_LEN)}`;
       charCount.dataset.state = len > MAX_GOAL_LEN * 0.95 ? 'over' : 'ok';
+      storage.set('devagent.taskDraft', goalInput.value);
     });
+    goalInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing) {
+        event.preventDefault(); submitForm.requestSubmit();
+      }
+    });
+    return submitForm;
+  }
 
-    return card({ title: '提交需求', body: form });
+  function buildSuggestions() {
+    const suggestions = [
+      { icon: 'code', title: '实现新功能', desc: '把想法变成可审阅的代码', goal: '为 /users 接口增加分页参数，支持 page 和 page_size；非法参数返回 400，并补充边界测试。' },
+      { icon: 'shield', title: '修复与验证', desc: '定位问题，给出修复和证据', goal: '排查任务取消后状态未更新的问题，修复根因，并补充取消时机相关的回归测试。' },
+      { icon: 'layers', title: '整理与重构', desc: '理清结构，保留原有行为', goal: '整理重复的业务逻辑，保持现有接口兼容，说明重构范围和验证方法。' },
+    ];
+    return el('div', { class: 'task-suggestions' }, suggestions.map((item) => el('button', {
+      class: 'task-suggestion', attrs: { type: 'button' },
+      on: { click: () => {
+        goalInput.value = item.goal; goalInput.dispatchEvent(new Event('input')); goalInput.focus();
+      } },
+    }, [fromHTML(icon(item.icon, 18)), el('strong', { text: item.title }), el('span', { text: item.desc })])));
+  }
+
+  function startNewTask(goal) {
+    closeStream();
+    set({ activeTaskId: '', taskDetail: null, selectedNode: '' });
+    taskDetail = null; graph = new Map(); selectedNode = ''; events.length = 0;
+    starter.hidden = false; session.hidden = true; detailCol.hidden = true;
+    bench.dataset.inspecting = 'false';
+    if (typeof goal === 'string') {
+      goalInput.value = goal; goalInput.dispatchEvent(new Event('input'));
+    }
+    paintTaskList();
+    navigate('workbench', { new: '1' }, true);
+    goalInput.focus();
   }
 
   /* ---------- 提交任务 ---------- */
 
   async function onSubmit(e) {
     e.preventDefault();
+    if (submitting) return;
     const goal = goalInput.value.trim();
     if (!goal) {
       goalInput.setAttribute('aria-invalid', 'true');
@@ -208,11 +285,14 @@ export default async function renderWorkbench(root, ctx) {
     }
     goalInput.removeAttribute('aria-invalid');
 
+    submitting = true;
+    submitBtn.disabled = true;
     submitBtn.dataset.loading = 'true';
     submitBtn.setAttribute('aria-busy', 'true');
     try {
       const task = await api.createTask(goal);
       goalInput.value = '';
+      storage.set('devagent.taskDraft', '');
       charCount.textContent = `0 / ${fmtInt(MAX_GOAL_LEN)}`;
       toast({
         tone: 'success',
@@ -228,6 +308,8 @@ export default async function renderWorkbench(root, ctx) {
         desc: err?.message || String(err),
       });
     } finally {
+      submitting = false;
+      submitBtn.disabled = false;
       delete submitBtn.dataset.loading;
       submitBtn.removeAttribute('aria-busy');
     }
@@ -254,7 +336,9 @@ export default async function renderWorkbench(root, ctx) {
   }
 
   function paintTaskList() {
-    const tasks = getState('tasks') || [];
+    const allTasks = getState('tasks') || [];
+    const tasks = filterTasks(allTasks, searchInput.value || '', listFilter);
+    queueCount.textContent = String(allTasks.length);
     const active = getState('activeTaskId');
     clear(taskListEl);
 
@@ -263,8 +347,8 @@ export default async function renderWorkbench(root, ctx) {
         emptyState({
           small: true,
           icon: 'inbox',
-          title: '暂无任务',
-          desc: '在上方提交需求后，任务会出现在这里',
+          title: allTasks.length ? '没有匹配的任务' : '还没有任务记录',
+          desc: allTasks.length ? '调整关键词或筛选条件。' : '创建第一个任务，记录会保存在这里。',
         })
       );
       return;
@@ -314,6 +398,10 @@ export default async function renderWorkbench(root, ctx) {
     layout = null;
     selectedNode = '';
     taskDetail = null;
+    set({ taskDetail: null, selectedNode: '' });
+    starter.hidden = true; session.hidden = false;
+    detailCol.hidden = true; bench.dataset.inspecting = 'false';
+    selectTab('activity'); paintSession();
     events.length = 0;
 
     paintDag();
@@ -380,9 +468,11 @@ export default async function renderWorkbench(root, ctx) {
         }
         paintDag();
         paintSummary(detail);
+        paintSession();
+        paintDetail();
       }
 
-      if (ctxData) {
+      if (ctxData && taskId === getState('activeTaskId')) {
         set({ contextMetrics: ctxData.metrics || {} });
       }
 
@@ -436,13 +526,13 @@ export default async function renderWorkbench(root, ctx) {
 
         // 乐观更新：节点状态立即反映到图上
         const changed = applyEvent(graph, ev);
-        if (changed) paintDag();
+        if (changed) { paintDag(); paintSession(); paintDetail(); }
 
         if (events.length < MAX_TIMELINE) {
           events.push(ev);
           appendTimelineItem(ev, { fromReplay: meta?.replayed });
-          // 回放期间不逐条刷新计数（几十条事件会触发几十次 DOM 写入）
-          if (!meta?.replayed) paintTimelineMeta();
+          // 回放也更新计数：已结束任务可能全部落在回放窗口内。
+          paintTimelineMeta();
         }
 
         if (ev.kind === 'task_finished' || ev.kind === 'task_cancelled') {
@@ -525,6 +615,7 @@ export default async function renderWorkbench(root, ctx) {
         selectedNode = selectedNode === id ? '' : id;
         paintDag();
         paintDetail();
+        detailCol.scrollIntoView({ block: 'nearest', behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
       },
     });
 
@@ -558,6 +649,8 @@ export default async function renderWorkbench(root, ctx) {
 
   function paintDetail() {
     clear(detailBody);
+    detailCol.hidden = !selectedNode || !graph.has(selectedNode);
+    bench.dataset.inspecting = String(!detailCol.hidden);
 
     if (!selectedNode || !graph.has(selectedNode)) {
       detailBody.append(
@@ -822,7 +915,7 @@ export default async function renderWorkbench(root, ctx) {
       timelineEl.scrollTop = timelineEl.scrollHeight;
       return;
     }
-    timelineEl.scrollTo({ top: timelineEl.scrollHeight, behavior: 'smooth' });
+    timelineEl.scrollTo({ top: timelineEl.scrollHeight, behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
   }
 
   /**
@@ -845,70 +938,123 @@ export default async function renderWorkbench(root, ctx) {
 
   /* ---------- 执行摘要 ---------- */
 
+  function paintSession() {
+    const nodes = [...graph.values()];
+    const headline = runHeadline(taskDetail, nodes);
+    const goal = taskDetail?.goal || (getState('tasks') || []).find((task) => task.task_id === getState('activeTaskId'))?.goal || '正在读取任务…';
+    clear(runHeader);
+    const taskActions = el('div', { class: 'run-actions' }, [refreshBtn]);
+    if (taskDetail && ['pending', 'running'].includes(taskDetail.status)) {
+      taskActions.append(button('停止执行', { icon: 'stop', variant: 'secondary', small: true, onClick: () => cancelCurrent(taskDetail.task_id) }));
+    } else if (taskDetail) {
+      taskActions.append(button('按此需求新建', { icon: 'plus', variant: 'secondary', small: true, onClick: () => startNewTask(goal) }));
+    }
+    runHeader.append(
+      el('div', { class: 'run-title-row' }, [
+        el('div', { class: 'run-title' }, [
+          el('p', { class: 'eyebrow', text: `TASK / ${shortId(getState('activeTaskId'))}` }),
+          el('h1', { text: goal }),
+        ]), taskActions,
+      ]),
+      el('div', { class: `run-status run-status-${headline.tone}` }, [
+        el('span', { class: `dot dot-sm ${statusDotClass(taskDetail?.status || 'pending')}` }),
+        el('strong', { text: headline.title }),
+        el('span', { class: 'run-status-description', text: headline.desc }),
+      ]),
+    );
+    clear(phaseList);
+    if (nodes.length) {
+      const completed = nodes.filter((node) => node.status === 'success').length;
+      phaseList.append(el('div', { class: 'plan-heading' }, [
+        el('strong', { text: '执行计划' }), el('span', { text: `${completed} / ${nodes.length} 节点通过` }),
+      ]));
+      const steps = el('div', { class: 'plan-steps' });
+      nodes.forEach((node, index) => steps.append(el('button', {
+        class: 'plan-step', attrs: { type: 'button', 'aria-label': `查看步骤 ${node.id}：${node.goal}` },
+        dataset: { status: node.status },
+        on: { click: () => {
+          selectedNode = node.id; paintDag(); paintDetail();
+          detailCol.scrollIntoView({ block: 'nearest', behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+        } },
+      }, [el('span', { class: 'plan-step-number', text: node.status === 'success' ? '✓' : String(index + 1) }),
+        el('div', {}, [el('strong', { text: node.goal || node.id }), el('span', { text: `${node.id} · ${statusLabel(node.status)}` })]),
+      ])));
+      phaseList.append(steps);
+    } else {
+      phaseList.append(el('div', { class: 'plan-pending' }, [fromHTML(icon('route', 17)),
+        taskDetail && ['failed', 'cancelled', 'paused', 'succeeded'].includes(taskDetail.status)
+          ? '这条记录没有可用的执行计划，详情见执行记录。' : 'Agent 正在梳理需求，生成执行计划后会在这里展开。',
+      ]));
+    }
+    paintArtifacts(); paintVerification();
+  }
+
+  function paintArtifacts() {
+    clear(artifacts);
+    const changes = extractChanges(taskDetail, '');
+    const diffs = changes.filter((change) => change.diff);
+    tabsBar.children[1].querySelector('span').textContent = `代码改动${diffs.length ? ` · ${diffs.length}` : ''}`;
+    if (!changes.length) {
+      artifacts.append(emptyState({ icon: 'code', title: '尚无代码产物', desc: '编码步骤产出后，文件改动会在这里集中展示。' }));
+      return;
+    }
+    const counts = diffs.reduce((sum, change) => {
+      const stats = diffStats(change.diff); return { add: sum.add + stats.add, del: sum.del + stats.del };
+    }, { add: 0, del: 0 });
+    artifacts.append(el('div', { class: 'artifact-heading' }, [
+      el('div', {}, [el('strong', { text: `${diffs.length} 份代码改动` }),
+        el('span', { class: 'diff-stat-add', text: ` +${counts.add}` }), el('span', { class: 'diff-stat-del', text: ` −${counts.del}` })]),
+      button('复制产物', { icon: 'copy', variant: 'secondary', small: true, onClick: async () => {
+        const text = changes.map((change) => `## ${change.file}\n${change.diff || change.note || ''}`).join('\n\n');
+        const ok = await copyText(text); toast({ tone: ok ? 'success' : 'error', title: ok ? '产物已复制' : '复制失败' });
+      } }),
+    ]));
+    artifacts.append(el('p', { class: 'artifact-notice', text: '待审阅的代码产物 · 尚未写入仓库，未应用或合并。' }));
+    for (const change of changes) artifacts.append(renderChange(change));
+  }
+
+  function paintVerification() {
+    clear(verification);
+    const checks = verificationChecks(taskDetail);
+    const tests = latestSteps(taskDetail?.steps || []).filter((step) => step.agent === 'tester');
+    tabsBar.children[2].querySelector('span').textContent = `验证结果${checks.length ? ` · ${checks.length}` : ''}`;
+    verification.append(el('div', { class: 'verification-intro' }, [
+      el('h2', { text: '证据与判定' }),
+      el('p', { text: '独立验证记录与测试执行输出分别展示，供你审阅。' }),
+    ]));
+    if (!checks.length && !tests.length) {
+      verification.append(emptyState({ icon: 'shield', title: '尚无验证记录', desc: '验证步骤结束后，这里会展示逐项结论与测试记录。' }));
+      return;
+    }
+    for (const check of checks) {
+      const content = el('div', { class: 'verification-check' }, [
+        el('div', { class: 'verification-check-head' }, [
+          el('strong', { text: check.step_id.split(':').slice(-2).join(' / ') }),
+          badge(check.passed ? 'success' : 'warning', check.label, check.passed ? 'check-circle' : 'alert-circle'),
+        ]),
+        el('div', { class: 'hint-text', text: `${check.model || '独立验证'} · ${fmtInt(check.tokens_used)} token` }),
+      ]);
+      if (check.failed_criteria?.length) content.append(el('ul', { class: 'failed-criteria' }, check.failed_criteria.map((criterion) => el('li', { text: criterion }))));
+      if (check.output) content.append(buildRawOutput(check.output));
+      verification.append(content);
+    }
+    if (tests.length) {
+      verification.append(el('h3', { class: 'test-evidence-heading', text: '测试执行记录' }));
+      verification.append(el('p', { class: 'artifact-notice', text: '测试在基线快照中执行，当前代码补丁尚未应用。测试通过不能单独证明本次代码改动正确。' }));
+      for (const step of tests) verification.append(el('div', { class: 'verification-check' }, [
+        el('strong', { text: step.step_id.split(':').slice(-2).join(' / ') }), buildRawOutput(step.output || '未提供测试输出'),
+      ]));
+    }
+  }
+
   function paintSummary(detail) {
     clear(summaryEl);
-
-    const stats = [
-      // 同样是任务级状态：detail.status 是 TaskStatus，不是 StepStatus
-      ['状态', taskStatusLabel(detail.status)],
-      ['耗时', fmtDuration(detail.duration_ms)],
-      ['token', fmtInt(detail.total_tokens)],
-      ['成本', fmtCost(detail.total_cost_usd)],
-      ['步骤数', fmtInt((detail.steps || []).length)],
-      ['节点数', fmtInt((detail.nodes || []).length)],
-    ];
-
-    const body = el('div');
-    const grid = el('div', {
-      class: 'grid grid-cols-3',
-      style: { gap: 'var(--space-4)' },
-    });
-    for (const [k, v] of stats) {
-      grid.append(
-        el('div', {}, [
-          el('div', { class: 'kv-key', text: k }),
-          el('div', { class: 'kv-value tnum', text: v }),
-        ])
-      );
-    }
-    body.append(grid);
-
-    if (detail.error) {
-      body.append(
-        el('div', { style: { 'margin-top': 'var(--space-3)' } }, [
-          alert({ tone: 'danger', title: '执行失败', body: detail.error }),
-        ])
-      );
-    }
-
-    const actions = [];
-    if (detail.status === 'running' || detail.status === 'pending') {
-      actions.push(
-        button('取消任务', {
-          icon: 'stop',
-          variant: 'secondary',
-          small: true,
-          onClick: () => cancelCurrent(detail.task_id),
-        })
-      );
-    }
-    actions.push(
-      button('删除任务', {
-        icon: 'trash',
-        variant: 'ghost',
-        small: true,
-        onClick: () => deleteCurrent(detail.task_id),
-      })
-    );
-
-    summaryEl.append(
-      card({
-        title: '执行摘要',
-        subtitle: `任务 ${shortId(detail.task_id)}`,
-        actions,
-        body,
-      })
-    );
+    const stats = [['用量', `${fmtInt(detail.total_tokens)} token`], ['成本', fmtCost(detail.total_cost_usd)],
+      ['耗时', fmtDuration(detail.duration_ms)], ['执行记录', `${(detail.steps || []).length} 步`]];
+    summaryEl.append(el('div', { class: 'run-metadata' }, [
+      ...stats.map(([label, value]) => el('span', {}, [el('span', { text: label }), el('strong', { text: value })])),
+      button('删除记录', { icon: 'trash', variant: 'ghost', small: true, onClick: () => deleteCurrent(detail.task_id) }),
+    ]));
   }
 
   async function cancelCurrent(taskId) {
@@ -934,14 +1080,7 @@ export default async function renderWorkbench(root, ctx) {
     try {
       await api.deleteTask(taskId);
       toast({ tone: 'success', title: '任务已删除' });
-      set({ activeTaskId: '' });
-      closeStream();
-      graph = new Map();
-      taskDetail = null;
-      events.length = 0;
-      paintDag();
-      paintTimeline();
-      mount(summaryEl);
+      startNewTask();
       await loadTasks();
     } catch (err) {
       toast({ tone: 'error', title: '删除失败', desc: err?.message || String(err) });
@@ -958,27 +1097,16 @@ export default async function renderWorkbench(root, ctx) {
 
   await loadTasks();
 
-  // 优先使用 URL 中的 task 参数；否则选第一个任务
+  // URL 指定任务时恢复会话；默认展示新建任务页面。
   const initialTask = ctx?.params?.get?.('task') || '';
-  const tasks = getState('tasks') || [];
-  const target = tasks.some((t) => t.task_id === initialTask)
-    ? initialTask
-    : tasks[0]?.task_id;
-  if (target) await selectTask(target);
+  if (initialTask) await selectTask(initialTask);
   else {
-    paintDag();
-    paintTimeline();
-    mount(detailBody, emptyState({
-      small: true,
-      icon: 'target',
-      title: '未选择节点',
-      desc: '提交或选择一个任务后，点击 DAG 节点查看详情',
-    }));
+    set({ activeTaskId: '', taskDetail: null });
+    paintTaskList(); paintDag(); paintTimeline();
   }
 
   return () => {
     closeStream();
-    disposers.forEach((d) => d());
   };
 }
 
@@ -1027,7 +1155,7 @@ function eventTone(ev) {
 function eventTitle(ev) {
   const label = EVENT_LABELS[ev.kind] || ev.kind;
   if (ev.node_id) {
-    return `${label} · ${ev.node_id}${ev.agent_type ? ` (${ev.agent_type})` : ''}`;
+    return `${label} · ${ev.node_id}${ev.agent_type ? ` · ${agentLabel(ev.agent_type)}` : ''}`;
   }
   return label;
 }
@@ -1063,7 +1191,8 @@ function timelineItem(ev, { fromReplay = false } = {}) {
   content.append(title);
 
   // 附加字段（已在标题展示的不重复）
-  const skip = new Set(['kind', 'task_id', 'timestamp', 'node_id', 'agent_type', 'verdict']);
+  const skip = new Set(['kind', 'task_id', 'timestamp', 'node_id', 'agent_type', 'verdict', 'succeeded', 'total_nodes']);
+  const fieldLabels = { goal: '目标', status: '状态', attempt: '尝试', duration_ms: '耗时', tokens_used: '用量', total_tokens: '总用量', deps: '依赖', failed_criteria: '未通过标准', suggestions: '修改建议', lesson: '经验', error: '错误' };
   const fields = Object.entries(ev).filter(
     ([k, v]) => !skip.has(k) && v !== '' && v != null && !(Array.isArray(v) && !v.length)
   );
@@ -1074,9 +1203,12 @@ function timelineItem(ev, { fromReplay = false } = {}) {
       if (Array.isArray(v)) val = v.join('；');
       else if (typeof v === 'object') val = JSON.stringify(v);
       else val = v;
+      if (k === 'status') val = ev.kind.startsWith('task') ? taskStatusLabel(v) : statusLabel(v);
+      if (k === 'duration_ms') val = fmtDuration(v);
+      if (k === 'tokens_used' || k === 'total_tokens') val = `${fmtInt(v)} token`;
       row.append(
         el('span', { class: 'ev-field' }, [
-          el('b', { text: k }),
+          el('b', { text: fieldLabels[k] || k }),
           ` ${String(val).slice(0, 200)}`,
         ])
       );
@@ -1096,9 +1228,9 @@ function timelineItem(ev, { fromReplay = false } = {}) {
  * 早期用精确相等导致 diff 面板恒为空。
  *
  * 回退重跑时同一节点的多个 attempt 会被收进来，按 (文件, 正文) 去重
- * 并保留最后一次 —— 那才是最终落地的代码。
+ * 主审阅区仅取各步骤的最后一次尝试；历史尝试保留在执行记录。
  */
-function extractChanges(detail, nodeId) {
+export function extractChanges(detail, nodeId) {
   const steps = Array.isArray(detail?.steps) ? detail.steps : [];
   const suffix = `:${nodeId}`;
   const matches = (s) => {
@@ -1106,10 +1238,10 @@ function extractChanges(detail, nodeId) {
     return id === nodeId || id.endsWith(suffix);
   };
   const mine = steps.filter(matches);
-  const pool = mine.length ? mine : steps.filter((s) => s.agent === 'coder');
+  const pool = nodeId ? mine.filter((s) => s.agent === 'coder') : steps.filter((s) => s.agent === 'coder');
 
   const seen = new Map();
-  const ordered = [...pool].sort((a, b) => (a.attempt || 1) - (b.attempt || 1));
+  const ordered = latestSteps(pool);
 
   for (const step of ordered) {
     const text = String(step.output || '');
@@ -1143,7 +1275,7 @@ function extractChanges(detail, nodeId) {
 function findStep(detail, nodeId) {
   const steps = Array.isArray(detail?.steps) ? detail.steps : [];
   const suffix = `:${nodeId}`;
-  return steps.find((s) => {
+  return latestSteps(steps).find((s) => {
     const id = String(s.step_id || '');
     return id === nodeId || id.endsWith(suffix);
   }) || null;

@@ -11,8 +11,8 @@
  *    用于驱动连接状态指示灯与路由进度条。
  */
 
-import { EventDedup, ReplayWindow } from './eventstream.js';
-import { createEmitter } from './util.js';
+import { EventDedup, ReplayWindow } from './eventstream.js?v=20261008-live';
+import { createEmitter } from './util.js?v=20261008-live';
 
 export const API_PREFIX = '/api/v1';
 
@@ -21,9 +21,14 @@ export const requestEvent = createEmitter();
 
 /** 运行时 API 基址。默认同源，可通过 ?api= 覆盖。 */
 let apiBase = '';
+let apiKey = '';
+export function setApiKey(key) { apiKey = String(key || '').trim(); }
+export function getApiKey() { return apiKey; }
 
 export function setApiBase(base) {
-  apiBase = String(base || '').trim().replace(/\/+$/, '');
+  const next = String(base || '').trim().replace(/\/+$/, '');
+  if (next !== apiBase) apiKey = '';
+  apiBase = next;
 }
 
 export function getApiBase() {
@@ -115,7 +120,8 @@ export async function request(path, opts = {}) {
   try {
     const res = await fetch(apiUrl(path), {
       method,
-      headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+      redirect: 'error',
+      headers: { ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...(apiKey ? { 'X-API-Key': apiKey } : {}) },
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal: controller.signal,
     });
@@ -168,6 +174,8 @@ export async function request(path, opts = {}) {
  * ------------------------------------------------------------------ */
 
 export const api = {
+  getSettings: (opts) => request('/settings', opts),
+  saveSettings: (payload, opts) => request('/settings', { method: 'PUT', body: payload, ...opts }),
   /** 健康检查 + 能力探测。 */
   health: (opts) => request('/health', { timeout: 6_000, ...opts }),
 
@@ -211,7 +219,7 @@ export const api = {
 
   /** Prometheus 文本格式，供「导出」按钮使用。 */
   prometheusText: async () => {
-    const res = await fetch(apiUrl('/metrics/prometheus'));
+    const res = await fetch(apiUrl('/metrics/prometheus'), { redirect: 'error', headers: apiKey ? { 'X-API-Key': apiKey } : {} });
     if (!res.ok) throw new ApiError(`导出失败（HTTP ${res.status}）`, { status: res.status });
     return res.text();
   },
@@ -266,6 +274,7 @@ export function subscribeTaskEvents(
   taskId,
   { onEvent, onError, onClose, replayGraceMs = 1500 } = {},
 ) {
+  if (apiKey) return subscribeAuthenticatedEvents(taskId, { onEvent, onError, onClose, replayGraceMs });
   const es = new EventSource(apiUrl(`/tasks/${encodeURIComponent(taskId)}/events`));
   let closed = false;
   let disconnectCount = 0;
@@ -327,4 +336,59 @@ export function subscribeTaskEvents(
     closed = true;
     es.close();
   };
+}
+
+/** EventSource cannot send X-API-Key. Use a header-authenticated stream without URL credentials. */
+export function parseSSEBlock(block) {
+  let kind = 'message'; const data = [];
+  for (const line of block.split('\n')) {
+    if (line.startsWith('event:')) kind = line.slice(6).trim();
+    if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+  }
+  return { kind, data: data.join('\n') };
+}
+
+function subscribeAuthenticatedEvents(taskId, { onEvent, onError, onClose, replayGraceMs }) {
+  const url = apiUrl(`/tasks/${encodeURIComponent(taskId)}/events`);
+  const key = apiKey;
+  const dedup = new EventDedup(); const replay = new ReplayWindow(replayGraceMs);
+  let closed = false; let retryTimer = null; let controller; let disconnectCount = 0;
+  const connect = async () => {
+    controller = new AbortController(); replay.begin();
+    try {
+      const response = await fetch(url, { headers: { 'X-API-Key': key }, signal: controller.signal, redirect: 'error' });
+      if (!response.ok) {
+        if ([401, 403, 404].includes(response.status)) {
+          closed = true; onError?.(new Error(`事件流访问失败（HTTP ${response.status}）`), { willRetry: false }); return;
+        }
+        throw new Error(`事件流请求失败（HTTP ${response.status}）`);
+      }
+      const reader = response.body.getReader(); const decoder = new TextDecoder(); let pending = '';
+      while (!closed) {
+        const { value, done } = await reader.read(); if (done) break;
+        pending += decoder.decode(value, { stream: true });
+        let match;
+        while ((match = /\r?\n\r?\n/.exec(pending))) {
+          const block = pending.slice(0, match.index).replaceAll('\r\n', '\n');
+          pending = pending.slice(match.index + match[0].length);
+          const event = parseSSEBlock(block);
+          if (!SSE_EVENTS.includes(event.kind) || event.kind === 'ping' || !event.data) continue;
+          let payload; try { payload = JSON.parse(event.data); } catch { payload = { raw: event.data }; }
+          const duplicate = dedup.isDuplicate(event.kind, payload);
+          onEvent?.({ kind: event.kind, ...payload }, { duplicate, replayed: !duplicate && replay.isReplaying() });
+          if (['task_finished', 'task_cancelled'].includes(event.kind)) {
+            closed = true; controller.abort(); onClose?.(); return;
+          }
+        }
+      }
+      if (!closed) throw new Error('事件流连接中断');
+    } catch (error) {
+      if (closed) return;
+      disconnectCount += 1; replay.restart();
+      onError?.(error, { willRetry: true, disconnectCount });
+      retryTimer = window.setTimeout(connect, 3000);
+    }
+  };
+  connect();
+  return () => { closed = true; controller?.abort(); if (retryTimer) window.clearTimeout(retryTimer); };
 }

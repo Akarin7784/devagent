@@ -13,7 +13,7 @@
  * 不做任何估算或推断 —— 展示不可核查的数字比不展示更糟。
  */
 
-import { api } from '../api.js';
+import { api } from '../api.js?v=20261008-live';
 import {
   alert,
   button,
@@ -25,13 +25,13 @@ import {
   skeletonStat,
   statCard,
   toast,
-} from '../components.js';
-import { icon } from '../icons.js';
-import { getState, navigate, set } from '../store.js';
+} from '../components.js?v=20261008-live';
+import { icon } from '../icons.js?v=20261008-live';
+import { getState, navigate, set } from '../store.js?v=20261008-live';
 import {
   clear, copyText, el, fmtCompact, fmtCost, fmtInt, fmtPct, fromHTML, histMaxQuantile,
   histOverallMean, metric, mount, sumLabels,
-} from '../util.js';
+} from '../util.js?v=20261008-live';
 
 /** 五层上下文能力 —— 与 docs/02 的设计一一对应。
  *  `metrics` 用真实的后端指标名（后缀匹配，兼容带/不带前缀两种形态）。 */
@@ -79,7 +79,7 @@ const LAYERS = [
 ];
 
 export default async function renderContext(root, ctx) {
-  const container = el('div');
+  const container = el('div', { class: 'page-stack context-page' });
   root.append(container);
   let disposed = false;
 
@@ -120,12 +120,12 @@ export default async function renderContext(root, ctx) {
  * ------------------------------------------------------------------ */
 
 function buildSkeleton() {
-  const wrap = el('div');
-  const grid = el('div', { class: 'grid grid-cols-4', style: { 'margin-bottom': 'var(--space-5)' } });
+  const wrap = el('div', { class: 'page-stack' });
+  const grid = el('div', { class: 'grid grid-cols-4' });
   for (let i = 0; i < 4; i += 1) grid.append(skeletonStat());
   wrap.append(grid);
   wrap.append(
-    el('div', { class: 'grid grid-cols-2', style: { 'margin-bottom': 'var(--space-5)' } }, [
+    el('div', { class: 'grid grid-cols-2' }, [
       skeletonBlock(220),
       skeletonBlock(220),
     ])
@@ -143,32 +143,25 @@ function buildSections(ctx) {
   const cache = getState('cacheStats');
   const observability = getState('observability');
 
-  const sections = [];
+  const sections = [buildHeaderActions()];
 
-  if (!observability) {
+  if (getState('connected') && !observability) {
     sections.push(
       el('div', { class: 'section' }, [
         alert({
           tone: 'info',
-          title: '可观测性未开启，以下指标可能为空',
-          body: '启动服务时加 --trace，或设置 DEVAGENT_OBSERVABILITY__METRICS_ENABLED=true。'
-            + '注意：上下文指标的采集本身有微小开销，生产环境建议接入 OTLP 后关闭内存导出器。',
+          title: '指标采集未开启',
+          body: '在设置 → 后端配置 → 可观测性中启用。',
         }),
       ])
     );
   }
 
-  sections.push(buildHeaderActions());
   sections.push(buildKpiRow(metrics));
   sections.push(buildLayerGrid(metrics));
   sections.push(
     el('div', {
-      class: 'grid',
-      style: {
-        'grid-template-columns': 'minmax(0, 1fr) minmax(0, 1fr)',
-        gap: 'var(--space-4)',
-        'align-items': 'start',
-      },
+      class: 'grid grid-cols-2 context-detail-grid',
     }, [
       buildCompressionCard(metrics),
       buildCacheCard(cache),
@@ -184,10 +177,6 @@ function buildHeaderActions() {
   return el('div', { class: 'page-head' }, [
     el('div', { class: 'page-head-text' }, [
       el('h1', { text: '上下文工程看板' }),
-      el('p', {
-        class: 'page-head-desc',
-        text: '这些数字回答一个问题：把「上下文」当作一等公民来设计，到底省下了多少成本、避免了多少幻觉。',
-      }),
     ]),
     el('div', { class: 'page-head-actions' }, [
       button('查看任务明细', {
@@ -228,7 +217,6 @@ function buildKpiRow(metrics) {
 
   const row = el('div', {
     class: 'grid grid-cols-4',
-    style: { 'margin-bottom': 'var(--space-5)' },
   });
 
   // 压缩比 = 压缩后/压缩前。<1 才是真的省下来了。
@@ -283,8 +271,7 @@ function buildKpiRow(metrics) {
 function buildLayerGrid(metrics) {
   const { counters, histograms } = metrics || {};
   const grid = el('div', {
-    class: 'grid grid-auto-wide',
-    style: { 'margin-bottom': 'var(--space-5)' },
+    class: 'grid context-layer-grid',
   });
 
   for (const layer of LAYERS) {
@@ -293,7 +280,6 @@ function buildLayerGrid(metrics) {
 
   return card({
     title: '五层上下文能力',
-    subtitle: '每一项都可独立观测与调优',
     body: grid,
   });
 }
@@ -378,12 +364,13 @@ function buildLayerCard(layer, counters, histograms) {
     body.append(
       el('p', {
         class: 'hint-text',
-        text: '暂无数据 —— 尚未产生该层的触发记录。',
+        text: '暂无数据',
       })
     );
   }
 
   return el('div', {
+    class: 'context-layer-card',
     style: {
       padding: 'var(--space-3)',
       border: '1px solid var(--border-subtle)',
@@ -397,13 +384,8 @@ function buildLayerCard(layer, counters, histograms) {
         html: icon(layer.icon, 14),
         style: { width: '22px', height: '22px' },
       }),
-      el('span', { text: layer.name, style: { 'font-size': 'var(--fs-sm)', 'font-weight': '600' } }),
+      el('span', { text: layer.name, attrs: { title: layer.desc }, style: { 'font-size': 'var(--fs-sm)', 'font-weight': '600' } }),
     ]),
-    el('p', {
-      class: 'hint-text',
-      text: layer.desc,
-      style: { 'margin-bottom': 'var(--space-3)' },
-    }),
     body,
   ]);
 }
@@ -426,7 +408,7 @@ function buildCompressionCard(metrics) {
         small: true,
         icon: 'package',
         title: '未触发压缩',
-        desc: '压缩只在上下文超过配置阈值时启动。当前输入较短或阈值较高，因此没有产生记录 —— 这不是故障。',
+        desc: '超过阈值后产生记录。',
       })
     );
   } else {
@@ -482,9 +464,7 @@ function buildCompressionCard(metrics) {
           el('div', { style: { 'margin-top': 'var(--space-3)' } }, [
             alert({
               tone: 'info',
-              title: '压缩比恒为 1.0，说明从未真正压缩',
-              body: '当前所有请求的上下文都在预算之内，压缩层未介入。这解释了为什么「节省 token」为 0 —— '
-                + '想让这几项指标变好看，需要构造超长输入（如 datasets 里的 scale 类样本）。',
+              title: '尚未发生实际压缩',
             }),
           ])
         );
@@ -494,7 +474,6 @@ function buildCompressionCard(metrics) {
 
   return card({
     title: '上下文压缩',
-    subtitle: 'Compression 层',
     body,
   });
 }
@@ -515,7 +494,7 @@ function buildCacheCard(cache) {
         desc: '设置 DEVAGENT_CACHE__ENABLED=true 可复用相同或语义相近的模型响应。',
       })
     );
-    return card({ title: '模型响应缓存', subtitle: '成本优化', body });
+    return card({ title: '模型响应缓存', body });
   }
 
   const isVector = cache.mode === 'vector';
@@ -554,7 +533,7 @@ function buildCacheCard(cache) {
           style: { display: 'flex', 'justify-content': 'space-between', 'align-items': 'baseline' },
         }, [
           el('span', {
-            text: '语义命中占比（升级带来的增量）',
+            text: '语义命中占比',
             style: { 'font-size': 'var(--fs-xs)', color: 'var(--text-secondary)' },
           }),
           el('span', {
@@ -566,7 +545,7 @@ function buildCacheCard(cache) {
     );
   } else {
     list.append(
-      metricRow({ name: '模式', value: '精确匹配（措辞不同即未命中）' }),
+      metricRow({ name: '模式', value: '精确匹配' }),
       metricRow({ name: '命中', value: fmtInt(cache.hits ?? 0) }),
       metricRow({ name: '未命中', value: fmtInt(cache.misses ?? 0) }),
       metricRow({
@@ -594,7 +573,6 @@ function buildCacheCard(cache) {
 
   return card({
     title: '模型响应缓存',
-    subtitle: '成本优化效果的可核查证据',
     body,
   });
 }
@@ -650,17 +628,12 @@ function buildRawMetrics(metrics) {
     },
   });
 
-  body.append(
-    el('p', { class: 'hint-text', text: '完整指标快照。三层结构：counters / gauges 为两层，histograms 为三层（含统计量）。', style: { 'margin-bottom': 'var(--space-3)' } }),
-    pre
-  );
+  body.append(pre);
 
-  return card({
-    title: '指标快照',
-    subtitle: '原始数据',
-    actions: [exportBtn, copyBtn],
-    body,
-  });
+  return el('details', { class: 'card metric-disclosure' }, [
+    el('summary', { class: 'card-header' }, [el('h2', { text: '指标快照' })]),
+    el('div', { class: 'card-body' }, [el('div', { class: 'metric-disclosure-actions' }, [exportBtn, copyBtn]), body]),
+  ]);
 }
 
 /* ------------------------------------------------------------------ *

@@ -89,13 +89,10 @@ async def health(request: Request) -> HealthResponse:
     from devagent.config import get_settings
     from devagent.observability import get_observability
 
-    settings = get_settings()
+    settings = getattr(request.app.state, "settings", None) or get_settings()
     gateway = getattr(request.app.state, "gateway", None)
     names = getattr(gateway, "provider_names", None)
-    if names:
-        providers = list(names)
-    else:
-        providers = [name for name, cfg in settings.models.__dict__.items() if _enabled(cfg)]
+    providers = list(names) if names is not None else list(settings.models.enabled_providers())
 
     return HealthResponse(
         status="ok",

@@ -2522,50 +2522,7 @@
   flex: 1;
 }
 
-/* 工作台三栏布局：左侧任务队列 / 中间主区 / 右侧洞察
- *
- * 基态是**两栏**，三栏在 responsive.css 的 ≥1280px 里开启。
- * 为什么基态不直接写三栏：三栏需要约 1280px 才有可读宽度
- * （280 左 + 320 右 + 主区至少 600），窄屏强行三栏会把 DAG 压成一条缝。
- * 移动优先的反向覆盖写法在这里会变成「先写三栏再往下砍两刀」，
- * 断点越多越容易漏 —— 基态取中间态更省心智。
- *
- * 注意 DOM 有 3 个子元素（aside/main/aside），基态只声明 2 列时
- * 第三个会**自动换行**并被拉伸到左侧列下方，而不是消失。
- * 这类「元素还在、位置错了」的布局 bug 不会报错，只能靠肉眼发现。
- */
-.workbench {
-  display: grid;
-  grid-template-columns: 280px minmax(0, 1fr);
-  gap: var(--space-4);
-  align-items: start;
-}
-
-.workbench-aside {
-  position: sticky;
-  top: calc(var(--topbar-h) + var(--space-4));
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
-}
-
-/* 右侧列（节点详情）：仅在 ≥1280px 的三栏布局下出现。
- * 用 max-width 而非 display:none 隐藏 —— 窄屏降为两栏后，它作为
- * 整行下沉到主区下方，仍然可见可用，而非被简单丢弃。 */
-.workbench-detail {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
-  min-width: 0;
-}
-
-.workbench-main {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
-  min-width: 0;
-}
-
+/* 工作台布局由 workspace.css 维护；下面是复用的任务记录组件。 */
 /* 任务列表项 */
 .task-list {
   display: flex;

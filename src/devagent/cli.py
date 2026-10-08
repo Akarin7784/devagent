@@ -67,8 +67,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ---- serve ----
     p_serve = sub.add_parser("serve", help="启动 API 服务")
-    p_serve.add_argument("--host", default="127.0.0.1")
-    p_serve.add_argument("--port", type=int, default=8000)
+    p_serve.add_argument("--host", default=None, help="覆盖后端配置中的监听地址")
+    p_serve.add_argument("--port", type=int, default=None, help="覆盖后端配置中的监听端口")
     p_serve.add_argument("--reload", action="store_true")
 
     return parser
@@ -289,11 +289,12 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         print("缺少 uvicorn。请安装：pip install -e .", file=sys.stderr)
         return 2
 
+    settings = get_settings()
     uvicorn.run(
         "devagent.api.app:create_app",
         factory=True,
-        host=args.host,
-        port=args.port,
+        host=args.host if args.host is not None else settings.api_host,
+        port=args.port if args.port is not None else settings.api_port,
         reload=args.reload,
     )
     return 0

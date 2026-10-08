@@ -56,13 +56,18 @@
 **如果你要执行不可信来源的代码，必须启用 `DockerSandbox`：**
 
 ```bash
-DEVAGENT_TOOLS__SANDBOX_BACKEND=docker
+DEVAGENT_SANDBOX__ENABLED=true
+DEVAGENT_SANDBOX__ALLOW_LOCAL_FALLBACK=false
 pip install -e ".[sandbox]"
 docker build -t devagent/sandbox:latest docker/sandbox
 ```
 
 这一点在 [ADR-0004](docs/adr/0004-沙箱默认本地进程docker可选.md) 中有完整说明。
 我们不夸大默认配置的安全能力。
+
+### 测试目录隔离
+
+每次测试调用从配置基线创建独立快照，生成文件不写回基线；相同文件名和 conftest 不在任务之间共享。退出与取消都会清理快照；取消时先终止子进程树或容器。目录隔离不改变本地子进程的权限边界。补丁尚未应用，基线测试结果不能证明本次代码改动已通过验收。
 
 ### 提示词注入
 
@@ -148,3 +153,14 @@ Agent 会读取仓库中的文件内容作为上下文。如果仓库中存在�
 4. 设置 `DEVAGENT_RELIABILITY__MAX_TASK_TOKENS` 上限，防止成本失控
 5. 不要把 `/metrics` 端点暴露到公网
 6. 使用 `sql` 存储后端时，为数据库配置访问控制、备份与**保留期清理策略**
+
+
+### 后端配置管理
+
+`GET/PUT /api/v1/settings` 无访问密钥时只允许本机 Host、本机连接与同源来源，拒绝跨站请求。启用 API Key 后由全局 `X-API-Key` 中间件鉴权，远程部署应使用 HTTPS、受控 CORS 与可信反向代理。模型供应商基址只接受 HTTP(S)，不接受 URL 内嵌凭据、查询或片段。
+
+配置响应不回显供应商密钥、后端访问密钥或数据库 / Redis 连接串；校验错误不返回输入内容。浏览器密钥仅保存在页面内存，通过请求头发送，认证 SSE 使用 fetch 流而不在 URL 中携带密钥。修改连接地址会清除旧会话密钥，请求禁止跟随重定向。
+
+保存仅更新提交字段，使用临时文件原子替换；同一服务进程内以 revision 防止并发覆盖。配置接口面向单进程管理，多 worker 或多实例部署应统一管理文件，不能将当前锁视为跨进程事务。配置保存后须重启，原服务继续使用启动时的认证与运行参数。
+
+`.devagent/settings.json` 包含明文覆盖值（包括用户主动保存的密钥），并非加密存储。POSIX 创建目录 / 文件使用 0700 / 0600；Windows 应由部署管理员设置目录 ACL。禁止把该目录交给沙箱、静态文件服务或其他用户。环境变量中的未修改密钥不会复制进覆盖文件；可通过 `DEVAGENT_SETTINGS_FILE` 选择受保护的持久目录。默认 CLI 仅监听回环地址，需要外部访问时显式配置监听地址。

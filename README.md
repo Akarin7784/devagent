@@ -4,12 +4,12 @@
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-659%20passing-brightgreen)](#测试)
+[![Tests](https://img.shields.io/badge/tests-regression%20checked-brightgreen)](#测试)
 [![mypy](https://img.shields.io/badge/mypy-strict-blue)](https://mypy-lang.org/)
 [![Ruff](https://img.shields.io/badge/code%20style-ruff-000000)](https://github.com/astral-sh/ruff)
 
-DevAgent 把一句自然语言需求，变成「需求规格 → 技术方案 → 代码改动 → 测试 → 独立验证」的端到端交付，
-并且把每一步的**上下文构造过程**作为一等公民进行量化与优化。
+DevAgent 把一句自然语言需求，变成「需求规格 → 技术方案 → 代码改动 → 测试 → 独立验证」的编排流程。当前产出是代码 diff 或片段，尚未应用补丁；测试执行基线快照，
+详见 [质量与已知限制](docs/07-质量与已知限制.md)。系统对每一步的**上下文构造过程**进行量化与优化。
 
 它不是为了再做一个「Agent 框架」，而是为了回答一个具体问题：
 
@@ -69,7 +69,7 @@ Coder 上下文:  requirements + constraints + reflexion_lessons + 相关代码
 Verifier 上下文: requirements.验收标准 + diff + 测试stdout   ← 无 Coder 自述
 ```
 
-这条边界由 `ContextIsolator` 在代码层面强制，并有专门测试守护。
+这条边界由编排器从结构化产物提取路径与 diff，并用独立上下文装配；集成测试检查实际模型输入。
 
 **验证不可用时 fail-closed**：Verifier 调用失败（上游 5xx / 超时 / 限流）时，
 节点判为**未通过**并计入 `verification_unavailable` 指标 —— 绝不因为"验证跑不了"
@@ -136,7 +136,7 @@ devagent run "为用户列表接口增加分页能力"
 模型调用次数 : 14
 DAG 节点     : {"N1": "success", "N2": "success", "N3": "success"}
 执行步骤     : requirement:ok -> architect:ok -> coder:ok -> verifier:reject -> coder:ok -> verifier:pass -> coder:ok -> verifier:pass -> tester:ok -> verifier:pass
-token 总量   : 8679
+token 总量   : 9927
 SMOKE OK
 ```
 
@@ -256,7 +256,7 @@ score(chunk) = w_rel · relevance
 指数 `gamma=4` 让「明显重复」的片段几乎失去竞争力，但仍保留软性权衡空间。
 
 **硬去重**是第二道保险：即便软打分因配置失误让冗余片段胜出，去重也会在最终集合上兜住。
-这个设计来自一个真实 bug（见 [docs/05](docs/05-工程落地指南.md)）。
+这个设计来自一个真实 bug（见 [架构说明](docs/06-架构说明.md)）。
 
 ### L5 · 预算（Budget）
 
@@ -267,7 +267,7 @@ score(chunk) = w_rel · relevance
 
 ## 配置
 
-配置通过环境变量注入，嵌套字段用 `__` 分隔（`pydantic-settings` 约定）。
+配置可通过设置页保存到后端，也可使用 `.env` 与环境变量；嵌套字段用 `__` 分隔（`pydantic-settings` 约定）。
 
 ```bash
 # 模型供应商（至少配一个）
@@ -282,9 +282,27 @@ DEVAGENT_RELIABILITY__MAX_RETRIES=3
 ```
 
 > 供应商没有独立的 ``ENABLED`` 开关：``ProviderConfig.enabled`` 由
-> 「``api_key`` 与 ``base_url`` 同时非空」推导（空串 Key 视为未配置）。
+> 「``api_key`` 与 ``base_url`` 同时非空」推导；本地服务选择 `auth_mode=none` 时只需基址。
 
-完整清单见 [`.env.example`](.env.example)。
+环境配置示例见 [`.env.example`](.env.example)，完整字段由设置页读取后端 `Settings` schema 展示。
+
+### 在设置页管理后端
+
+「模型供应商」提供预设、API Key、基址、协议、认证、请求超时、重试、输出参数和成本单价，并可直接将模型绑定到大小模型、嵌入或评测路由。「后端配置」覆盖服务与跨域、模型路由、缓存、上下文、可靠性与预算、沙箱、API 访问控制、可观测性、评测、任务存储、数据库与 Redis；支持跨分类搜索。
+
+预设包含 DeepSeek、通义千问、智谱、OpenAI、Anthropic、Gemini、Azure OpenAI、Kimi、MiniMax、豆包、混元、百度千帆、硅基流动、OpenRouter、Groq、xAI、Mistral、Together、Fireworks、NVIDIA NIM、Cohere、Bedrock、Vertex AI、阶跃星辰、讯飞星火、Perplexity、Cerebras、Ollama、LM Studio 和自定义服务。端点说明与官方接入文档随预设展示；模型示例需以账号实际权限为准。
+
+1. 选择预设，点击「添加 / 选择供应商」，填写密钥和模型名，设置相应路由。Ollama 与 LM Studio 支持无密钥；嵌入模型需选择提供 embeddings 接口的服务。
+2. 点击「保存后端配置」。服务端校验后只写入本次修改，已有密钥留空保留、不会回显；API Key 可显式清除。切换设置分区会保留尚未保存的编辑，刷新页面会丢弃编辑。
+3. 重启后端，新配置才生效。`devagent serve` 使用配置中的监听地址和端口（默认 `127.0.0.1:8000`）；显式 `--host` / `--port` 优先，直接使用 uvicorn 或演示脚本时由启动参数决定。
+
+覆盖值默认保存在项目 `.devagent/settings.json`（已忽略提交）；可通过 `DEVAGENT_SETTINGS_FILE` 指定持久目录。加载顺序为默认值 → `.env` → 环境变量 → 保存的覆盖值，未保存的环境密钥不会被复制进文件。需要恢复环境配置优先权时，由管理员备份并移除对应 JSON 覆盖项，再重启。配置文件含明文密钥，应按 [安全策略](SECURITY.md) 限制访问并备份。
+
+远程管理须先配置 `DEVAGENT_SECURITY__API_KEY`，并在「后端连接」填写会话访问密钥。该密钥只保存在当前页面内存，不进入 localStorage 或 URL；刷新后需要重新输入。无 API Key 时，配置接口只接受本机、同源请求。
+
+Anthropic 使用原生 Messages 接口（固定 `x-api-key` / `max_tokens`），其余使用 OpenAI Chat Completions 兼容接口。Azure 需要资源端点与部署名；Vertex 需要项目端点和 OAuth token（不自动刷新）；Bedrock 使用 API Key，不处理 SigV4。预设不保证所有模型都支持工具调用或嵌入，设置操作不会发起付费模型验证。
+
+`scripts/serve_demo.py` 始终使用脚本化模型，设置页会明确标注离线演示模式；真实任务请使用 `devagent serve` 启动。
 
 ### 关键开关
 
@@ -301,7 +319,7 @@ DEVAGENT_RELIABILITY__MAX_RETRIES=3
 | `DEVAGENT_CACHE__SIMILARITY_THRESHOLD` | `0.92` | 语义命中的余弦相似度阈值 |
 | `DEVAGENT_CONTEXT__INJECTION_GUARD` | `true` | 给不可信来源的上下文加内容边界标记 |
 | `DEVAGENT_CONTEXT__WEIGHT_TRUST` | `1.0` | 信任度在装配打分中的权重（0 = 关闭） |
-| `DEVAGENT_SANDBOX__WORKSPACE_MOUNT` | 临时目录 | 测试工作区；留空则每次启动建一个一次性目录 |
+| `DEVAGENT_SANDBOX__WORKSPACE_MOUNT` | 临时目录 | 测试基线；每次调用复制独立快照，留空使用空基线 |
 | `DEVAGENT_SANDBOX__ALLOW_LOCAL_FALLBACK` | `true` | Docker 不可用时是否降级为本地沙箱（生产建议 `false`，fail-closed） |
 | `DEVAGENT_SECURITY__API_KEY` | `""` | 非空时 `/api/v1/**` 要求 `X-API-Key` 请求头 |
 | `DEVAGENT_EVALUATION__DATASET_DIR` | `datasets` | 评测接口允许读取的数据集根目录 |
@@ -488,12 +506,12 @@ curl -N http://localhost:8000/api/v1/tasks/<id>/events
 
 | 路由 | 内容 |
 | --- | --- |
-| 总览 | 任务 KPI、成功率、累计 token/成本、近期任务、健康告警 |
-| 工作台 | 任务 DAG（节点按状态着色，`×N` 显示重跑轮次）、节点详情与**逐行着色的 diff**、SSE 执行时间线 |
+| 运行概览 | 任务 KPI、成功率、累计 token/成本、近期任务、健康告警 |
+| 工作台（默认入口） | 大输入区与本地草稿、任务搜索/筛选、执行计划、SSE 动态、独立的代码改动与验证页签；依赖图和步骤详情按需展开 |
 | 上下文看板 | 五层上下文能力指标、token 节省、压缩比、预算利用率、语义缓存命中 |
 | 评测中心 | golden set 跑批、任务级/轨迹级/质量级指标、分类别表现、判别力提示 |
 | 可观测性 | 指标明细表（可搜索排序）、Prometheus 导出、链路追踪、缓存统计 |
-| 设置 | 后端连接、外观偏好、本地数据管理 |
+| 设置 | 后端连接、模型供应商、完整后端配置、外观偏好、本地数据管理 |
 
 ### 设计系统
 
@@ -501,7 +519,7 @@ curl -N http://localhost:8000/api/v1/tasks/<id>/events
   因此切换主题时组件 CSS 零改动（187 个令牌，无悬空引用）。
 - **明暗双主题**：跟随系统 / 手动切换，`prefers-color-scheme` 实时监听，
   首屏有防 FOUC 预置脚本。
-- **图标**：77 个内联 SVG，继承 `currentColor`，暗色主题下自动适配。
+- **图标**：内联 SVG，继承 `currentColor`，暗色主题下自动适配。
 - **可访问性**：焦点陷阱与恢复、`:focus-visible`、skip-link、
   `aria-live` 分级通知、`prefers-reduced-motion`、`forced-colors`、WCAG AA 对比度。
 - **响应式**：≤1023px 侧栏转抽屉，≤767px 表格转卡片，触摸目标 ≥38px。
@@ -511,8 +529,8 @@ curl -N http://localhost:8000/api/v1/tasks/<id>/events
 ```
 web/
 ├── index.html          外壳挂载点
-├── css/                tokens / base / components / responsive
-├── js/                 util, api, store, components, shell, main, icons
+├── css/                tokens / base / components / responsive / workspace
+├── js/                 util, api, store, task-view, components, shell, main, icons
 │   └── pages/          6 个业务页面
 └── graph.js            DAG 布局纯函数（不碰 document）
 ```
@@ -543,7 +561,7 @@ make serve-demo          # 等价于 PYTHONPATH=src python scripts/serve_demo.py
 前端逻辑可在无浏览器环境下测试：
 
 ```bash
-make web-check   # 语法检查 + 模块图完整性 + 175 个纯逻辑断言（零依赖）
+make web-check   # 语法检查 + 模块图完整性 + 逻辑回归测试（零依赖）
 ```
 
 ---
@@ -552,10 +570,10 @@ make web-check   # 语法检查 + 模块图完整性 + 175 个纯逻辑断言（
 
 ```bash
 pip install -e ".[dev,db]"   # [dev] 是测试工具；[db] 供持久化层用例使用
-make test            # 全量（659 个）
+make test            # 全量测试
 make test-unit       # 仅单元测试
 make check           # ruff + mypy --strict
-make web-check       # 前端语法 + 模块图 + 逻辑测试（175 个，零依赖）
+make web-check       # 前端语法 + 模块图 + 逻辑测试（零依赖）
 ```
 
 > `[db]` 不是可选项：`tests/unit/test_db.py`（15 个用例，覆盖真实 SQL 方言、
@@ -563,20 +581,7 @@ make web-check       # 前端语法 + 模块图 + 逻辑测试（175 个，零�
 > 未安装时该文件会**明确跳过**并说明原因，而不是抛出一堆 setup 错误 ——
 > 但 CI 必须装上它，否则这些用例会在流水线上静默不跑。
 
-当前状态：
-
-```
-659 passed, 1 skipped in 19.8s
-46 passed (web/graph.test.js)
-17 passed (web/eventstream.test.js)
-37 passed (web/status.test.js)
-27 passed (web/format.test.js)
-41 passed (web/pages.test.js)
-10 passed (web/imports.test.js)
-ruff check .......... 通过
-ruff format --check . 通过
-mypy --strict ....... 61 个源文件，0 错误
-```
+最新验证结果集中维护在 [质量与已知限制](docs/07-质量与已知限制.md)，避免测试计数散落多处。
 
 测试覆盖了若干**回归场景**，每一个都对应一个曾经真实存在的 bug：
 
@@ -628,11 +633,14 @@ mypy --strict ....... 61 个源文件，0 错误
 
 | 文档 | 内容 |
 | --- | --- |
-| [01-项目总纲](docs/01-项目总纲.md) | 定位、架构、数据模型、里程碑 |
+| [文档导航](docs/README.md) | 按用途查找文档 |
+| [01-项目总纲](docs/01-项目总纲.md) | 项目目标、当前范围、后续路线图 |
 | [02-上下文工程深度设计](docs/02-上下文工程深度设计.md) | ★ 五层模型与装配算法 |
 | [03-多Agent编排与可靠性](docs/03-多Agent编排与可靠性.md) | 拓扑、握手协议、幻觉阻断 |
 | [04-面试题库与简历话术](docs/04-面试题库与简历话术.md) | 深挖题与表述方式 |
-| [05-工程落地指南](docs/05-工程落地指南.md) | 目录结构、关键代码、踩坑记录 |
+| [06-架构说明](docs/06-架构说明.md) | 当前实现的数据流与模块契约 |
+| [07-质量与已知限制](docs/07-质量与已知限制.md) | 修复、验证证据与能力边界 |
+| [贡献指南](CONTRIBUTING.md) | 安装开发环境与质量门禁 |
 | [ADR](docs/adr/) | 架构决策记录 |
 
 ---
@@ -677,8 +685,7 @@ mypy --strict ....... 61 个源文件，0 错误
 
 **支持哪些模型？**
 
-任何 OpenAI 兼容接口。内置 DeepSeek / 通义千问 / 智谱的适配与价格表，
-通过 `ModelProvider` 协议可以接入任意供应商。
+支持 OpenAI Chat Completions 兼容接口与 Anthropic 原生 Messages 接口。设置页提供主流供应商预设，可添加自定义服务；保留 DeepSeek / 通义千问 / 智谱的价格表，新增供应商可填写实际单价。
 
 **能离线跑吗？**
 

@@ -13,7 +13,7 @@
  *   - 超时放宽到 5 分钟。
  */
 
-import { api } from '../api.js';
+import { api } from '../api.js?v=20261008-live';
 import {
   alert,
   badge,
@@ -25,10 +25,10 @@ import {
   skeletonBlock,
   statCard,
   toast,
-} from '../components.js';
-import { icon } from '../icons.js';
-import { getState, navigate, set } from '../store.js';
-import { clear, el, fmtCost, fmtInt, fmtPct, fromHTML, mount } from '../util.js';
+} from '../components.js?v=20261008-live';
+import { icon } from '../icons.js?v=20261008-live';
+import { getState, navigate, set } from '../store.js?v=20261008-live';
+import { clear, el, fmtCost, fmtInt, fmtPct, fromHTML, mount } from '../util.js?v=20261008-live';
 
 /** 可选的评测类别 —— 与 golden set 的 category 字段一致。 */
 const CATEGORY_OPTIONS = [
@@ -59,16 +59,12 @@ export default async function renderEval(root, ctx) {
   /* ---------- 布局 ---------- */
 
   function buildLayout() {
-    const wrap = el('div');
+    const wrap = el('div', { class: 'page-stack eval-page' });
 
     wrap.append(
       el('div', { class: 'page-head' }, [
         el('div', { class: 'page-head-text' }, [
           el('h1', { text: '评测中心' }),
-          el('p', {
-            class: 'page-head-desc',
-            text: '基于 golden set 对系统做任务级、轨迹级与质量级评测。评测是判断「改动是否真的变好了」的唯一手段。',
-          }),
         ]),
       ])
     );
@@ -77,12 +73,7 @@ export default async function renderEval(root, ctx) {
 
     wrap.append(
       el('div', {
-        class: 'grid',
-        style: {
-          'grid-template-columns': 'minmax(320px, 400px) minmax(0, 1fr)',
-          gap: 'var(--space-4)',
-          'align-items': 'start',
-        },
+        class: 'grid evaluation-grid',
       }, [buildFormCard(), result ? buildResultPanel(result) : buildEmptyResult()])
     );
 
@@ -117,7 +108,7 @@ export default async function renderEval(root, ctx) {
           el('span', { class: 'optional', text: '可选' }),
         ]),
         datasetInput,
-        el('div', { class: 'field-hint', text: '默认读取 datasets/golden_set.jsonl（JSONL 格式，每行一个样本）' }),
+        el('div', { class: 'field-hint', text: '留空使用默认数据集（JSONL）' }),
       ])
     );
 
@@ -144,7 +135,6 @@ export default async function renderEval(root, ctx) {
           cb,
           el('span', {}, [
             el('span', { text: c.label }),
-            el('span', { class: 'hint-text', text: ` — ${c.desc}`, style: { 'margin-left': '6px' } }),
           ]),
         ])
       );
@@ -186,7 +176,7 @@ export default async function renderEval(root, ctx) {
         el('span', { class: 'switch-track' }),
         el('span', { class: 'switch-label' }, [
           el('div', { text: '启用 LLM Judge 质量评分' }),
-          el('div', { class: 'hint-text', text: '关闭可省一半成本，但失去质量级评测与判别力指标' }),
+          el('div', { class: 'hint-text', text: '关闭后不进行质量评分' }),
         ]),
       ])
     );
@@ -195,7 +185,7 @@ export default async function renderEval(root, ctx) {
       alert({
         tone: 'warning',
         title: '评测会真实调用模型，产生费用',
-        body: '评测同步执行，样本量大时可能耗时数分钟。建议先用「样本上限 = 5」验证链路，再放开全量。',
+        body: '建议先设置少量样本。',
       })
     );
 
@@ -224,7 +214,7 @@ export default async function renderEval(root, ctx) {
       body: emptyState({
         icon: 'flask',
         title: '尚未运行评测',
-        desc: '配置左侧参数后点击「开始评测」。也可以直接在命令行运行：make cli-eval，或 python -m devagent.cli eval。',
+        desc: '设置参数后开始评测。',
       }),
     });
   }

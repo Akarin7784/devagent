@@ -9,7 +9,7 @@
 
 import assert from 'node:assert/strict';
 
-import { EventDedup, ReplayWindow, eventFingerprint } from './js/eventstream.js';
+import { EventDedup, ReplayWindow, eventFingerprint } from './js/eventstream.js?v=20261008-live';
 
 let passed = 0;
 const failures = [];

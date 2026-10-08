@@ -50,7 +50,9 @@ dev_reload = _load_script_module("dev_reload")
 def _frontend_app(root: Path, live: Any = None) -> Starlette:
     """最小可用的前端托管：只挂一个目录，不含任何 devagent 依赖。"""
     return Starlette(
-        routes=[Mount("/", app=dev_reload.DevStaticFiles(directory=str(root), html=True, live=live))]
+        routes=[
+            Mount("/", app=dev_reload.DevStaticFiles(directory=str(root), html=True, live=live))
+        ]
     )
 
 
@@ -241,9 +243,7 @@ def test_在真实应用上完成接线(tmp_path: Path) -> None:
     assert live is not None, '没有找到 Mount("/")：挂载点的 path 是被 rstrip 过的空串'
 
     routes = app.router.routes
-    dev_index = next(
-        i for i, r in enumerate(routes) if getattr(r, "path", None) == "/__dev/events"
-    )
+    dev_index = next(i for i, r in enumerate(routes) if getattr(r, "path", None) == "/__dev/events")
     mount_index = next(
         i
         for i, r in enumerate(routes)

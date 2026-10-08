@@ -9,10 +9,8 @@
 
 安全约束（测试文件的内容与路径都由**模型**给出）：
 
-- 写入根目录默认是**本实例专属的一次性临时目录**，绝不是 ``Path.cwd()``：
-  否则模型只要给出 ``{"path": "src/devagent/tools/sandbox.py"}`` 就能在宿主上
-  静默改写仓库源码；
-- 根目录下**已存在**的文件一律拒绝覆盖（本次运行自己写入的除外，便于重试）；
+- 每次调用在独立的基线快照中写入和执行，结束或取消时清理；
+- 基线已有文件一律拒绝覆盖，生成文件不写回基线；
 - 只接受安全的相对 ``.py`` 路径，以 ``-`` 开头的一律拒绝
   （``--rootdir=..`` / ``-p`` / ``-c/etc/passwd`` 这类字符串会作为
   pytest **选项**进入 argv）；
@@ -125,8 +123,8 @@ class SandboxTestRunner:
         runner = SandboxTestRunner(sandbox, workspace_root="/tmp/ws")
         outcome = await runner.run_tests(test_files)
 
-    未显式指定 ``workspace_root`` 时使用本实例专属的一次性临时目录
-    （见 :attr:`workspace_root`），调用方可用 :meth:`cleanup` 释放。
+    ``workspace_root`` 是只读基线；每次调用都创建并清理独立的执行快照。
+    未指定时用本实例的空临时基线，调用方可用 :meth:`cleanup` 释放它。
     """
 
     def __init__(
@@ -140,11 +138,10 @@ class SandboxTestRunner:
         self._timeout = timeout
         self._explicit_root = bool(workspace_root)
         self._root: Path | None = Path(workspace_root) if workspace_root else None
-        self._owned_files: set[Path] = set()
 
     @property
     def workspace_root(self) -> Path:
-        """写入/执行用的根目录（未指定时按需创建一次性临时目录）。"""
+        """基线目录（未指定时按需创建空临时目录）。"""
         return self._ensure_root()
 
     def cleanup(self) -> None:
@@ -153,29 +150,41 @@ class SandboxTestRunner:
             return
         shutil.rmtree(self._root, ignore_errors=True)
         self._root = None
-        self._owned_files.clear()
 
     async def run_tests(
         self, test_files: list[dict[str, Any]], *, workdir: str = ""
     ) -> TestRunOutcome:
-        """写入测试文件并在沙箱中执行。
+        """在本次调用专属的基线快照中执行测试，结束或取消时清理快照。
 
-        Args:
-            test_files: ``[{"path": ..., "content": ...}, ...]``。
-            workdir: 工作目录（默认使用本实例的根目录）。
-
-        Returns:
-            ``TestRunOutcome``；沙箱不可用或执行失败时如实返回
-            ``executed=False``，**绝不伪造结果**。
-
-        说明：``outcome.raw`` 里始终带有 ``written_paths``（本次实际写入的
-        相对路径，供调用方清理），以及 ``refused_paths`` / ``rejected_paths``
-        （被拒绝覆盖 / 路径非法的条目）与 ``exit_code``。
+        ``workspace_root`` / ``workdir`` 仅提供基线；生成文件不会写回它们。
+        每次调用使用独立目录，因此共享 runner 的并发任务和重试互不覆盖。
         """
         if not test_files:
             return TestRunOutcome(executed=False, stderr="没有可执行的测试文件")
+        baseline = Path(workdir) if workdir else self._ensure_root()
+        try:
+            with tempfile.TemporaryDirectory(prefix="devagent-test-call-") as directory:
+                target = Path(directory)
+                shutil.copytree(
+                    baseline,
+                    target,
+                    dirs_exist_ok=True,
+                    ignore=_ignore_snapshot_entries,
+                )
+                outcome = await self._run_in_workspace(test_files, target=target)
+                outcome.raw["baseline_root"] = str(baseline)
+                return outcome
+        except OSError as exc:
+            logger.error("test_workspace_failed", error=str(exc))
+            return TestRunOutcome(executed=False, stderr=f"测试工作区不可用：{exc}")
 
-        target = Path(workdir) if workdir else self._ensure_root()
+    async def _run_in_workspace(
+        self, test_files: list[dict[str, Any]], *, target: Path
+    ) -> TestRunOutcome:
+        """写入并执行；raw 保留工作区、文件路径与退出码供审计。"""
+        if not test_files:
+            return TestRunOutcome(executed=False, stderr="没有可执行的测试文件")
+
         try:
             report = self._write_test_files(test_files, target)
         except OSError as exc:
@@ -330,7 +339,7 @@ class SandboxTestRunner:
                 report.rejected.append(rel)
                 continue
 
-            if target.exists() and target not in self._owned_files:
+            if target.exists():
                 # 覆盖仓库既有文件是本模块最危险的失败模式：宁可跳过并上报
                 logger.warning("existing_file_overwrite_refused", path=rel, root=str(root))
                 report.refused.append(rel)
@@ -338,7 +347,6 @@ class SandboxTestRunner:
 
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
-            self._owned_files.add(target)
             report.written.append(rel)
         return report
 
@@ -359,6 +367,19 @@ class SandboxTestRunner:
         if not parts or ".." in parts:
             return False
         return parts[-1].lower().endswith(".py")
+
+
+def _ignore_snapshot_entries(directory: str, names: list[str]) -> set[str]:
+    """快照不复制密钥、缓存、虚拟环境或指向外部的符号链接。"""
+    excluded = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache"}
+    return {
+        name
+        for name in names
+        if name in excluded
+        or name == ".env"
+        or (name.startswith(".env.") and name != ".env.example")
+        or (Path(directory) / name).is_symlink()
+    }
 
 
 __all__ = ["PytestOutputParser", "SandboxTestRunner"]

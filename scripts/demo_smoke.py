@@ -248,7 +248,15 @@ class DemoProvider(ModelProvider):
                 # 第一次判失败 → 触发回退重试路径（这是本脚本最有价值的覆盖）
                 content = _VERIFIER_FAIL
             else:
-                content = _VERIFIER_PASS
+                # 验证响应必须与本节点的标准对齐，不能混入其他节点的标准。
+                user = "\n".join(m.content for m in messages if m.role == "user")
+                payload = json.loads(_VERIFIER_PASS)
+                payload["criterion_checks"] = [
+                    check
+                    for check in payload["criterion_checks"]
+                    if f"- [ ] {check['criterion']}" in user
+                ]
+                content = json.dumps(payload, ensure_ascii=False)
         elif "需求分析" in system:
             content = _REQUIREMENT
         elif "架构" in system:

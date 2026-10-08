@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 
 from devagent.api.routes import router
 from devagent.api.service import TaskService
+from devagent.api.settings_routes import router as settings_router
 from devagent.api.store import EventBus
 from devagent.config import Settings, get_settings
 from devagent.logging_config import configure_logging, get_logger
@@ -106,6 +107,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    app.state.settings = resolved
 
     # CORS：前端 dev server 通常跑在 5173（Vite）
     #
@@ -141,6 +143,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return await call_next(request)
 
     app.include_router(router, prefix="/api/v1")
+    app.include_router(settings_router, prefix="/api/v1")
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:

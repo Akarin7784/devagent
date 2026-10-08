@@ -22,6 +22,7 @@ from devagent.config import Settings
 from devagent.context.routing import ComplexityRouter, ModelSpec
 from devagent.enums import ModelTier
 from devagent.logging_config import get_logger
+from devagent.models.configured import AnthropicProvider, ConfiguredProvider
 from devagent.models.domain import RoutingSignals
 from devagent.models.provider import (
     ChatMessage,
@@ -30,11 +31,6 @@ from devagent.models.provider import (
     ModelProvider,
     TokenUsage,
     ToolSpec,
-)
-from devagent.models.providers import (
-    DeepSeekProvider,
-    QwenProvider,
-    ZhipuProvider,
 )
 from devagent.models.vector_cache import VectorSemanticCache
 from devagent.observability import MetricNames, get_observability
@@ -272,31 +268,12 @@ class ModelGateway:
 
     @staticmethod
     def _build_providers(settings: Settings) -> dict[str, ModelProvider]:
-        m = settings.models
-        providers: dict[str, ModelProvider] = {}
-
-        if m.deepseek.enabled:
-            providers["deepseek"] = DeepSeekProvider(
-                api_key=m.deepseek.api_key.get_secret_value(),  # type: ignore[union-attr]
-                base_url=m.deepseek.base_url,
-                timeout_seconds=m.deepseek.timeout_seconds,
-                max_retries=m.deepseek.max_retries,
+        return {
+            name: (AnthropicProvider if cfg.protocol == "anthropic" else ConfiguredProvider)(
+                name, cfg
             )
-        if m.qwen.enabled:
-            providers["qwen"] = QwenProvider(
-                api_key=m.qwen.api_key.get_secret_value(),  # type: ignore[union-attr]
-                base_url=m.qwen.base_url,
-                timeout_seconds=m.qwen.timeout_seconds,
-                max_retries=m.qwen.max_retries,
-            )
-        if m.zhipu.enabled:
-            providers["zhipu"] = ZhipuProvider(
-                api_key=m.zhipu.api_key.get_secret_value(),  # type: ignore[union-attr]
-                base_url=m.zhipu.base_url,
-                timeout_seconds=m.zhipu.timeout_seconds,
-                max_retries=m.zhipu.max_retries,
-            )
-        return providers
+            for name, cfg in settings.models.enabled_providers().items()
+        }
 
     # ------------------------------------------------------------------ #
     # 对外接口

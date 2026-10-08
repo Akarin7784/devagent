@@ -21,7 +21,7 @@ install:  ## 安装运行时依赖
 	$(PYTHON) -m pip install -e .
 
 install-dev:  ## 安装开发依赖（含测试与检查工具）
-	$(PYTHON) -m pip install -e ".[dev,sandbox,eval]"
+	$(PYTHON) -m pip install -e ".[dev,db,sandbox,eval]"
 	pre-commit install
 
 # ---------- 代码质量 ----------
@@ -48,10 +48,10 @@ test:  ## 运行全部测试
 	pytest
 
 test-unit:  ## 只运行单元测试
-	pytest -m unit
+	pytest tests/unit
 
-test-integration:  ## 只运行集成测试（需 DB/Redis）
-	pytest -m integration
+test-integration:  ## 运行脚本化 Provider 的编排集成测试
+	pytest tests/integration
 
 test-fast:  ## 只跑快速测试（跳过标记为 slow 的）
 	pytest -m "not slow" -q
@@ -83,18 +83,9 @@ migrate:  ## 执行数据库迁移
 # 注：web/ 为零构建前端，无需 npm install，直接打开 web/index.html 即可。
 # 只有需要本地静态服务器（避免 file:// 的 CORS 限制）时才用下面这条。
 
-web-words:  ## 导出跨语言词表（从 devagent/enums.py 生成前端可读的 fixture）
-	@$(PYTHON) -c "import sys; sys.path.insert(0, 'src'); \
-	from devagent.enums import AgentType, StepStatus, TaskStatus; \
-	import json, pathlib; \
-	pathlib.Path('web').mkdir(exist_ok=True); \
-	pathlib.Path('web/test_contract_words.json').write_text( \
-	    json.dumps({'_generated_by': 'Makefile::web-words', \
-	                'step_status': [s.value for s in StepStatus], \
-	                'agent_type': [a.value for a in AgentType], \
-	                'task_status': [s.value for s in TaskStatus]}, \
-	               ensure_ascii=False, indent=2) + '\n', encoding='utf-8')"
-	@echo "[web-words] web/test_contract_words.json 已更新"
+web-words:  ## 导出跨语言词表与后端配置 schema
+	@$(PYTHON) scripts/export_web_contracts.py
+	@echo "[web-words] 跨语言词表与后端配置 schema 已更新"
 
 web-check: web-words  ## 校验前端（语法检查 + 纯逻辑测试 + 模块图完整性，零依赖）
 	@echo "[web-check] 语法检查（全部 ES 模块）"
@@ -107,7 +98,7 @@ web-check: web-words  ## 校验前端（语法检查 + 纯逻辑测试 + 模块�
 		if(e.isDirectory()){w(f);continue} if(!f.endsWith('.js'))continue; \
 		const s=fs.readFileSync(f,'utf8'); \
 		for(const m of s.matchAll(/from\s*['\''\"](\.[^'\''\"]+)['\''\"]/g)){n++; \
-		if(!fs.existsSync(p.resolve(p.dirname(f),m[1]))){console.log('  缺失:',f,'->',m[1]);bad++;}}}})('web'); \
+		if(!fs.existsSync(p.resolve(p.dirname(f),m[1].split('?')[0]))){console.log('  缺失:',f,'->',m[1]);bad++;}}}})('web'); \
 		console.log('  检查 '+n+' 条相对导入，缺失 '+bad+' 条'); process.exit(bad?1:0)"
 	@echo "[web-check] 纯逻辑测试"
 	$(NODE) web/graph.test.js
@@ -118,6 +109,8 @@ web-check: web-words  ## 校验前端（语法检查 + 纯逻辑测试 + 模块�
 	$(NODE) web/eventstream.test.js
 	@echo "[web-check] 页面纯函数与渲染契约"
 	$(NODE) web/pages.test.js
+	$(NODE) web/workspace.test.js
+	$(NODE) web/settings.test.js
 	@echo "[web-check] 模块图与「动态数据不得当 HTML 解析」静态防线"
 	$(NODE) web/imports.test.js
 	@echo "[web-check] 通过"

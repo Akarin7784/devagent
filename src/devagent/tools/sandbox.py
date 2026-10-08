@@ -210,6 +210,9 @@ class LocalProcessSandbox:
                 drain = await _drain_streams(
                     proc, cap_bytes=cap_bytes, timeout=float(effective_timeout)
                 )
+            except asyncio.CancelledError:
+                await _kill_process_tree(proc, reason="cancelled")
+                raise
             except OSError as exc:  # 管道读取异常不应让沙箱崩掉
                 logger.warning("sandbox_drain_failed", error=str(exc))
                 drain = _DrainResult(stdout=b"", stderr=b"", truncated=False, timed_out=False)
@@ -429,9 +432,14 @@ class DockerSandbox:
             raise RuntimeError("找不到 docker 可执行文件") from None
 
         cap_bytes = max(int(self._max_output_chars), 1) * 4
-        drain = await _drain_streams(
-            proc, cap_bytes=cap_bytes, timeout=float(effective_timeout) + 10
-        )
+        try:
+            drain = await _drain_streams(
+                proc, cap_bytes=cap_bytes, timeout=float(effective_timeout) + 10
+            )
+        except asyncio.CancelledError:
+            await _kill_process_tree(proc, reason="docker_cancelled")
+            await self._remove_container(container_name)
+            raise
         if drain.timed_out or drain.truncated:
             # 杀 docker CLI ≠ 停止容器：必须显式清理容器，否则它会继续写挂载目录
             await _kill_process_tree(

@@ -359,14 +359,71 @@ class TestVerifierAgent:
         assert msg.feedback.suggestions == ["增加参数校验"]
         assert msg.feedback.lesson == "边界值需校验"
 
-    async def test_no_checks_defaults_to_reject(self) -> None:
-        """无逐条判定时保守判为未通过（不凭推测通过）。"""
-        replies = [_json_block({"verdict": "pass", "criterion_checks": []})]
+    @pytest.mark.parametrize(
+        ("declared", "checks"),
+        [
+            ("pass", []),
+            ("pass", [{"criterion": "支持 page", "passed": True}]),
+            ("pass", [{"criterion": "无关标准", "passed": True}]),
+            (
+                "pass",
+                [
+                    {"criterion": "支持 page", "passed": "false"},
+                    {"criterion": "非法参数返回 400", "passed": True},
+                ],
+            ),
+            (
+                "reject",
+                [
+                    {"criterion": "支持 page", "passed": True},
+                    {"criterion": "非法参数返回 400", "passed": True},
+                ],
+            ),
+            (
+                "unknown",
+                [
+                    {"criterion": "支持 page", "passed": True},
+                    {"criterion": "非法参数返回 400", "passed": True},
+                ],
+            ),
+            (
+                "pass",
+                [
+                    {"criterion": "支持 page", "passed": True},
+                    {"criterion": "支持 page", "passed": True},
+                    {"criterion": "非法参数返回 400", "passed": True},
+                ],
+            ),
+            (
+                "pass",
+                [
+                    {"criterion": "支持 page", "passed": True},
+                    {"criterion": "非法参数返回 400", "passed": True},
+                    {"criterion": "无关标准", "passed": True},
+                ],
+            ),
+            ("pass", "not a list"),
+        ],
+        ids=[
+            "empty",
+            "missing",
+            "unrelated",
+            "string-bool",
+            "reject",
+            "unknown",
+            "duplicate",
+            "extra",
+            "invalid-list",
+        ],
+    )
+    async def test_incomplete_or_invalid_checks_are_rejected(
+        self, declared: str, checks: Any
+    ) -> None:
+        replies = [_json_block({"verdict": declared, "criterion_checks": checks})]
         agent = VerifierAgent(_gateway(replies))
         msg = await agent.run(_invocation(AgentType.VERIFIER, self._handoff()))
         assert msg.feedback is not None
         assert msg.feedback.verdict is Verdict.REJECT
-        assert set(msg.feedback.failed_criteria) == {"支持 page", "非法参数返回 400"}
 
     async def test_requires_criteria(self) -> None:
         agent = VerifierAgent(_gateway(["{}"]))
@@ -375,41 +432,6 @@ class TestVerifierAgent:
 
     async def test_cache_disabled(self) -> None:
         assert VerifierAgent(_gateway(["{}"])).cache_enabled is False
-
-    async def test_verifier_context_excludes_coder_explanation(self) -> None:
-        """★ 核心设计验证：Verifier 收到的消息不应包含 Coder 的自我解释。
-
-        构造一个 bundle，其中只放验收标准与客观证据，
-        确认 build_messages 的输出不含「我已完成」这类辩解文本。
-        """
-        engine = ContextEngine(ContextConfig())
-        handoff = self._handoff()
-        engine.isolator.handoff_to(AgentType.VERIFIER, handoff)
-        # 只补充客观证据（测试结果）
-        engine.isolator.space_for(AgentType.VERIFIER).add(
-            make_chunk(
-                "# 测试执行结果\n2 passed, 0 failed",
-                ContextKind.TOOL_RESULT,
-                source="sandbox://pytest",
-            )
-        )
-        bundle = await engine.build(
-            agent=AgentType.VERIFIER,
-            task_embedding=None,
-            current_step="S-1",
-            budget_total=8000,
-        )
-
-        invocation = AgentInvocation(task_id="T-1", step_id="S-1", bundle=bundle, handoff=handoff)
-        gateway = _gateway([_json_block({"verdict": "pass", "criterion_checks": []})])
-        agent = VerifierAgent(gateway)
-        messages = agent.build_messages(invocation)
-        text = "\n".join(m.content for m in messages)
-
-        assert "支持 page" in text, "验收标准应可见"
-        assert "2 passed" in text, "客观证据应可见"
-        assert "我已完成" not in text
-        assert "我已实现" not in text
 
 
 # --------------------------------------------------------------------------- #

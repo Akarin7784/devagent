@@ -45,7 +45,7 @@ python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
 
 # 安装含开发依赖（ruff / mypy / pytest / pre-commit）
-pip install -e ".[dev]"
+pip install -e ".[dev,db]"
 
 # 或使用 Makefile
 make install-dev
@@ -58,11 +58,13 @@ pre-commit install
 
 ```bash
 make check    # ruff + mypy
-make test     # 315 个测试
+make test     # 全量测试
 python scripts/demo_smoke.py   # 端到端冒烟，无需 API Key
 ```
 
-三条都通过，环境就算就绪。
+三条都通过，环境就算就绪。Windows 无 make 时，依次运行 `python -m ruff check src tests scripts`、`python -m mypy src`、`python -m pytest -q` 与冒烟脚本。
+
+测试结果与已知限制集中维护在 [质量文档](docs/07-质量与已知限制.md)。新增测试优先放入对应模块；同一契约的输入变体用参数化合并，不重复建立仅验证实现存在的用例。
 
 > **不需要配置 API Key 也能开发。** 绝大多数测试使用注入的假 Provider，
 > `demo_smoke.py` 也是脚本化的。只有在验证真实模型行为时才需要 Key。
@@ -210,12 +212,12 @@ def _candidate_specs(self, primary: ModelSpec) -> list[ModelSpec]:
 | 标记 | 说明 | 要求 |
 | --- | --- | --- |
 | `unit` | 快速、无外部依赖 | 默认 |
-| `integration` | 需要 DB / Redis | 可选 |
+| `integration` | 脚本化 Provider 的端到端编排；SQL 用例使用 SQLite | 默认全量执行 |
 | `e2e` | 需要真实 API Key | 可选 |
 | `slow` | 耗时较长 | 可选 |
 
 ```bash
-pytest -m unit           # 只跑单元测试
+pytest tests/unit -q     # 只跑单元测试
 pytest -m "not slow"     # 跳过慢测试
 ```
 

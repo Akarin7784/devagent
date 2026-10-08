@@ -6,9 +6,9 @@
  * 唯一例外是 `icon()`（来自 icons.js），它生成的是纯静态 SVG，无注入面。
  */
 
-import { icon } from './icons.js';
-import { agentLabel, statusDotClass, taskStatusBadge } from './status.js';
-import { el, esc, fromHTML, activateModal, mount } from './util.js';
+import { icon } from './icons.js?v=20261008-live';
+import { agentLabel, statusDotClass, taskStatusBadge } from './status.js?v=20261008-live';
+import { el, esc, fromHTML, activateModal, mount } from './util.js?v=20261008-live';
 
 // 重新导出，保持既有调用方的 import 路径不变（多个页面从 components.js 取）。
 export { agentLabel, statusDotClass };

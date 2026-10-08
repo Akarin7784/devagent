@@ -91,6 +91,8 @@ class TaskService:
         self._bus = bus or EventBus()
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._running: dict[str, asyncio.Task[None]] = {}
+        self._started: set[str] = set()
+        self._cancel_requested: set[str] = set()
         # 把 Orchestrator 的进度回调接到 EventBus，使 DAG 节点的开始/完成/判定
         # 能实时推给前端。
         #
@@ -184,6 +186,7 @@ class TaskService:
 
     async def _execute(self, task_id: str, goal: str) -> None:
         """后台执行任务，全程发事件。"""
+        self._started.add(task_id)
         # 归属信息走 ContextVar（见 __init__ 的说明）
         token_task = self._current_task.set(task_id)
         token_goal = self._current_goal.set(goal)
@@ -199,6 +202,9 @@ class TaskService:
             persister = asyncio.create_task(self._persist_loop(persist_queue))
 
         try:
+            # 首次调度前只记录取消意图，让协程进入这里完成状态和事件清理。
+            if task_id in self._cancel_requested:
+                raise asyncio.CancelledError
             # ★ 信号量等待必须被 try 覆盖：任务在**排队期间**被取消时，
             # 早先的实现会跳过全部状态跃迁与清理（因为 try 在 async with 内部），
             # 结果任务永远停在 pending、_running 残留、SSE 永不结束。
@@ -245,13 +251,18 @@ class TaskService:
         finally:
             self._bus.close(task_id)
             self._running.pop(task_id, None)
+            self._started.discard(task_id)
+            self._cancel_requested.discard(task_id)
             self._current_task.reset(token_task)
             self._current_goal.reset(token_goal)
             if persister is not None and persist_queue is not None:
                 # 排空后再关：已经产生的事件不能因为任务结束而丢。
-                persist_queue.put_nowait(None)
                 with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait_for(persist_queue.put(None), timeout=10)
                     await asyncio.wait_for(persister, timeout=10)
+                if not persister.done():
+                    persister.cancel()
+                    await asyncio.gather(persister, return_exceptions=True)
                 self._persist_queue.set(None)
 
     async def _persist_loop(self, queue: asyncio.Queue[TaskEvent | None]) -> None:
@@ -311,7 +322,9 @@ class TaskService:
         task = self._running.get(task_id)
         if task is None or task.done():
             return False
-        task.cancel()
+        self._cancel_requested.add(task_id)
+        if task_id in self._started and not task.cancelling():
+            task.cancel()
         logger.info("task_cancel_requested", task_id=task_id)
         return True
 
@@ -330,8 +343,8 @@ class TaskService:
     async def shutdown(self) -> None:
         """取消所有在跑任务并等待收尾。"""
         tasks = list(self._running.values())
-        for task in tasks:
-            task.cancel()
+        for task_id in list(self._running):
+            self.cancel(task_id)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._running.clear()

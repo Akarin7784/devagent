@@ -5,17 +5,17 @@
  * 这一层是**唯一**知道「有哪些页面」的地方，模块之间因此不产生横向依赖。
  */
 
-import { mountShell, registerNotFound, registerPage } from './shell.js';
-import { ROUTES } from './store.js';
-import { button, emptyState } from './components.js';
-import { el } from './util.js';
+import { mountShell, registerNotFound, registerPage } from './shell.js?v=20261008-live';
+import { ROUTES } from './store.js?v=20261008-live';
+import { button, emptyState } from './components.js?v=20261008-live';
+import { el } from './util.js?v=20261008-live';
 
-import renderOverview from './pages/overview.js';
-import renderWorkbench from './pages/workbench.js';
-import renderContext from './pages/context.js';
-import renderEval from './pages/eval.js';
-import renderObservability from './pages/observability.js';
-import renderSettings from './pages/settings.js';
+import renderOverview from './pages/overview.js?v=20261008-live';
+import renderWorkbench from './pages/workbench.js?v=20261008-live';
+import renderContext from './pages/context.js?v=20261008-live';
+import renderEval from './pages/eval.js?v=20261008-live';
+import renderObservability from './pages/observability.js?v=20261008-live';
+import renderSettings from './pages/settings.js?v=20261008-live';
 
 /* ---------- 注册页面 ---------- */
 
@@ -35,7 +35,7 @@ registerNotFound((root) => {
         icon: 'alert-circle',
         title: '页面不存在',
         desc: '这个地址没有对应的页面。它可能已被移除，或者链接拼写有误。',
-        action: button('回到总览', {
+        action: button('回到工作台', {
           icon: 'dashboard',
           variant: 'primary',
           onClick: () => {

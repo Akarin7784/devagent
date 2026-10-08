@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from devagent.config import ContextConfig, Settings
 from devagent.context import ContextEngine
 from devagent.context.compression import ContextCompressor, EchoSummarizer
@@ -192,7 +194,13 @@ def _build_orchestrator(
 ) -> Orchestrator:
     settings = Settings()
     gateway = ModelGateway(
-        settings, providers={"deepseek": provider, "qwen": provider, "zhipu": provider}
+        settings,
+        providers={
+            "deepseek": provider,
+            "qwen": provider,
+            "zhipu": provider,
+            provider.name: provider,
+        },
     )
     engine = ContextEngine(
         ContextConfig(),
@@ -290,7 +298,111 @@ class TestVerification:
         ctx = provider.seen_verifier_context
         assert "支持 page 与 page_size 参数" in ctx, "验收标准必须可见"
         # Coder 回复中的自我陈述不应出现在 Verifier 上下文
-        assert "增加分页参数解析" not in ctx or "实际产出" in ctx
+        assert "增加分页参数解析" not in ctx
+        assert "解析并校验 page/page_size" not in ctx
+        assert "+ page = int(request.args.get('page', 1))" in ctx
+
+    async def test_dependency_and_current_artifacts_reach_consumers(self) -> None:
+        provider = RoutedFakeProvider()
+        original = provider.chat
+
+        async def chain_reply(messages: list[ChatMessage], **kwargs: Any) -> ChatResult:
+            response = await original(messages, **kwargs)
+            if provider._detect_role(messages) is AgentType.ARCHITECT:
+                response.content = _json_block(
+                    {
+                        "nodes": [
+                            {
+                                "id": "N1",
+                                "goal": "define interface",
+                                "agent_type": "coder",
+                                "deps": [],
+                            },
+                            {
+                                "id": "N2",
+                                "goal": "consume interface",
+                                "agent_type": "coder",
+                                "deps": ["N1"],
+                            },
+                        ]
+                    }
+                )
+            if provider._detect_role(messages) is AgentType.CODER:
+                response.content = _json_block(
+                    {
+                        "summary": "AUTHOR_CLAIM",
+                        "changes": [
+                            {
+                                "file": "interface.py",
+                                "reason": "AUTHOR_REASON",
+                                "diff": "+ def UNIQUE_INTERFACE(): return 123",
+                            }
+                        ],
+                    }
+                )
+            return response
+
+        provider.chat = chain_reply  # type: ignore[method-assign]
+        orch = _build_orchestrator(provider)
+        first = await orch.run("chain", task_id="chain")
+        assert first.succeeded
+        coder_prompts = [text for role, text in provider.seen_prompts if role is AgentType.CODER]
+        assert "UNIQUE_INTERFACE" in coder_prompts[1]
+        tester_prompts = [text for role, text in provider.seen_prompts if role is AgentType.TESTER]
+        assert all("UNIQUE_INTERFACE" in text for text in tester_prompts)
+        verifier_prompts = [
+            text for role, text in provider.seen_prompts if role is AgentType.VERIFIER
+        ]
+        assert all(
+            "AUTHOR_CLAIM" not in text and "AUTHOR_REASON" not in text for text in verifier_prompts
+        )
+
+        # 恢复检查点时同样必须恢复代码产物，供新下游使用。
+        orch._checkpoints.clear_step("chain", "chain:N2")
+        provider.seen_prompts.clear()
+        second = await orch.run("chain", task_id="chain")
+        assert second.succeeded
+        assert "UNIQUE_INTERFACE" in next(
+            text for role, text in provider.seen_prompts if role is AgentType.CODER
+        )
+
+    @pytest.mark.parametrize("max_tokens", [500_000, 700], ids=["accounting", "breaker"])
+    async def test_verifier_parse_failure_is_charged(
+        self, monkeypatch: pytest.MonkeyPatch, max_tokens: int
+    ) -> None:
+        provider = RoutedFakeProvider()
+        monkeypatch.setattr(
+            provider,
+            "estimate_cost",
+            lambda usage, **_kwargs: usage.total_tokens / 1_000_000,
+            raising=False,
+        )
+        orch = _build_orchestrator(
+            provider,
+            config=OrchestratorConfig(
+                enable_tester=False,
+                max_tokens=max_tokens,
+            ),
+        )
+
+        def fail_parse(*args: Any) -> Any:
+            raise ValueError("paid response could not be parsed")
+
+        monkeypatch.setattr(orch._agents[AgentType.VERIFIER], "parse_output", fail_parse)
+        result = await orch.run("accounting")
+        ledger = orch._gateway.ledger
+        assert result.total_tokens == ledger.total_prompt_tokens + ledger.total_completion_tokens
+        assert sum(step.tokens_used for step in result.steps) == result.total_tokens
+        assert orch._breaker.tokens_used == result.total_tokens
+        assert result.total_cost_usd == pytest.approx(ledger.total_cost_usd)
+        assert result.total_cost_usd > 0
+        assert sum(step.cost_usd for step in result.steps) == pytest.approx(result.total_cost_usd)
+        if max_tokens == 700:
+            assert result.status is TaskStatus.PAUSED
+            assert result.total_tokens == 800
+        else:
+            assert result.status is TaskStatus.FAILED
+            assert provider.verifier_calls == 3
 
 
 class TestCircuitBreaker:

@@ -14,37 +14,36 @@
 
 /* --------------------------------------------------------------------------
    1. Palette — 原始色板
-   中性色用**带蓝调**的灰（而非纯灰），因为界面大面积是冷色代码/图表，
-   纯灰会显脏。对比度已按 WCAG AA 校验（正文 ≥4.5:1，大字/边框 ≥3:1）。
+   中性色以低饱和灰阶为主；状态与主操作保留语义色，减少大面积强调色。
    -------------------------------------------------------------------------- */
 :root {
   /* 中性 —— 冷调灰阶 */
   --c-gray-0: #ffffff;
-  --c-gray-25: #fbfcfe;
-  --c-gray-50: #f5f7fb;
-  --c-gray-100: #eceff5;
-  --c-gray-200: #dfe3ec;
-  --c-gray-300: #c8cfdd;
-  --c-gray-400: #9aa4b8;
-  --c-gray-500: #6b7689;
-  --c-gray-600: #4d5769;
-  --c-gray-700: #363f4f;
-  --c-gray-800: #232b39;
-  --c-gray-850: #1a212c;
-  --c-gray-900: #131923;
-  --c-gray-950: #0c1017;
+  --c-gray-25: #fcfcfc;
+  --c-gray-50: #f7f7f8;
+  --c-gray-100: #efeff1;
+  --c-gray-200: #e2e2e6;
+  --c-gray-300: #ccccd3;
+  --c-gray-400: #a2a2ad;
+  --c-gray-500: #71717f;
+  --c-gray-600: #53535f;
+  --c-gray-700: #3c3c47;
+  --c-gray-800: #272730;
+  --c-gray-850: #1c1c24;
+  --c-gray-900: #17171e;
+  --c-gray-950: #111117;
 
   /* 品牌 —— 靛蓝，用于主操作与选中态 */
-  --c-brand-50: #eef3ff;
-  --c-brand-100: #dde6ff;
-  --c-brand-200: #bfcdff;
-  --c-brand-300: #97aeff;
-  --c-brand-400: #6b8aff;
-  --c-brand-500: #4a6cf7;
-  --c-brand-600: #3a55d9;
-  --c-brand-700: #2e44ad;
-  --c-brand-800: #263a8c;
-  --c-brand-900: #1f2f6e;
+  --c-brand-50: #f4f2fc;
+  --c-brand-100: #e9e4fb;
+  --c-brand-200: #d0c6f4;
+  --c-brand-300: #b2a3ec;
+  --c-brand-400: #9381e1;
+  --c-brand-500: #7360d4;
+  --c-brand-600: #6150bd;
+  --c-brand-700: #51419c;
+  --c-brand-800: #423582;
+  --c-brand-900: #352969;
 
   /* 状态 —— 每色五档，用于底色/描边/文本/实心四种用法 */
   --c-success-50: #e8f8f0;
@@ -92,7 +91,7 @@
   --c-code-add-fg: #0b6b43;
   --c-code-del-bg: #fdecea;
   --c-code-del-fg: #a32e23;
-  --c-code-hunk-fg: #6b7689;
+  --c-code-hunk-fg: #71717f;
 }
 
 /* --------------------------------------------------------------------------
@@ -256,7 +255,7 @@
   --code-add-fg: #6fdcae;
   --code-del-bg: #2e1614;
   --code-del-fg: #f0908a;
-  --code-hunk-fg: #6b7689;
+  --code-hunk-fg: #71717f;
 
   --focus-ring: 0 0 0 2px var(--surface-base), 0 0 0 4px var(--c-brand-400);
 
@@ -266,7 +265,7 @@
   --shadow-lg: 0 12px 28px rgb(0 0 0 / 55%), 0 4px 10px rgb(0 0 0 / 35%);
   --shadow-xl: 0 24px 56px rgb(0 0 0 / 65%), 0 8px 20px rgb(0 0 0 / 40%);
 
-  --skeleton-base: #1a212c;
+  --skeleton-base: #1c1c24;
   --skeleton-shine: #232c3a;
 }
 

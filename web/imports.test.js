@@ -14,7 +14,7 @@
 
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join, relative, resolve } from 'node:path';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -44,6 +44,10 @@ function listModules(dir) {
 }
 
 /** 抽取一个文件里的相对导入/再导出路径。 */
+function resolveModule(module, spec) {
+  return fileURLToPath(new URL(spec, pathToFileURL(module)));
+}
+
 function relativeSpecifiers(absPath) {
   const src = readFileSync(absPath, 'utf8');
   const out = [];
@@ -57,7 +61,7 @@ function loadedStylesheets() {
   return [...html.matchAll(/<link[^>]+rel=["']stylesheet["'][^>]*>/gi)]
     .map((m) => /href=["']([^"']+)["']/i.exec(m[0]))
     .filter(Boolean)
-    .map((m) => join(HERE, m[1].replace(/^\.\//, '')));
+    .map((m) => fileURLToPath(new URL(m[1], pathToFileURL(join(HERE, 'index.html')))));
 }
 
 const MODULES = listModules(HERE);
@@ -70,7 +74,7 @@ test('每个相对导入都指向真实存在的文件（写错在浏览器里�
   const missing = [];
   for (const m of MODULES) {
     for (const spec of relativeSpecifiers(m)) {
-      if (!existsSync(resolve(dirname(m), spec))) {
+      if (!existsSync(resolveModule(m, spec))) {
         missing.push(`${relative(HERE, m)} → ${spec}`);
       }
     }
@@ -87,7 +91,7 @@ test('所有模块都能从 js/main.js 顺着 import 图走到（没有孤儿模
     const cur = queue.pop();
     if (seen.has(cur) || !existsSync(cur)) continue;
     seen.add(cur);
-    for (const spec of relativeSpecifiers(cur)) queue.push(resolve(dirname(cur), spec));
+    for (const spec of relativeSpecifiers(cur)) queue.push(resolveModule(cur, spec));
   }
 
   // 不可达的模块 = 又一次"孤儿文件"事故（web/app.js 就是这么来的：
@@ -130,7 +134,7 @@ test('所有 var(--token) 引用都有对应的自定义属性定义', () => {
 test('index.html 的脚本入口唯一（两套应用同时启动是最难查的状态污染）', () => {
   const html = readFileSync(join(HERE, 'index.html'), 'utf8');
   const scripts = [...html.matchAll(/<script[^>]*src=["']([^"']+)["']/gi)].map((m) => m[1]);
-  assert.deepEqual(scripts, ['./js/main.js']);
+  assert.deepEqual(scripts, ['./js/main.js?v=20261008-live']);
 });
 
 test('被删除的孤儿文件确实不存在（防止有人把它们从历史里恢复）', () => {

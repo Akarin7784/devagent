@@ -21,7 +21,7 @@ import { readFileSync } from 'node:fs';
 import {
   LEGEND_ITEMS, STATUS_GROUP, agentColor, applyEvent, buildGraphState,
   computeLayers, diffStats, layoutDag, parseDiff, statusGroup, statusLabel,
-} from './graph.js';
+} from './graph.js?v=20261008-live';
 
 let passed = 0;
 const failures = [];

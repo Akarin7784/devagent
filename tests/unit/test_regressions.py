@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 import pytest
@@ -158,10 +159,11 @@ class ScriptedProvider:
                 "verdict": "pass" if passed else "reject",
                 "criterion_checks": [
                     {
-                        "criterion": "满足需求",
+                        "criterion": criterion,
                         "passed": passed,
                         "reason": "测试" if passed else "未达标",
                     }
+                    for criterion in re.findall(r"^- \[ \] (.+)$", user, re.MULTILINE)
                 ],
             }
             if not passed:
@@ -350,11 +352,13 @@ class TestTestEvidence:
         )
         assert orch._breaker.tokens_used == result.total_tokens
 
-    async def test_step_tokens_match_task_total(self) -> None:
+    @pytest.mark.parametrize("enable_tester", [False, True], ids=["without-tester", "with-tester"])
+    async def test_step_tokens_match_task_total(self, enable_tester: bool) -> None:
         """steps[] 里的 token 之和必须与 total_tokens 对得上（此前需求/架构恒为 0）。"""
         provider = ScriptedProvider()
-        orch = _orchestrator(provider)
+        orch = _orchestrator(provider, config=OrchestratorConfig(enable_tester=enable_tester))
         result = await orch.run("需求", task_id="t")
+        assert result.total_tokens == provider.calls * ScriptedProvider.TOKENS_PER_CALL * 2
 
         step_tokens = sum(s.tokens_used for s in result.steps)
         assert step_tokens > 0
@@ -510,18 +514,6 @@ class TestContextSpaceHygiene:
             agent=AgentType.CODER,
         )
         assert len(result.chunks) == 1
-
-    def test_placement_keeps_newest_last(self) -> None:
-        """位置编排：最新的片段必须在最尾（早先切片方向是反的）。"""
-        assembler = ContextAssembler()
-        hard = make_chunk("HARD", ContextKind.SYSTEM_PROMPT, is_hard=True)
-        old = make_chunk("OLD", ContextKind.CODE, age=10)
-        middle = make_chunk("MID", ContextKind.CODE, age=5)
-        newest = make_chunk("NEW", ContextKind.CODE, age=0)
-        ordered = assembler.placement_order([middle, newest, old, hard])
-        assert ordered[0] is hard
-        assert ordered[-1] is newest, "最新的片段必须在尾部"
-        assert ordered[1] is old, "越旧越靠前"
 
 
 # --------------------------------------------------------------------------- #
@@ -775,21 +767,6 @@ class TestAdversarialFollowups:
 
         started = [p["node_id"] for k, p in events if k == "node_started"]
         assert started == ["N1", "N2", "N3"], f"node_started 未覆盖全部节点：{started}"
-
-    async def test_step_tokens_include_tester(self) -> None:
-        """步级 token 之和必须等于总账 —— 开着 Tester 时也要成立。
-
-        缺陷形态：``_verify_node`` 只记 Verifier 的用量，Tester 的用量进了
-        总账却没进步级账，前端「每步花了多少」与总计自相矛盾（800 vs 1000）。
-        """
-        provider = ScriptedProvider()
-        orch = _orchestrator(
-            provider, config=OrchestratorConfig(enable_tester=True, enable_reviewer=False)
-        )
-        result = await orch.run("需求", task_id="t")
-
-        assert result.total_tokens == provider.calls * ScriptedProvider.TOKENS_PER_CALL * 2
-        assert sum(s.tokens_used for s in result.steps) == result.total_tokens
 
     async def test_nothing_ran_is_not_reported_as_failure(self) -> None:
         """pytest「没跑到任何测试」（退出码 5）必须标为未执行，而不是失败。

@@ -13,7 +13,7 @@
  * 这足以覆盖本应用的复杂度，且零依赖。
  */
 
-import { createEmitter, storage } from './util.js';
+import { createEmitter, storage } from './util.js?v=20261008-live';
 
 export const THEME_KEY = 'devagent.theme';
 export const AUTO_REFRESH_KEY = 'devagent.autorefresh';
@@ -168,20 +168,20 @@ export function resetState(keep = ['theme', 'systemDark']) {
 /** 路由表。`id` 同时是 hash 值与导航高亮依据。 */
 export const ROUTES = [
   {
-    id: 'overview',
-    label: '总览',
-    icon: 'dashboard',
-    title: '总览',
-    desc: '多 Agent 协作的运行概况与上下文工程收益',
+    id: 'workbench',
+    label: '任务工作台',
+    icon: 'terminal',
+    title: '任务工作台',
+    desc: '从需求到可审阅的产物',
     group: 'main',
   },
   {
-    id: 'workbench',
-    label: '任务工作台',
-    icon: 'git-branch',
-    title: '任务工作台',
-    desc: '提交需求，观察 DAG 编排、执行轨迹与代码改动',
-    group: 'main',
+    id: 'overview',
+    label: '运行概览',
+    icon: 'dashboard',
+    title: '运行概览',
+    desc: '任务健康、用量与运行效率',
+    group: 'insight',
   },
   {
     id: 'context',
@@ -189,7 +189,7 @@ export const ROUTES = [
     icon: 'layers',
     title: '上下文工程看板',
     desc: '装配决策、预算分配、压缩收益与语义缓存命中',
-    group: 'main',
+    group: 'insight',
   },
   {
     id: 'eval',
@@ -220,6 +220,7 @@ export const ROUTES = [
 /** 导航分组标题。 */
 export const NAV_GROUPS = [
   { id: 'main', label: '工作区' },
+  { id: 'insight', label: '洞察' },
   { id: 'quality', label: '质量与观测' },
   { id: 'system', label: '系统' },
 ];

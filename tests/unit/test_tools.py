@@ -142,6 +142,46 @@ class TestSandboxExecution:
         assert result.exit_code != 0
         assert "超时" in result.stderr
 
+    @pytest.mark.parametrize("containerized", [False, True], ids=["local", "docker"])
+    async def test_cancellation_stops_execution_before_workspace_cleanup(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, containerized: bool
+    ) -> None:
+        from devagent.tools import sandbox as sandbox_module
+
+        proc = _FakeProcess(eof=False)
+        entered = asyncio.Event()
+        killed: list[str] = []
+        removed: list[str] = []
+
+        async def spawn(*args: Any, **kwargs: Any) -> Any:
+            return proc
+
+        async def drain(*args: Any, **kwargs: Any) -> Any:
+            entered.set()
+            await asyncio.Event().wait()
+
+        async def kill(process: Any, *, reason: str) -> None:
+            assert process is proc
+            process.kill()
+            killed.append(reason)
+
+        async def remove(self: Any, name: str) -> None:
+            removed.append(name)
+
+        monkeypatch.setattr(sandbox_module.asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(sandbox_module, "_drain_streams", drain)
+        monkeypatch.setattr(sandbox_module, "_kill_process_tree", kill)
+        monkeypatch.setattr(DockerSandbox, "is_available", lambda _self: True)
+        monkeypatch.setattr(DockerSandbox, "_remove_container", remove)
+        sandbox = DockerSandbox() if containerized else LocalProcessSandbox()
+        task = asyncio.create_task(sandbox.run(["python", "-c", "pass"], workdir=str(tmp_path)))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert proc.killed and len(killed) == 1
+        assert bool(removed) is containerized
+
     async def test_output_truncated(self) -> None:
         sandbox = LocalProcessSandbox(SandboxPolicy(max_output_chars=100))
         result = await sandbox.run(["python", "-c", "print('x' * 5000)"])
@@ -444,25 +484,18 @@ class TestSandboxFactoryIsolation:
 
 
 class TestPytestOutputParser:
-    def test_parses_passed_failed(self) -> None:
-        p, f, e = PytestOutputParser.parse("3 passed, 1 failed in 0.42s")
-        assert (p, f, e) == (3, 1, 0)
-
-    def test_parses_pass_only(self) -> None:
-        p, f, e = PytestOutputParser.parse("5 passed in 1.20s")
-        assert (p, f, e) == (5, 0, 0)
-
-    def test_parses_with_errors(self) -> None:
-        p, f, e = PytestOutputParser.parse("2 passed, 1 failed, 3 errors in 0.5s")
-        assert (p, f, e) == (2, 1, 3)
-
-    def test_parses_no_tests(self) -> None:
-        p, f, e = PytestOutputParser.parse("no tests ran in 0.01s")
-        assert (p, f, e) == (0, 0, 0)
-
-    def test_parses_unordered_counts(self) -> None:
-        p, f, e = PytestOutputParser.parse("1 failed, 4 passed")
-        assert (p, f, e) == (4, 1, 0)
+    @pytest.mark.parametrize(
+        ("stdout", "expected"),
+        [
+            ("3 passed, 1 failed in 0.42s", (3, 1, 0)),
+            ("5 passed in 1.20s", (5, 0, 0)),
+            ("2 passed, 1 failed, 3 errors in 0.5s", (2, 1, 3)),
+            ("no tests ran in 0.01s", (0, 0, 0)),
+            ("1 failed, 4 passed", (4, 1, 0)),
+        ],
+    )
+    def test_parses_summary(self, stdout: str, expected: tuple[int, int, int]) -> None:
+        assert PytestOutputParser.parse(stdout) == expected
 
     def test_detects_collection_error(self) -> None:
         assert PytestOutputParser.has_collection_error("", "ERROR collecting tests/test_x.py")
@@ -608,29 +641,110 @@ class TestTestRunnerWriteIsolation:
             )
             assert outcome.all_passed is True
             assert outcome.raw["written_paths"] == ["test_ok.py"]
-            assert (root / "test_ok.py").is_file()
+            assert not (root / "test_ok.py").exists(), "基线不得留下生成文件"
+            assert not Path(outcome.raw["workdir"]).exists(), "本次执行目录应自动清理"
         finally:
             runner.cleanup()
             other.cleanup()
         assert not root.exists(), "cleanup 应删除本实例创建的一次性临时目录"
 
-    async def test_written_paths_are_exposed_for_cleanup(self, tmp_path: Path) -> None:
+    async def test_workspace_audit_and_cleanup(self, tmp_path: Path) -> None:
         runner = SandboxTestRunner(LocalProcessSandbox(), workspace_root=str(tmp_path))
         outcome = await runner.run_tests(
             [{"path": "tests/test_generated.py", "content": "def test_ok():\n    assert True\n"}]
         )
         assert outcome.raw["written_paths"] == ["tests/test_generated.py"]
-        assert outcome.raw["workdir"] == str(tmp_path)
-        assert (tmp_path / "tests" / "test_generated.py").is_file()
+        assert outcome.raw["baseline_root"] == str(tmp_path)
+        assert outcome.raw["workdir"] != str(tmp_path)
+        assert not Path(outcome.raw["workdir"]).exists()
+        assert not (tmp_path / "tests" / "test_generated.py").exists()
 
-    async def test_rewrite_of_own_file_is_allowed(self, tmp_path: Path) -> None:
-        """重试场景：本次运行自己写入的文件可以被再次覆盖。"""
+    async def test_retry_gets_fresh_workspace(self, tmp_path: Path) -> None:
         runner = SandboxTestRunner(LocalProcessSandbox(), workspace_root=str(tmp_path), timeout=60)
         files = [{"path": "test_retry.py", "content": "def test_ok():\n    assert True\n"}]
         first = await runner.run_tests(files)
         second = await runner.run_tests(files)
         assert first.all_passed is True
         assert second.all_passed is True
+        assert first.raw["workdir"] != second.raw["workdir"]
+
+    async def test_concurrent_same_path_runs_the_correct_tests(self, tmp_path: Path) -> None:
+        class BarrierSandbox(LocalProcessSandbox):
+            def __init__(self) -> None:
+                super().__init__()
+                self.arrivals = 0
+                self.ready = asyncio.Event()
+
+            async def run(self, command: list[str], **kwargs: Any) -> ExecutionResult:
+                self.arrivals += 1
+                if self.arrivals == 2:
+                    self.ready.set()
+                await asyncio.wait_for(self.ready.wait(), timeout=5)
+                return await super().run(command, **kwargs)
+
+        runner = SandboxTestRunner(BarrierSandbox(), workspace_root=str(tmp_path))
+        failing, passing = await asyncio.gather(
+            runner.run_tests([{"path": "test_shared.py", "content": "def test_a(): assert False"}]),
+            runner.run_tests([{"path": "test_shared.py", "content": "def test_b(): assert True"}]),
+        )
+        assert failing.failed == 1 and not failing.all_passed
+        assert passing.passed == 1 and passing.all_passed
+        assert "test_b PASSED" not in failing.stdout
+        assert failing.raw["workdir"] != passing.raw["workdir"]
+        assert list(tmp_path.iterdir()) == []
+
+    async def test_conftest_does_not_leak_to_next_call(self, tmp_path: Path) -> None:
+        runner = SandboxTestRunner(LocalProcessSandbox(), workspace_root=str(tmp_path))
+        first = await runner.run_tests(
+            [
+                {
+                    "path": "conftest.py",
+                    "content": "import pytest\n@pytest.fixture(autouse=True)\ndef fail(): assert False",
+                },
+                {"path": "test_first.py", "content": "def test_first(): assert True"},
+            ]
+        )
+        second = await runner.run_tests(
+            [
+                {"path": "test_second.py", "content": "def test_second(): assert True"},
+            ]
+        )
+        assert not first.all_passed
+        assert second.all_passed
+        assert not (tmp_path / "conftest.py").exists()
+
+    async def test_snapshot_preserves_baseline_code_and_is_removed_on_cancel(
+        self, tmp_path: Path
+    ) -> None:
+        entered = asyncio.Event()
+        directories: list[Path] = []
+        (tmp_path / "implementation.py").write_text("VALUE = 42", encoding="utf-8")
+
+        class WaitingSandbox(_RecordingSandbox):
+            async def run(
+                self, command: list[str], *, workdir: str = "", timeout: int | None = None
+            ) -> ExecutionResult:
+                directory = Path(workdir)
+                directories.append(directory)
+                assert (directory / "implementation.py").read_text(encoding="utf-8") == "VALUE = 42"
+                entered.set()
+                await asyncio.Event().wait()
+                raise AssertionError("must be cancelled")
+
+        runner = SandboxTestRunner(WaitingSandbox(), workspace_root=str(tmp_path))
+        task = asyncio.create_task(
+            runner.run_tests(
+                [
+                    {"path": "test_generated.py", "content": "def test_value(): assert True"},
+                ]
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not directories[0].exists()
+        assert (tmp_path / "implementation.py").read_text(encoding="utf-8") == "VALUE = 42"
 
 
 class TestTestRunnerEvidenceIntegrity:

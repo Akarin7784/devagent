@@ -1,7 +1,7 @@
 /**
  * 设置页。
  *
- * 四个分区：后端连接（含连通性测试）、外观、数据、关于。
+ * 分区：后端连接、模型供应商、后端配置、外观、数据、关于。
  *
  * ## 为什么分区展示，而不是一页堆叠
  *
@@ -24,8 +24,9 @@
  * 这是设置页面最常见的可用性缺陷。
  */
 
-import { getApiBase, setApiBase } from '../api.js';
-import { cycleTheme, probeHealth, setTheme } from '../shell.js';
+import { getApiBase, getApiKey, setApiBase, setApiKey } from '../api.js?v=20261008-live';
+import { renderBackendSettings } from '../backend-settings.js?v=20261008-live';
+import { cycleTheme, probeHealth, setTheme } from '../shell.js?v=20261008-live';
 import {
   alert,
   button,
@@ -33,10 +34,10 @@ import {
   confirmDialog,
   kvItem,
   toast,
-} from '../components.js';
-import { icon } from '../icons.js';
-import { getState, navigate, resetState, subscribe } from '../store.js';
-import { clear, el, mount, storage } from '../util.js';
+} from '../components.js?v=20261008-live';
+import { icon } from '../icons.js?v=20261008-live';
+import { getState, navigate, resetState, subscribe } from '../store.js?v=20261008-live';
+import { clear, el, mount, storage } from '../util.js?v=20261008-live';
 
 /**
  * 分区定义。
@@ -47,6 +48,8 @@ import { clear, el, mount, storage } from '../util.js';
  */
 export const SETTINGS_TABS = [
   { id: 'connection', label: '后端连接', icon: 'link' },
+  { id: 'models', label: '模型供应商', icon: 'cpu' },
+  { id: 'backend', label: '后端配置', icon: 'settings' },
   { id: 'appearance', label: '外观', icon: 'sun' },
   { id: 'data', label: '数据', icon: 'database' },
   { id: 'about', label: '关于', icon: 'info' },
@@ -75,9 +78,10 @@ export function resolveSettingsTab(raw) {
 let activeTab = SETTINGS_TABS[0].id;
 
 export default async function renderSettings(root, ctx) {
-  const container = el('div');
+  const container = el('div', { class: 'page-stack settings-page' });
   root.append(container);
   let disposed = false;
+  const backendSession = {};
 
   // URL 优先（深链 / 刷新 / 前进后退）；没有参数时沿用本次会话内停留的分区。
   const fromUrl = ctx?.params?.get?.('tab');
@@ -121,7 +125,7 @@ export default async function renderSettings(root, ctx) {
    * - 否则整页重绘：卡片里的「已连接/未连接」与「后端不可达」告警一并刷新。
    */
   function onConnectionChange() {
-    if (!isTypingInPage()) {
+    if (!isTypingInPage() && !['backend', 'models'].includes(activeTab)) {
       paint();
       return;
     }
@@ -220,13 +224,15 @@ export default async function renderSettings(root, ctx) {
         id: `panel-${activeTab}`,
         'aria-labelledby': `tab-${activeTab}`,
       },
-      style: { 'margin-top': 'var(--space-4)' },
     }, [buildActiveCard()]);
   }
 
   /** 只构建当前分区的卡片 —— 这是"不再挤在一页"的实质。 */
   function buildActiveCard() {
     switch (activeTab) {
+      case 'models':
+      case 'backend':
+        return renderBackendSettings(activeTab, backendSession);
       case 'appearance':
         return buildAppearanceCard();
       case 'data':
@@ -243,10 +249,6 @@ export default async function renderSettings(root, ctx) {
     return el('div', { class: 'page-head' }, [
       el('div', { class: 'page-head-text' }, [
         el('h1', { text: '设置' }),
-        el('p', {
-          class: 'page-head-desc',
-          text: '后端连接、外观、数据与关于，按分区查看。所有偏好保存在浏览器本地，不会上传到服务端。',
-        }),
       ]),
     ]);
   }
@@ -266,6 +268,15 @@ export default async function renderSettings(root, ctx) {
         spellcheck: 'false',
         autocomplete: 'off',
       },
+      on: { input: () => {
+        if (input.value.trim().replace(/\/+$/, '') !== getApiBase()) accessKey.value = '';
+      } },
+    });
+    const accessKey = el('input', {
+      class: 'input mono', attrs: {
+        id: 'api-access-key', type: 'password', value: getApiKey(),
+        autocomplete: 'new-password', placeholder: '后端启用访问控制时填写',
+      },
     });
 
     const testBtn = button('测试连接', {
@@ -275,7 +286,9 @@ export default async function renderSettings(root, ctx) {
         const value = input.value.trim().replace(/\/+$/, '');
         testBtn.dataset.loading = 'true';
         const prev = getApiBase();
+        const previousKey = getApiKey();
         setApiBase(value);
+        setApiKey(accessKey.value);
         const result = await probeHealth();
         if (result.ok) {
           storage.set('devagent.apiBase', value);
@@ -288,6 +301,7 @@ export default async function renderSettings(root, ctx) {
           if (prev !== value) resetState();
         } else {
           setApiBase(prev);
+          setApiKey(previousKey);
           toast({
             tone: 'error',
             title: '连接失败',
@@ -331,6 +345,17 @@ export default async function renderSettings(root, ctx) {
         }),
       ])
     );
+    body.append(el('div', { class: 'field' }, [
+      el('label', { class: 'label', attrs: { for: 'api-access-key' }, text: '后端会话访问密钥（X-API-Key）' }),
+      accessKey,
+      button('应用会话密钥', { variant: 'secondary', small: true, onClick: async () => {
+        if (input.value.trim().replace(/\/+$/, '') !== getApiBase()) {
+          toast({ tone: 'warning', title: '请先测试新的后端连接' }); return;
+        }
+        setApiKey(accessKey.value); await probeHealth(); paint();
+      } }),
+      el('p', { class: 'field-hint', text: '仅用于当前会话，刷新后需重新输入。' }),
+    ]));
 
     // 实时状态
     const connected = getState('connected');
@@ -370,7 +395,7 @@ export default async function renderSettings(root, ctx) {
       );
     }
 
-    return card({ title: '后端连接', subtitle: '决定数据来自哪里', body });
+    return card({ title: '后端连接', body });
   }
 
   /* ---------- 外观 ---------- */
@@ -487,7 +512,7 @@ export default async function renderSettings(root, ctx) {
           onClick: async () => {
             const ok = await confirmDialog({
               title: '清除本地偏好',
-              message: '将删除浏览器中保存的主题、API 地址等偏好。任务数据在后端，不受影响。'
+              message: '将删除浏览器中保存的主题、API 地址、任务草稿等本地数据。任务数据在后端，不受影响。'
                 + '清除后页面会重新加载。',
               confirmLabel: '清除',
               danger: true,
@@ -496,6 +521,7 @@ export default async function renderSettings(root, ctx) {
             storage.remove('devagent.theme');
             storage.remove('devagent.apiBase');
             storage.remove('devagent.autorefresh');
+            storage.remove('devagent.taskDraft');
             toast({ tone: 'success', title: '已清除，正在重载…', duration: 1000 });
             window.setTimeout(() => {
               const url = new URL(window.location.href);
@@ -520,7 +546,7 @@ export default async function renderSettings(root, ctx) {
 
   function countLocalPrefs() {
     let n = 0;
-    for (const k of ['devagent.theme', 'devagent.apiBase', 'devagent.autorefresh']) {
+    for (const k of ['devagent.theme', 'devagent.apiBase', 'devagent.autorefresh', 'devagent.taskDraft']) {
       if (storage.get(k, null) != null) n += 1;
     }
     return n;
@@ -576,6 +602,8 @@ export default async function renderSettings(root, ctx) {
 
   return () => {
     disposed = true;
+    backendSession.disposed = true;
+    backendSession.notify = null;
     unsubscribe();
   };
 }

@@ -93,6 +93,7 @@ class _RunState:
     breaker: CircuitBreaker
     reflexion: ReflexionMemory
     loop_detector: LoopDetector
+    outputs: dict[str, AgentOutput] = field(default_factory=dict)
     task_span: Span | None = None
 
 
@@ -668,7 +669,19 @@ class Orchestrator:
 
         # 注入该 Agent 的独立上下文空间（handoff_to 会先移除上一轮投喂的
         # handoff 片段，因此重试不会让硬约束在空间里重复累积）
-        run_state.isolator.handoff_to(node.agent_type, handoff)
+        node_isolator = run_state.isolator.snapshot()
+        node_space = node_isolator.handoff_to(node.agent_type, handoff)
+        for dependency in node.deps:
+            dependency_output = run_state.outputs.get(dependency)
+            if dependency_output is None:
+                raise OrchestrationError(f"依赖节点 {dependency} 的产物不可用")
+            node_space.add(
+                make_chunk(
+                    _artifact_text(dependency_output),
+                    ContextKind.CODE,
+                    source=f"artifact://{dependency}",
+                )
+            )
 
         # 恢复断点（仅"上次运行遗留的、**已通过验证**的步骤"才跳过）。
         # 注意：检查点现在只在 Verifier 判定通过后才写入（见下方 PASS 分支），
@@ -676,7 +689,15 @@ class Orchestrator:
         checkpoint = (
             self._checkpoints.load(task_id, step_id) if self._config.enable_checkpoints else None
         )
-        if checkpoint is not None and checkpoint.completed:
+        if (
+            checkpoint is not None
+            and checkpoint.completed
+            and isinstance(saved_output := checkpoint.payload.get("output"), dict)
+        ):
+            run_state.outputs[node_id] = AgentOutput(
+                content=str(saved_output.get("content", "")),
+                raw=dict(saved_output.get("raw") or {}),
+            )
             dag.mark(node_id, StepStatus.SUCCESS)
             # 跨运行恢复是**设计意图**（检查点只在通过验证后写入），
             # 但"是不是同一次运行"必须可观测：同一次运行内被检查点短路
@@ -707,7 +728,7 @@ class Orchestrator:
             current_step=step_id,
             routing_signals=signals,
             budget_total=handoff.budget_tokens,
-            isolator=run_state.isolator,
+            isolator=node_isolator,
             task_id=task_id,
             task_text=handoff.goal,
         )
@@ -774,7 +795,8 @@ class Orchestrator:
             # ① 被驳回的尝试也会留下"已完成"记录；② 重试耗尽后标记 FAILED 时
             # 那条记录仍然存在 —— 同一个 task_id 再跑一次就会被检查点短路，
             # 一步不执行却报成功。写入点后移，从根上消除这一类脏记录。
-            self._save_checkpoint(task_id, step_id, node_id, attempt, output.tokens_used)
+            run_state.outputs[node_id] = output
+            self._save_checkpoint(task_id, step_id, node_id, attempt, output)
             dag.mark(node_id, StepStatus.SUCCESS, tokens_used=output.tokens_used)
             logger.info("node_succeeded", task_id=task_id, node=node_id, attempt=attempt)
             return
@@ -835,6 +857,7 @@ class Orchestrator:
         # 上游的重跑会让它的产出建立在过期的输入上，必须一并失效。
         affected = dag.reset_subgraph(node_id)
         for affected_id in affected:
+            run_state.outputs.pop(affected_id, None)
             if self._config.enable_checkpoints:
                 self._checkpoints.clear_step(task_id, f"{task_id}:{affected_id}")
         dag.mark(node_id, StepStatus.PENDING, tokens_used=output.tokens_used)
@@ -850,7 +873,7 @@ class Orchestrator:
         logger.info("node_rejected_retrying", task_id=task_id, node=node_id, attempt=attempt)
 
     def _charge_failed_call(
-        self, state: _RunState, result: TaskRunResult, exc: BaseException
+        self, state: _RunState, result: TaskRunResult, exc: BaseException, *, steps: int = 0
     ) -> None:
         """补记「模型调用发生了、但后续步骤失败」的用量。
 
@@ -859,19 +882,15 @@ class Orchestrator:
         预算越不准** —— 模型输出格式不对是很常见的失败，而它每次都真实计费。
         """
         usage = getattr(exc, "usage", None)
-        if usage is None:
-            return
         tokens = int(getattr(usage, "total_tokens", 0) or 0)
         cost = float(getattr(exc, "cost_usd", 0.0) or 0.0)
-        if tokens <= 0:
-            return
         result.total_tokens += tokens
         result.total_cost_usd += cost
-        state.breaker.charge(tokens=tokens, steps=0)
+        state.breaker.charge(tokens=tokens, steps=steps)
         logger.warning("failed_call_charged", tokens=tokens, cost_usd=cost)
 
     def _save_checkpoint(
-        self, task_id: str, step_id: str, node_id: str, attempt: int, tokens: int
+        self, task_id: str, step_id: str, node_id: str, attempt: int, output: AgentOutput
     ) -> None:
         """记录「该节点本轮**已通过验证**」。"""
         if not self._config.enable_checkpoints:
@@ -886,7 +905,11 @@ class Orchestrator:
                 # 并发下镜像指向的是**最后一个**启动的运行，
                 # 会让 A 任务的检查点带上 B 的 run_id。
                 run_id=self._state().run_id,
-                payload={"tokens": tokens, "attempt": attempt},
+                payload={
+                    "tokens": output.tokens_used,
+                    "attempt": attempt,
+                    "output": {"content": output.content, "raw": output.raw},
+                },
             )
         )
 
@@ -911,7 +934,9 @@ class Orchestrator:
         # Tester 参与：先跑测试产出客观证据
         evidence = _TestEvidence()
         if self._config.enable_tester:
-            evidence = await self._collect_test_evidence(task_id, node_id, handoff, result)
+            evidence = await self._collect_test_evidence(
+                task_id, node_id, handoff, result, artifact=coder_output
+            )
             # ★ 记账：Tester 的模型调用此前完全游离于账本之外 ——
             # 每个成功节点实际有 3 次模型调用（coder + tester + verifier），
             # 而熔断器和 total_tokens 只看到 1 次，实际可用预算约为配置值的 3 倍。
@@ -920,7 +945,8 @@ class Orchestrator:
             run_state.breaker.charge(tokens=evidence.tokens, steps=0)
 
         step_id = f"{task_id}:{node_id}:verify"
-        space = run_state.isolator.space_for(AgentType.VERIFIER)
+        verifier_isolator = run_state.isolator.snapshot()
+        space = verifier_isolator.space_for(AgentType.VERIFIER)
         # ★ 每次验证都以**空空间**开始。
         # 早先只 add 不清理，于是同一次运行内：重试时上一轮被驳回的产物与
         # 本轮产物同时在场且 source 完全相同（artifact://N1），Verifier 无法
@@ -940,7 +966,7 @@ class Orchestrator:
         )
         space.add(
             make_chunk(
-                f"# 实际产出（不含作者解释）\n{coder_output.content}",
+                f"# 实际产出（不含作者解释）\n{_artifact_text(coder_output)}",
                 ContextKind.CODE,
                 source=f"artifact://{node_id}",
             )
@@ -966,7 +992,7 @@ class Orchestrator:
             task_embedding=None,
             current_step=step_id,
             budget_total=handoff.budget_tokens,
-            isolator=run_state.isolator,
+            isolator=verifier_isolator,
             task_id=task_id,
             task_text=handoff.goal,
         )
@@ -981,6 +1007,8 @@ class Orchestrator:
 
         try:
             message = await self._agents[AgentType.VERIFIER].run(invocation)
+        except BudgetExceededError:
+            raise
         except Exception as exc:
             # ★ fail-closed：验证器不可用时**绝不算通过**。
             # 早先这里返回 Verdict.PASS 并注释为"保守判为通过"，方向正好相反：
@@ -1005,6 +1033,19 @@ class Orchestrator:
                     "绝不能当作已满足验收标准。"
                 ),
             )
+            usage = getattr(exc, "usage", None)
+            self._record_step(
+                result,
+                StepResult(
+                    step_id=step_id,
+                    agent=AgentType.VERIFIER,
+                    output=f"验证失败：{exc}",
+                    feedback=unavailable,
+                    tokens_used=int(getattr(usage, "total_tokens", 0) or 0) + evidence.tokens,
+                    cost_usd=float(getattr(exc, "cost_usd", 0.0) or 0.0) + evidence.cost,
+                ),
+            )
+            self._charge_failed_call(run_state, result, exc, steps=1)
             return Verdict.REJECT, unavailable
 
         # 验证调用同样要计账（此前漏记，见上面的说明）。
@@ -1015,7 +1056,7 @@ class Orchestrator:
         run_state.breaker.charge(tokens=used_tokens, steps=1)
 
         feedback = message.feedback
-        verdict = feedback.verdict if feedback is not None else Verdict.PASS
+        verdict = feedback.verdict if feedback is not None else Verdict.REJECT
         obs = get_observability()
         node_type = self._agents[AgentType.VERIFIER].agent_type.value
         obs.inc(MetricNames.VERDICT_TOTAL, 1, node_type=node_type, verdict=verdict.value)
@@ -1047,6 +1088,8 @@ class Orchestrator:
         node_id: str,
         handoff: AgentHandoff,
         result: TaskRunResult,
+        *,
+        artifact: AgentOutput | None = None,
     ) -> _TestEvidence:
         """运行 Tester 生成并执行测试，返回（证据文本, token, 成本）。
 
@@ -1058,13 +1101,20 @@ class Orchestrator:
             return _TestEvidence()
         run_state = self._state()
         step_id = f"{task_id}:{node_id}:test"
-        run_state.isolator.handoff_to(AgentType.TESTER, handoff)
+        tester_isolator = run_state.isolator.snapshot()
+        space = tester_isolator.handoff_to(AgentType.TESTER, handoff)
+        if artifact is not None:
+            space.add(
+                make_chunk(
+                    _artifact_text(artifact), ContextKind.CODE, source=f"artifact://{node_id}"
+                )
+            )
         bundle = await self._context.build(
             agent=AgentType.TESTER,
             task_embedding=None,
             current_step=step_id,
             budget_total=handoff.budget_tokens,
-            isolator=run_state.isolator,
+            isolator=tester_isolator,
             task_id=task_id,
             task_text=handoff.goal,
         )
@@ -1181,6 +1231,26 @@ class Orchestrator:
             task_span.set_attribute("tokens", result.total_tokens)
             obs.end_span(task_span, error=error or "")
         return result
+
+
+def _artifact_text(output: AgentOutput) -> str:
+    """从结构化产物提取文件和代码，排除作者的效果声明。"""
+    changes = output.raw.get("changes")
+    if isinstance(changes, list):
+        parts = [
+            f"## {change.get('file', '')}\n```diff\n{change.get('diff', '')}\n```"
+            for change in changes
+            if isinstance(change, dict) and change.get("diff")
+        ]
+        return "\n\n".join(parts) or "（没有代码改动）"
+    test_files = output.raw.get("test_files")
+    if isinstance(test_files, list):
+        return "\n\n".join(
+            f"## {item.get('path', '')}\n```python\n{item.get('content', '')}\n```"
+            for item in test_files
+            if isinstance(item, dict)
+        )
+    return output.content
 
 
 def _reasoning_depth_for(agent_type: AgentType) -> float:

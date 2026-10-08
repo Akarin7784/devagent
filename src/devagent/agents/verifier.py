@@ -92,21 +92,22 @@ class VerifierAgent(BaseAgent):
         assert handoff is not None
 
         checks = _parse_checks(data.get("criterion_checks") or [])
-        failed = [c["criterion"] for c in checks if not c["passed"]]
-
-        # 一致性保护：模型可能声称 pass 但存在未通过项。
-        # 以**逐条判定结果**为准，不采信顶层 verdict，避免自相矛盾。
+        # 以请求中的标准为基准：遗漏、重复或无关检查都不能获得通过。
+        expected = list(dict.fromkeys(handoff.acceptance_criteria))
+        failed = [
+            criterion
+            for criterion in expected
+            if len(matches := [c for c in checks if c["criterion"] == criterion]) != 1
+            or matches[0]["passed"] is not True
+        ]
         declared = str(data.get("verdict") or "").strip().lower()
-        derived_pass = not failed
-        if declared in {Verdict.PASS.value, Verdict.REJECT.value}:
-            declared_pass = declared == Verdict.PASS.value
-            if declared_pass and failed:
-                # 顶层说要 pass 但有失败项 → 以失败项为准
-                derived_pass = False
-        if not checks:
-            # 未给出任何逐条判定 → 保守判为未通过
-            derived_pass = False
-            failed = list(handoff.acceptance_criteria)
+        derived_pass = (
+            declared == Verdict.PASS.value
+            and bool(expected)
+            and not failed
+            and len(checks) == len(expected)
+            and all(c["criterion"] in expected for c in checks)
+        )
 
         verdict = Verdict.PASS if derived_pass else Verdict.REJECT
         suggestions = [str(s).strip() for s in (data.get("suggestions") or []) if str(s).strip()]
@@ -139,24 +140,28 @@ def _extract_json(text: str) -> dict[str, Any]:
         if brace:
             candidate = brace.group(0)
     try:
-        parsed: dict[str, Any] = json.loads(candidate)
-        return parsed
+        parsed = json.loads(candidate)
+        if isinstance(parsed, dict):
+            return parsed
+        return {"verdict": "reject", "criterion_checks": []}
     except json.JSONDecodeError:
         return {"verdict": "reject", "criterion_checks": [], "suggestions": ["验证输出无法解析"]}
 
 
-def _parse_checks(raw: list[Any]) -> list[dict[str, Any]]:
+def _parse_checks(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
     out: list[dict[str, Any]] = []
     for item in raw:
-        if not isinstance(item, dict):
-            continue
-        criterion = str(item.get("criterion") or "").strip()
-        if not criterion:
-            continue
+        if not isinstance(item, dict) or not isinstance(item.get("criterion"), str):
+            return []
+        criterion = item["criterion"].strip()
+        if not criterion or not isinstance(item.get("passed"), bool):
+            return []
         out.append(
             {
                 "criterion": criterion,
-                "passed": bool(item.get("passed", False)),
+                "passed": item["passed"],
                 "reason": str(item.get("reason") or "").strip(),
             }
         )

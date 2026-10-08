@@ -205,7 +205,10 @@ class TestPlacement:
         middle = make_chunk("MIDDLE", ContextKind.CODE, age=10)
         recent = make_chunk("RECENT", ContextKind.CODE, age=0)
 
-        ordered = assembler.placement_order([middle, recent, hard])
+        old = make_chunk("OLD", ContextKind.CODE, age=20)
+        ordered = assembler.placement_order([middle, recent, old, hard])
+        assert ordered[1] is old
+        assert ordered[2] is middle
 
         assert ordered[0] is hard, "硬约束必须在头部（首位置高注意力区）"
         assert ordered[-1] is recent, "最新内容必须在尾部（尾位置高注意力区）"

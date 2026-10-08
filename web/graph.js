@@ -34,13 +34,13 @@ export {
   agentColor,
   statusGroup,
   statusLabel,
-} from './js/status.js';
+} from './js/status.js?v=20261008-live';
 
 import {
   agentColor as _agentColor,
   statusGroup as _statusGroup,
   statusLabel as _statusLabel,
-} from './js/status.js';
+} from './js/status.js?v=20261008-live';
 
 /** 节点矩形的固定尺寸（SVG 用户单位）。 */
 export const NODE_W = 168;

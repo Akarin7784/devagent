@@ -6,7 +6,7 @@
  * 深度分析交给专门页面 —— 总览页堆图表是最常见的产品失误。
  */
 
-import { api } from '../api.js';
+import { api } from '../api.js?v=20261008-live';
 import {
   alert,
   badge,
@@ -20,13 +20,13 @@ import {
   statusBadge,
   statusDotClass,
   toast,
-} from '../components.js';
-import { icon } from '../icons.js';
-import { getLoad, getState, navigate, setLoad, subscribe } from '../store.js';
+} from '../components.js?v=20261008-live';
+import { icon } from '../icons.js?v=20261008-live';
+import { getLoad, getState, navigate, setLoad, subscribe } from '../store.js?v=20261008-live';
 import {
   $, clear, el, fmtCompact, fmtCost, fmtDuration, fmtInt, fmtPct,
   fmtRelative, fromHTML, histMaxQuantile, histOverallMean, metric, mount, sumLabels,
-} from '../util.js';
+} from '../util.js?v=20261008-live';
 
 const LOAD_KEY = 'overview';
 
@@ -37,7 +37,7 @@ const LOAD_KEY = 'overview';
  * @returns {() => void} 清理函数
  */
 export default async function renderOverview(root, ctx) {
-  const container = el('div');
+  const container = el('div', { class: 'page-stack overview-page' });
   root.append(container);
 
   const disposers = [];
@@ -63,7 +63,7 @@ export default async function renderOverview(root, ctx) {
       // 只在拿到有效数据时覆盖，避免一次失败清空已有内容
       if (metrics) patch.metrics = metrics;
       if (cache) patch.cacheStats = cache;
-      const { set } = await import('../store.js');
+      const { set } = await import('../store.js?v=20261008-live');
       set(patch);
       void state;
       setLoad(LOAD_KEY, 'ready');
@@ -114,8 +114,8 @@ export default async function renderOverview(root, ctx) {
  * ------------------------------------------------------------------ */
 
 function skeletonLayout() {
-  const wrap = el('div');
-  const grid = el('div', { class: 'grid grid-cols-4', style: { 'margin-bottom': 'var(--space-5)' } });
+  const wrap = el('div', { class: 'page-stack' });
+  const grid = el('div', { class: 'grid grid-cols-4' });
   for (let i = 0; i < 4; i += 1) grid.append(skeletonStat());
   wrap.append(grid);
   wrap.append(el('div', { class: 'skeleton skeleton-block', style: { height: '240px' } }));
@@ -134,7 +134,10 @@ function buildSections(ctx) {
   const providers = getState('providers') || [];
   const observability = getState('observability');
 
-  const sections = [];
+  const sections = [el('div', { class: 'overview-hero' }, [
+    el('h1', { text: '运行概览' }),
+    button('创建任务', { icon: 'plus', variant: 'primary', onClick: () => navigate('workbench', { new: '1' }) }),
+  ])];
 
   // 顶部告警：把「不健康」的信号顶到最前面，而不是埋在指标里
   const warnings = collectWarnings({ connected, providers, observability, cache });
@@ -280,7 +283,6 @@ export function renderKpiRow(tasks, metrics) {
 
   const row = el('div', {
     class: 'grid grid-cols-4',
-    style: { 'margin-bottom': 'var(--space-5)' },
   });
 
   row.append(
@@ -329,10 +331,10 @@ export function renderKpiRow(tasks, metrics) {
  * ------------------------------------------------------------------ */
 
 function buildMainGrid(tasks, metrics, cache, ctx) {
-  const grid = el('div', { class: 'grid', style: { 'grid-template-columns': 'minmax(0, 1.6fr) minmax(0, 1fr)', gap: 'var(--space-4)', 'align-items': 'start' } });
+  const grid = el('div', { class: 'overview-main-grid' });
 
   grid.append(buildRecentTasks(tasks, ctx));
-  grid.append(el('div', { style: { display: 'flex', 'flex-direction': 'column', gap: 'var(--space-4)' } }, [
+  grid.append(el('div', { class: 'page-stack' }, [
     buildContextValue(metrics),
     buildCacheCard(cache),
   ]));
@@ -348,7 +350,7 @@ function buildRecentTasks(tasks, ctx) {
       emptyState({
         icon: 'inbox',
         title: '还没有任务',
-        desc: '提交第一个需求，观察多 Agent 如何协作完成它',
+        desc: '创建任务后查看运行记录。',
         action: button('去提交需求', {
           icon: 'plus',
           variant: 'primary',
@@ -517,7 +519,7 @@ function buildContextValue(metrics) {
           small: true,
           icon: 'layers',
           title: '暂无上下文记录',
-          desc: '可能未启用指标采集，或还没有产生超阈值的上下文压缩。',
+          desc: '运行任务后查看指标。',
         })
       );
     }
@@ -525,7 +527,6 @@ function buildContextValue(metrics) {
 
   return card({
     title: '上下文工程收益',
-    subtitle: '本项目核心竞争力所在',
     actions: button('详情', {
       icon: 'arrow-right',
       variant: 'ghost',
@@ -604,9 +605,7 @@ function buildCacheCard(cache) {
 
     body.append(list);
 
-    const foot = el('div', { class: 'hint-text', style: { 'margin-top': 'var(--space-3)' } });
-    foot.append(el('span', { text: '数值为服务进程内累计，非单次请求切片。' }));
-    body.append(foot);
+    list.title = '数值为服务进程内累计';
   }
 
   return card({
